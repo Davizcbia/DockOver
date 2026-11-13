@@ -1,0 +1,9 @@
+# Menu Bar input V0.13
+
+The painted bar remains per-pixel layered and transparent. A separate topmost, non-activating `WS_EX_NOREDIRECTIONBITMAP` window has no visual content and is restricted via a Win32 region to the union of the same antialiased capsule pixels used for hover painting. The visual layer uses `WS_EX_TRANSPARENT` while the input layer is active; pointer messages are forwarded only inside those capsules. The full bar is never painted with almost-transparent hit-test pixels. Region geometry is rebuilt only on layout/DPI change; the input window moves only if its bounds change. If input window, region, or pass-through setup fails, the visual layer reverts to prior layered hit testing.
+
+Read-only diagnostics: `docky-gui-diagnostics.exe --dev --pid <menu-pid>` lists `MenuInput` and `MenuBar`; append `--probe <screen-x> <screen-y>` for the actual window under one point, or `--audit` for every point of the bar. The audit does not move/click the mouse. It compares the input region with `WindowFromPoint`; occluding windows or a target that exits during the audit invalidate the result. Run with a long enough isolated target lifetime (e.g. `--exit-after 60`).
+
+Explicit `LiquidMenuBar.exe --dev-diag <new-file> --dev-route wifi|sound|battery|control` injects a fixed mouse-message sequence into the same-process input layer at a calculated capsule point after startup. Optional `--dev-key escape` or `--dev-next <status>` exercises the corresponding existing paths. This is synthetic message injection, not a physical mouse test. See `gui-diagnostics-v12.md` for other diagnostics and audio precautions.
+
+Tested on one physical 96-DPI monitor. Isolated geometry/region pixel parity tests also calculate 144 and 192 DPI but are not physical mixed-DPI acceptance. No global hook, system setting, desktop screenshot or taskbar operation is used by the input layer.

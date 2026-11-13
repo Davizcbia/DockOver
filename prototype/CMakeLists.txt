@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 3.21)
+project(DockPrototype LANGUAGES CXX)
+add_executable(DockPrototype WIN32 main.cpp)
+target_compile_features(DockPrototype PRIVATE cxx_std_20)
+target_compile_definitions(DockPrototype PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(DockPrototype PRIVATE d3d11 dxgi dcomp d2d1)

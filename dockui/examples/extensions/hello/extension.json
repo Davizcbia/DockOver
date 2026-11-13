@@ -1,0 +1,30 @@
+{
+  "id": "com.example.hello",
+  "name": "Hello docky",
+  "statusItems": [
+    {
+      "id": "com.example.hello.focus",
+      "title": "Focus",
+      "icon": "icon.svg",
+      "template": true,
+      "tooltip": "Hello docky sample item",
+      "menu": [
+        { "id": "notepad", "title": "Open Notepad", "run": "notepad.exe" },
+        { "separator": true },
+        { "id": "folder", "title": "Open Extension Folder", "run": "explorer.exe", "args": "." }
+      ]
+    }
+  ],
+  "widgets": [
+    {
+      "id": "com.example.hello.uptime",
+      "title": "Uptime",
+      "size": "small",
+      "template": "text",
+      "accent": "#30D158",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File uptime.ps1",
+      "refresh": 60,
+      "data": { "headline": "...", "body": "Waiting for the first update" }
+    }
+  ]
+}
