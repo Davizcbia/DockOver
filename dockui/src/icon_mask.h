@@ -56,13 +56,19 @@ inline std::vector<std::uint32_t> MakeMacStyleIcon(const std::vector<std::uint32
   tile=inset>=3&&edges>=3;
  }
  std::vector<std::uint32_t> out(static_cast<size_t>(side)*side);
- auto sample=[&](float x,float y,int shift)->float{
-  if(x<-.5f||y<-.5f||x>static_cast<float>(w)-.5f||y>static_cast<float>(h)-.5f)return 0.f;
-  x=std::clamp(x,0.f,static_cast<float>(w-1));y=std::clamp(y,0.f,static_cast<float>(h-1));
-  int x0=static_cast<int>(x),y0=static_cast<int>(y),x1=(std::min)(x0+1,static_cast<int>(w)-1),y1=(std::min)(y0+1,static_cast<int>(h)-1);
-  float fx=x-x0,fy=y-y0;
-  auto at=[&](int xx,int yy){return static_cast<float>((src[static_cast<size_t>(yy)*w+xx]>>shift)&255);};
-  return (at(x0,y0)*(1-fx)+at(x1,y0)*fx)*(1-fy)+(at(x0,y1)*(1-fx)+at(x1,y1)*fx)*fy;
+ // Catmull-Rom cubic on the premultiplied channels: keeps edges crisp where bilinear softened them (the squircle
+ // fit resamples by 0.86 for non-tile icons; bilinear at that ratio visibly blurred fine detail).
+ auto sample4=[&](float x,float y,float out4[4]){
+  out4[0]=out4[1]=out4[2]=out4[3]=0.f;
+  if(x<-.5f||y<-.5f||x>static_cast<float>(w)-.5f||y>static_cast<float>(h)-.5f)return;
+  const float fx0=std::floor(x),fy0=std::floor(y);const int x0=static_cast<int>(fx0),y0=static_cast<int>(fy0);const float tx=x-fx0,ty=y-fy0;
+  auto weights=[](float t,float wt[4]){const float t2=t*t,t3=t2*t;
+   wt[0]=-.5f*t3+t2-.5f*t;wt[1]=1.5f*t3-2.5f*t2+1.f;wt[2]=-1.5f*t3+2.f*t2+.5f*t;wt[3]=.5f*t3-.5f*t2;};
+  float wx[4],wy[4];weights(tx,wx);weights(ty,wy);
+  for(int j=0;j<4;++j){const int yy=(std::clamp)(y0-1+j,0,static_cast<int>(h)-1);
+   for(int i=0;i<4;++i){const int xx=(std::clamp)(x0-1+i,0,static_cast<int>(w)-1);const float k=wx[i]*wy[j];const std::uint32_t q=src[static_cast<size_t>(yy)*w+xx];
+    out4[0]+=k*static_cast<float>(q>>24);out4[1]+=k*static_cast<float>((q>>16)&255);out4[2]+=k*static_cast<float>((q>>8)&255);out4[3]+=k*static_cast<float>(q&255);}}
+  out4[0]=std::clamp(out4[0],0.f,255.f);for(int c=1;c<4;++c)out4[c]=std::clamp(out4[c],0.f,out4[0]);  // stay premultiplied (colour <= alpha)
  };
  const std::uint32_t backing=tile?0u:MaskBackingColor(src,dark);
  const float br=static_cast<float>((backing>>16)&255),bg=static_cast<float>((backing>>8)&255),bb=static_cast<float>(backing&255);
@@ -76,7 +82,7 @@ inline std::vector<std::uint32_t> MakeMacStyleIcon(const std::vector<std::uint32
   }
   if(!inside)continue;const float coverage=inside/16.f;
   float sx=(x+0.5f-offX)/scale-0.5f,sy=(y+0.5f-offY)/scale-0.5f;
-  float a=sample(sx,sy,24),r=sample(sx,sy,16),g=sample(sx,sy,8),b=sample(sx,sy,0);
+  float v4[4];sample4(sx,sy,v4);float a=v4[0],r=v4[1],g=v4[2],b=v4[3];
   if(!tile){const float inv=1.f-a/255.f;r+=br*inv;g+=bg*inv;b+=bb*inv;a=255.f;}
   auto c=[&](float v){return static_cast<std::uint32_t>(std::clamp(v*coverage,0.f,255.f)+0.5f);};
   out[static_cast<size_t>(y)*side+x]=(c(a)<<24)|(c(r)<<16)|(c(g)<<8)|c(b);

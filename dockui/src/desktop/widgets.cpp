@@ -81,37 +81,111 @@ IDWriteTextFormat* Glyphs(float size) {
 void PaintDigital(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r, const Theme& t) {
     SYSTEMTIME now{}; GetLocalTime(&now);
     const float w = r.right - r.left, h = r.bottom - r.top, inset = 11.f, tick = 7.f;
-    // Tick positions: equal arc length along the widget outline inset by `inset`, so the ring of ticks follows the
-    // plate's own (superellipse) corners; ticks point inwards along the outline normal.
-    const auto ring = WidgetOutline(r, -inset, 48);
-    std::vector<float> run(ring.size() + 1, 0.f);
-    for (size_t i = 0; i < ring.size(); ++i) { const auto& a = ring[i]; const auto& b = ring[(i + 1) % ring.size()]; run[i + 1] = run[i] + std::hypot(b.x - a.x, b.y - a.y); }
+    // Three parallel curves: the plate's outline, the ticks' outer ends and their inner ends. Both tick ends are true
+    // offsets of the plate outline itself: from each outline point along its inward normal by `inset` and by
+    // `inset + tick`, so every tick is `tick` long, points along the plate's normal, and the ring's two edges keep the
+    // plate's corner exactly (concentric), not a resized copy of it. Ticks are spaced evenly along the outer curve.
+    // The ring's base is a rounded rectangle with circular corners of the plate's apparent radius (kRingRadius): the
+    // plate's superellipse corner, offset inwards, pinches into a near point at the diagonal, while the macOS clock's
+    // ring turns its corners on a clear circular arc (measured on the user's reference: ring radius about 16 pt at an
+    // 11 pt margin), enlarged to 25 pt so the inner ends (18 pt, concentric) still turn a visible arc rather than a point.
+    constexpr float kRingRadius = 36.f;
+    std::vector<D2D1_POINT_2F> plate;
+    {
+        const float rr = (std::min)({kRingRadius, w / 2, h / 2});
+        // clockwise from the top-right corner, like WidgetOutline: top-right, bottom-right, bottom-left, top-left
+        const struct { float cx, cy, a0; } arcs[4] = {{r.right - rr, r.top + rr, -1.5707963f}, {r.right - rr, r.bottom - rr, 0.f},
+                                                      {r.left + rr, r.bottom - rr, 1.5707963f}, {r.left + rr, r.top + rr, 3.1415927f}};
+        for (const auto& a : arcs)
+            for (int i = 0; i <= 24; ++i) { const float ang = a.a0 + 1.5707963f * i / 24; plate.push_back(D2D1::Point2F(a.cx + rr * std::cos(ang), a.cy + rr * std::sin(ang))); }
+    }
+    const size_t count = plate.size();
+    std::vector<D2D1_POINT_2F> normal(count), outer(count);
+    {
+        std::vector<D2D1_POINT_2F> seg(count);  // inward normal of segment i (plate[i] -> plate[i+1]); clockwise, y down
+        for (size_t i = 0; i < count; ++i) {
+            const auto& p0 = plate[i]; const auto& p1 = plate[(i + 1) % count];
+            const float len = (std::max)(1e-4f, std::hypot(p1.x - p0.x, p1.y - p0.y));
+            seg[i] = D2D1::Point2F(-(p1.y - p0.y) / len, (p1.x - p0.x) / len);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            const auto& s0 = seg[(i + count - 1) % count]; const auto& s1 = seg[i];
+            const float nx = s0.x + s1.x, ny = s0.y + s1.y, len = (std::max)(1e-4f, std::hypot(nx, ny));
+            normal[i] = D2D1::Point2F(nx / len, ny / len);
+            outer[i] = D2D1::Point2F(plate[i].x + normal[i].x * inset, plate[i].y + normal[i].y * inset);
+        }
+    }
+    std::vector<float> run(count + 1, 0.f);
+    for (size_t i = 0; i < count; ++i) { const auto& p0 = outer[i]; const auto& p1 = outer[(i + 1) % count]; run[i + 1] = run[i] + std::hypot(p1.x - p0.x, p1.y - p0.y); }
     const float perimeter = run.back();
     const float topCentre = [&] {  // the outline starts at the top-right corner; find where it crosses the top centre
         const float cx = (r.left + r.right) / 2;
-        for (size_t i = 0; i < ring.size(); ++i) { const auto& a = ring[i]; const auto& b = ring[(i + 1) % ring.size()];
-            if (std::fabs(a.y - b.y) < 0.01f && a.y < (r.top + r.bottom) / 2 && ((a.x - cx) * (b.x - cx) <= 0)) return run[i] + std::fabs(cx - a.x); }
+        for (size_t i = 0; i < count; ++i) { const auto& p0 = outer[i]; const auto& p1 = outer[(i + 1) % count];
+            if (std::fabs(p0.y - p1.y) < 0.01f && p0.y < (r.top + r.bottom) / 2 && ((p0.x - cx) * (p1.x - cx) <= 0)) return run[i] + std::fabs(cx - p0.x); }
         return 0.f; }();
     auto pointAt = [&](float d, D2D1_POINT_2F& p, D2D1_POINT_2F& n) {  // d from top centre, clockwise; n = inward normal
         d = std::fmod(d + topCentre + perimeter, perimeter);
         size_t i = static_cast<size_t>(std::upper_bound(run.begin(), run.end(), d) - run.begin());
-        i = i == 0 ? 0 : i - 1; if (i >= ring.size()) i = ring.size() - 1;
-        const auto& a = ring[i]; const auto& b = ring[(i + 1) % ring.size()];
-        const float seg = (std::max)(1e-4f, run[i + 1] - run[i]), u = (d - run[i]) / seg;
-        p = D2D1::Point2F(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u);
-        const float tx = (b.x - a.x) / seg, ty = (b.y - a.y) / seg;
-        n = D2D1::Point2F(-ty, tx);  // clockwise outline in y-down coordinates: rotating the tangent this way points inwards
+        i = i == 0 ? 0 : i - 1; if (i >= count) i = count - 1;
+        const size_t j = (i + 1) % count;
+        const float u = (d - run[i]) / (std::max)(1e-4f, run[i + 1] - run[i]);
+        p = D2D1::Point2F(outer[i].x + (outer[j].x - outer[i].x) * u, outer[i].y + (outer[j].y - outer[i].y) * u);
+        const float nx = normal[i].x + (normal[j].x - normal[i].x) * u, ny = normal[i].y + (normal[j].y - normal[i].y) * u, len = (std::max)(1e-4f, std::hypot(nx, ny));
+        n = D2D1::Point2F(nx / len, ny / len);
     };
     auto brush = Brush(rt, t.ink);
     ComPtr<ID2D1StrokeStyle> round;
     FactoryOf(rt)->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND), nullptr, 0, &round);
+    // Every tick points at the centre of the plate (the macOS desktop clock): upright at 12 and 6, level at 3 and 9,
+    // and leaning more and more toward the corners on either side, 45 degrees in the corners themselves. Same width
+    // for all sixty.
+    const D2D1_POINT_2F centre = D2D1::Point2F((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    // Outer ends in the corners: the ring's corner arc is rounder than the plate's corner, so there a tick is extended
+    // outwards (its inner end stays) until it meets the true `inset` offset of the plate outline itself; along the
+    // straight edges the two curves coincide and nothing changes. The outer edge of the ring then follows the plate's
+    // corner at an even margin while the inner edge keeps its circular arc.
+    std::vector<D2D1_POINT_2F> rim;
+    {
+        const auto edge = WidgetOutline(r, 0.f, 64);
+        const size_t m = edge.size();
+        std::vector<D2D1_POINT_2F> seg(m);
+        for (size_t k = 0; k < m; ++k) {
+            const auto& p0 = edge[k]; const auto& p1 = edge[(k + 1) % m];
+            const float len = (std::max)(1e-4f, std::hypot(p1.x - p0.x, p1.y - p0.y));
+            seg[k] = D2D1::Point2F(-(p1.y - p0.y) / len, (p1.x - p0.x) / len);
+        }
+        for (size_t k = 0; k < m; ++k) {
+            const auto& s0 = seg[(k + m - 1) % m]; const auto& s1 = seg[k];
+            const float nx = s0.x + s1.x, ny = s0.y + s1.y, len = (std::max)(1e-4f, std::hypot(nx, ny));
+            rim.push_back(D2D1::Point2F(edge[k].x + nx / len * inset, edge[k].y + ny / len * inset));
+        }
+    }
+    auto reachOut = [&](D2D1_POINT_2F q, D2D1_POINT_2F out) {  // distance from q along `out` to the rim curve
+        float best = -1.f;
+        for (size_t k = 0; k < rim.size(); ++k) {
+            const auto& a = rim[k]; const auto& b = rim[(k + 1) % rim.size()];
+            const float ex = b.x - a.x, ey = b.y - a.y, den = out.x * ey - out.y * ex;
+            if (std::fabs(den) < 1e-6f) continue;
+            const float t = ((a.x - q.x) * ey - (a.y - q.y) * ex) / den, u = ((a.x - q.x) * out.y - (a.y - q.y) * out.x) / den;
+            if (t > 0.f && u >= 0.f && u <= 1.f && (best < 0.f || t < best)) best = t;
+        }
+        return best;
+    };
     for (int i = 0; i < 60; ++i) {
         D2D1_POINT_2F p{}, n{};
         pointAt(perimeter * i / 60.f, p, n);
+        const float dx = centre.x - p.x, dy = centre.y - p.y, len = (std::max)(1e-4f, std::hypot(dx, dy));
+        const D2D1_POINT_2F dir = D2D1::Point2F(dx / len, dy / len);
+        // The band stays `tick` deep everywhere: a leaning tick is longer, so that its inner end still lands on the curve
+        // parallel to the outline (outer ends at `inset`, inner ends at `inset + tick`) and the ring never bulges.
+        const float depth = tick / (std::max)(0.5f, dir.x * n.x + dir.y * n.y);
         const bool past = i <= now.wSecond;
         const float age = past ? static_cast<float>(now.wSecond - i) / 60.f : 0.f;
         brush->SetColor(Alpha(t.ink, past ? 0.85f - 0.45f * age : 0.16f));
-        rt->DrawLine(p, D2D1::Point2F(p.x + n.x * tick, p.y + n.y * tick), brush.Get(), i % 5 == 0 ? 1.8f : 1.3f, round.Get());
+        const D2D1_POINT_2F q = D2D1::Point2F(p.x + dir.x * depth, p.y + dir.y * depth);  // inner end: unchanged
+        const float reach = reachOut(q, D2D1::Point2F(-dir.x, -dir.y));
+        const D2D1_POINT_2F o = reach > depth ? D2D1::Point2F(q.x - dir.x * reach, q.y - dir.y * reach) : p;  // only ever longer
+        rt->DrawLine(o, q, brush.Get(), 1.9f, round.Get());
     }
     std::wstring time = FormatTime(now, L"h:mm");
     float fs = (size == Size::Small ? 0.43f : 0.36f) * (std::min)(w, h * (size == Size::Small ? 1.f : 2.f));
@@ -260,42 +334,237 @@ float Upcoming(ID2D1RenderTarget* rt, const std::vector<CalEvent>& events, ULONG
     return y;
 }
 
+// ---- Scrolling widgets (Calendar, Weather) ---------------------------------------------------------------------
+// Content inside `view` drawn moved up by `offset`, with 14 DIP fades at the edges where more content continues
+// (top when scrolled down, bottom while more is below). The layer clips to `view`.
+class ScrollView {
+public:
+    ScrollView(ID2D1RenderTarget* rt, D2D1_RECT_F view, float offset, bool fadeTop, bool fadeBottom) : rt_(rt) {
+        rt->GetTransform(&old_);
+        const float h = (std::max)(1.f, view.bottom - view.top), edge = (std::min)(0.45f, 14.f / h);
+        const D2D1_GRADIENT_STOP stops[4] = {{0.f, D2D1::ColorF(0, 0, 0, fadeTop ? 0.f : 1.f)}, {edge, D2D1::ColorF(0, 0, 0, 1)},
+                                             {1.f - edge, D2D1::ColorF(0, 0, 0, 1)}, {1.f, D2D1::ColorF(0, 0, 0, fadeBottom ? 0.f : 1.f)}};
+        ComPtr<ID2D1GradientStopCollection> collection;
+        if (SUCCEEDED(rt->CreateGradientStopCollection(stops, 4, &collection)))
+            rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, view.top), D2D1::Point2F(0, view.bottom)), collection.Get(), &mask_);
+        if (SUCCEEDED(rt->CreateLayer(nullptr, &layer_)))
+            rt->PushLayer(D2D1::LayerParameters(view, nullptr, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1::IdentityMatrix(), 1.f, mask_.Get()), layer_.Get());
+        rt->SetTransform(D2D1::Matrix3x2F::Translation(0, -offset) * old_);
+    }
+    ~ScrollView() { rt_->SetTransform(old_); if (layer_) rt_->PopLayer(); }
+private:
+    ID2D1RenderTarget* rt_;
+    D2D1_MATRIX_3X2_F old_{};
+    ComPtr<ID2D1LinearGradientBrush> mask_;
+    ComPtr<ID2D1Layer> layer_;
+};
+
+// ---- macOS 26 Calendar widget pieces (reference screenshots 2026-11-19) -------------------------------------------
+SYSTEMTIME TicksToTime(ULONGLONG ticks) { SYSTEMTIME st{}; const FILETIME f{static_cast<DWORD>(ticks), static_cast<DWORD>(ticks >> 32)}; FileTimeToSystemTime(&f, &st); return st; }
+// "7:30 – 8:30PM", "11PM – 12AM", "10:10 – 11:10AM": minutes only when not :00, the period once when both ends share it.
+std::wstring TimeRange(const CalEvent& e) {
+    if (e.allDay) return L"All day";
+    const SYSTEMTIME a = TicksToTime(e.start), b = TicksToTime(e.end > e.start ? e.end : e.start);
+    auto hm = [](const SYSTEMTIME& st) { return FormatTime(st, st.wMinute ? L"h:mm" : L"h"); };
+    const std::wstring pa = FormatTime(a, L"tt"), pb = FormatTime(b, L"tt");
+    if (e.end <= e.start) return hm(a) + pa;
+    return hm(a) + (pa == pb ? L"" : pa) + L" – " + hm(b) + pb;
+}
+std::wstring StartTime(const CalEvent& e) {
+    if (e.allDay) return L"All day";
+    const SYSTEMTIME a = TicksToTime(e.start);
+    return FormatTime(a, a.wMinute ? L"h:mm" : L"h") + FormatTime(a, L"tt");
+}
+std::wstring FirstLine(const std::wstring& s) { const size_t n = s.find_first_of(L"\r\n"); return n == std::wstring::npos ? s : s.substr(0, n); }
+// Text with the AM/PM letters in small capitals, as macOS sets event times.
+void SmallCapsTime(ID2D1RenderTarget* rt, const std::wstring& text, float size, DWRITE_FONT_WEIGHT weight, D2D1_RECT_F box, D2D1_COLOR_F color) {
+    ComPtr<IDWriteTextLayout> layout;
+    auto* f = Font(size, weight);
+    if (!f || FAILED(DWrite()->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), f, box.right - box.left, box.bottom - box.top, &layout))) { Text(rt, text, f, box, color); return; }
+    for (size_t i = 0; i + 1 < text.size(); ++i)
+        if ((text[i] == L'A' || text[i] == L'P') && text[i + 1] == L'M') layout->SetFontSize(size * 0.8f, DWRITE_TEXT_RANGE{static_cast<UINT32>(i), 2});
+    auto b = Brush(rt, color);
+    rt->PushAxisAlignedClip(box, D2D1_ANTIALIAS_MODE_ALIASED);
+    rt->DrawTextLayout(D2D1::Point2F(box.left, box.top), layout.Get(), b.Get());
+    rt->PopAxisAlignedClip();
+}
+// Event block: a rounded tint of the event colour with a bar on its left; title (bold), location, time, all in the
+// event colour.
+// Measured on the reference: a three-line block is ~40 DIP, a two-line block ~28.
+constexpr float kEventLine = 12.f;
+float EventBlockHeight(const CalEvent& e, bool withLocation) { return 2.5f + kEventLine * (withLocation && !e.location.empty() ? 3 : 2) + 4.5f; }
+void EventBlock(ID2D1RenderTarget* rt, const CalEvent& e, D2D1_RECT_F box, const Theme& t, bool withLocation, bool startOnly = false) {
+    const D2D1_COLOR_F ink = EventInk(e.color, t);
+    auto b = Brush(rt, Alpha(Hex(e.color), t.dark ? 0.24f : 0.16f));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(box, 5.f, 5.f), b.Get());
+    b->SetColor(Hex(e.color));
+    rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(box.left + 4.f, box.top + 4.f, box.left + 7.f, box.bottom - 4.f), 1.5f, 1.5f), b.Get());
+    const float x = box.left + 12.f, right = box.right - 6.f;
+    float y = box.top + 2.f;
+    const float avail = box.bottom - box.top;
+    Text(rt, e.title, Font(11.5f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(x, y, right, y + kEventLine + 3), ink);
+    y += kEventLine;
+    if (withLocation && !e.location.empty() && avail >= 3 * kEventLine + 5) { Text(rt, FirstLine(e.location), Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(x, y, right, y + kEventLine + 3), Alpha(ink, 0.9f)); y += kEventLine; }
+    if (avail >= 2 * kEventLine + 3) SmallCapsTime(rt, startOnly ? StartTime(e) : TimeRange(e), 11.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, D2D1::RectF(x, y, right, y + kEventLine + 3), Alpha(ink, 0.9f));
+}
+// Hour timeline (large Calendar): `hours` rows from `firstHour` (fractional while scrolling) of `day`, hour labels left
+// of hairlines, events as blocks from their start to their end (at least two lines tall), and on today the red
+// current-time line. Returns how many events of that day fall outside the shown hours (or are all-day).
+int Timeline(ID2D1RenderTarget* rt, const std::vector<CalEvent>& events, ULONGLONG day, float firstHour, int hours, D2D1_RECT_F box, const Theme& t, bool today) {
+    const float labelW = 20.f, lineLeft = box.left + labelW + 6.f, step = (box.bottom - box.top) / hours;
+    auto line = Brush(rt, t.dark ? D2D1::ColorF(1, 1, 1, 0.14f) : D2D1::ColorF(0, 0, 0, 0.1f));
+    auto* label = Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
+    for (int h = static_cast<int>(std::floor(firstHour)); h <= static_cast<int>(std::ceil(firstHour + hours)); ++h) {
+        const float y = box.top + (h - firstHour) * step;
+        if (y < box.top - 9 || y > box.bottom + 9) continue;
+        const int hh = ((h % 24) + 24) % 24, h12 = hh % 12 == 0 ? 12 : hh % 12;
+        Text(rt, std::to_wstring(h12), label, D2D1::RectF(box.left - 4, y - 8, box.left + labelW, y + 8), t.secondary);
+        rt->DrawLine(D2D1::Point2F(lineLeft, y), D2D1::Point2F(box.right, y), line.Get(), 1.f);
+    }
+    const double hourTicks = static_cast<double>(kDayTicks / 24);
+    const ULONGLONG from = day + static_cast<ULONGLONG>(std::max(0.0, firstHour * hourTicks)), to = from + static_cast<ULONGLONG>(hours * hourTicks);
+    auto yOf = [&](ULONGLONG ticks) { return box.top + static_cast<float>((static_cast<double>(ticks) - static_cast<double>(from)) / (static_cast<double>(to) - static_cast<double>(from))) * (box.bottom - box.top); };
+    int hidden = 0;
+    float lastBottom = -1e9f;
+    for (const auto& e : events) {
+        if (DayStart(e.start) != day) continue;
+        const ULONGLONG endT = e.end > e.start ? e.end : e.start + kDayTicks / 48;
+        if (e.allDay || e.start >= to || endT <= from) { ++hidden; continue; }
+        float top = yOf(e.start), bottom = yOf(endT);  // may start above the box while scrolling: the fade clips it
+        top = (std::max)(top, lastBottom + 2.f);  // overlapping events stack below each other instead of on top
+        bottom = (std::max)(bottom, top + 2 * kEventLine + 5.f);
+        if (top >= box.bottom) { ++hidden; continue; }
+        EventBlock(rt, e, D2D1::RectF(lineLeft + 1.f, top + 1.f, box.right, (std::min)(bottom, box.bottom + 6.f) - 1.f), t, false, true);
+        lastBottom = bottom;
+    }
+    if (today) {
+        const ULONGLONG now = LocalNow();
+        if (now >= from && now <= to) {
+            const float y = yOf(now);
+            auto red = Brush(rt, kRed);
+            rt->DrawLine(D2D1::Point2F(box.left - 2, y), D2D1::Point2F(box.right, y), red.Get(), 1.5f);
+            rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(box.left - 2, y), 3.5f, 3.5f), red.Get());
+        }
+    }
+    return hidden;
+}
+
 void PaintCalendar(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r, const Theme& t) {
     SYSTEMTIME now{}; GetLocalTime(&now);
     const std::wstring weekday = Upper(FormatDate(now, L"dddd"));
     const auto events = Calendars().Events();
-    const ULONGLONG nowTicks = LocalNow(), today = DayStart(nowTicks);
+    const ULONGLONG nowTicks = LocalNow(), today = DayStart(nowTicks), tomorrow = today + kDayTicks;
     const bool configured = Calendars().Configured();
+    WidgetScroll& sc = PaintScroll();
     auto empty = [&](D2D1_RECT_F box) {
         Text(rt, configured ? L"No upcoming events" : L"No calendars", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(box.left, box.top, box.right, box.top + 18), t.secondary);
         if (!configured) Text(rt, L"Add one in Widget Settings", Font(11.5f), D2D1::RectF(box.left, box.top + 18, box.right, box.top + 34), t.secondary);
     };
+    auto header = [&](float left, float right) {
+        Text(rt, weekday, Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(left, r.top + 14, right, r.top + 30), kRed);
+        Text(rt, std::to_wstring(now.wDay), Font(40.f, DWRITE_FONT_WEIGHT_REGULAR), D2D1::RectF(left - 2, r.top + 24, right, r.top + 74), t.ink);
+    };
+    const float mid = (r.left + r.right) / 2;
     if (size == Size::Large) {
-        Text(rt, weekday, Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(r.left + kPad, r.top + 14, r.right - kPad, r.top + 30), kRed);
-        Text(rt, std::to_wstring(now.wDay), Font(40.f, DWRITE_FONT_WEIGHT_REGULAR), D2D1::RectF(r.left + kPad - 2, r.top + 26, r.left + 120, r.top + 76), t.ink);
-        MonthGrid(rt, D2D1::RectF(r.left + 150, r.top + 14, r.right - kPad, r.top + 160), t, now, true);
-        const D2D1_RECT_F list = D2D1::RectF(r.left + kPad, r.top + 176, r.right - kPad, r.bottom - 12);
-        if (Upcoming(rt, events, today, nowTicks, list, t, true) <= list.top) empty(list);
+        // Two hour timelines (macOS large Calendar): today from the current hour, tomorrow from its first event.
+        // Scrolling moves both through the day (hours above and below), each kept within its own day.
+        header(r.left + kPad, mid - 6);
+        const D2D1_RECT_F todayBox = D2D1::RectF(r.left + kPad + 4, r.top + 88, mid - 8, r.bottom - 30);
+        const float step = (todayBox.bottom - todayBox.top) / 7, base = static_cast<float>((std::min)(static_cast<int>(now.wHour), 17));
+        sc.min = -base * step; sc.max = (17 - base) * step;
+        const float shiftHours = std::clamp(sc.offset, sc.min, sc.max) / step;
+        int firstTomorrow = 9;
+        for (const auto& e : events) if (DayStart(e.start) == tomorrow && !e.allDay) { firstTomorrow = TicksToTime(e.start).wHour; break; }
+        firstTomorrow = (std::min)(firstTomorrow, 17);
+        const float todayFirst = std::clamp(base + shiftHours, 0.f, 17.f), tomorrowFirst = std::clamp(firstTomorrow + shiftHours, 0.f, 17.f);
+        int todayHidden = 0, tomorrowHidden = 0;
+        {   // hours sliding past the top and bottom fade out
+            const bool moved = std::fabs(sc.offset) > 0.5f;
+            ScrollView view(rt, D2D1::RectF(r.left, todayBox.top - 10, mid, todayBox.bottom + 10), 0, moved, moved);
+            todayHidden = Timeline(rt, events, today, todayFirst, 7, todayBox, t, true);
+        }
+        Text(rt, L"TOMORROW", Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(mid + 14, r.top + 14, r.right - kPad, r.top + 30), t.secondary);
+        {
+            const D2D1_RECT_F box = D2D1::RectF(mid + 10, r.top + 50, r.right - kPad, r.bottom - 30);
+            const bool moved = std::fabs(sc.offset) > 0.5f;
+            ScrollView view(rt, D2D1::RectF(mid, box.top - 10, r.right, box.bottom + 10), 0, moved, moved);
+            tomorrowHidden = Timeline(rt, events, tomorrow, tomorrowFirst, 7, box, t, false);
+        }
+        // "3 more events": what the two timelines could not show, with up to three of their colours as bars.
+        const int more = todayHidden + tomorrowHidden;
+        if (more > 0) {
+            std::vector<unsigned> colors;
+            for (const auto& e : events)
+                if ((DayStart(e.start) == today || DayStart(e.start) == tomorrow) && colors.size() < 3 && std::find(colors.begin(), colors.end(), e.color) == colors.end()) colors.push_back(e.color);
+            float x = mid + 14;
+            const float y = r.bottom - 24;
+            for (unsigned c : colors) { auto b = Brush(rt, Hex(c)); rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, y + 2, x + 3, y + 15), 1.5f, 1.5f), b.Get()); x += 5; }
+            Text(rt, std::to_wstring(more) + (more == 1 ? L" more event" : L" more events"), Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(x + 4, y, r.right - kPad, y + 17), t.secondary);
+        }
+        if (!configured) empty(D2D1::RectF(r.left + kPad, r.bottom - 48, mid - 8, r.bottom - 12));
         return;
     }
-    const float left = r.left + kPad, colRight = size == Size::Small ? r.right - kPad : r.left + 166;
-    Text(rt, weekday, Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.top + 14, colRight, r.top + 30), kRed);
-    Text(rt, std::to_wstring(now.wDay), Font(40.f, DWRITE_FONT_WEIGHT_REGULAR), D2D1::RectF(left - 2, r.top + 26, colRight, r.top + 74), t.ink);
     if (size == Size::Small) {
+        // The upcoming list scrolls under the date (all events of the next month).
+        const float left = r.left + kPad;
+        header(left, r.right - kPad);
         const D2D1_RECT_F list = D2D1::RectF(left, r.top + 80, r.right - kPad, r.bottom - 8);
-        if (Upcoming(rt, events, today, nowTicks, list, t, false) <= list.top) empty(list);
+        float end = list.top;
+        {
+            ScrollView view(rt, D2D1::RectF(r.left, list.top - 4, r.right, r.bottom), sc.offset, sc.offset > sc.min + 0.5f, sc.offset < sc.max - 0.5f);
+            end = Upcoming(rt, events, today, nowTicks, D2D1::RectF(list.left, list.top, list.right, list.top + 3000), t, false);
+        }
+        sc.min = 0; sc.max = (std::max)(0.f, end - list.bottom + 4);
+        if (end <= list.top) empty(list);
         return;
     }
-    // Medium: today's events as pills on the left, the next days on the right.
-    float y = r.top + 82;
-    int pills = 0;
+    // Medium (macOS "Up Next"): the date and today's next event on the left; on the right the rest of today, TOMORROW
+    // and the following days as event blocks, which scroll.
+    const float left = r.left + kPad, colRight = mid - 5;
+    header(left, colRight);
+    std::vector<const CalEvent*> rest;
+    std::vector<std::pair<ULONGLONG, std::vector<const CalEvent*>>> later;  // tomorrow and the next days, by day
     for (const auto& e : events) {
-        if (DayStart(e.start) != today || y + 19 > r.bottom - 8 || pills >= 3) continue;
-        Pill(rt, e, D2D1::RectF(left - 2, y, colRight, y + 18), t); y += 21; ++pills;
+        const ULONGLONG endT = e.allDay ? DayStart(e.start) + kDayTicks : (e.end > e.start ? e.end : e.start + 1);
+        if (endT <= nowTicks) continue;
+        const ULONGLONG d = DayStart(e.start < nowTicks ? nowTicks : e.start);
+        if (d == today) { rest.push_back(&e); continue; }
+        if (d > today + 7 * kDayTicks) continue;
+        if (later.empty() || later.back().first != d) later.push_back({d, {}});
+        later.back().second.push_back(&e);
     }
-    if (!pills && configured) Text(rt, L"No events today", Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 18), t.secondary);
-    const D2D1_RECT_F list = D2D1::RectF(r.left + 182, r.top + 14, r.right - kPad, r.bottom - 8);
-    if (Upcoming(rt, events, today, today + kDayTicks, list, t, true) <= list.top) empty(list);
+    float y = r.top + 76;
+    size_t used = 0;
+    while (used < rest.size()) {
+        const float h = EventBlockHeight(*rest[used], true);
+        if (y + h > r.bottom - 14) break;
+        EventBlock(rt, *rest[used], D2D1::RectF(left - 2, y, colRight, y + h), t, true);
+        y += h + 5; ++used;
+    }
+    if (rest.empty()) Text(rt, configured ? L"No more events today" : L"No calendars", Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 18), t.secondary);
+    const float rl = mid + 5, rr = r.right - kPad, top = r.top + 14, bottom = r.bottom - 12;
+    // Reference rhythm: blocks 5 apart, a day header 3 below the last block before it and 2 above its first block.
+    float ry = top;
+    {
+        ScrollView view(rt, D2D1::RectF(mid, r.top + 6, r.right, r.bottom - 4), sc.offset, sc.offset > sc.min + 0.5f, sc.offset < sc.max - 0.5f);
+        for (size_t i = used; i < rest.size(); ++i) {
+            const float h = EventBlockHeight(*rest[i], true);
+            EventBlock(rt, *rest[i], D2D1::RectF(rl, ry, rr, ry + h), t, true);
+            ry += h + 5;
+        }
+        for (const auto& [day, list] : later) {
+            if (ry > top) ry += 3;
+            Text(rt, DayHeader(day, today), Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(rl, ry, rr, ry + 16), t.secondary);
+            ry += 18;
+            for (const CalEvent* e : list) {
+                const float h = EventBlockHeight(*e, false);
+                EventBlock(rt, *e, D2D1::RectF(rl, ry, rr, ry + h), t, false);
+                ry += h + 5;
+            }
+        }
+    }
+    sc.min = 0; sc.max = (std::max)(0.f, ry - 5 - bottom);
+    if (ry == top && rest.size() <= used) empty(D2D1::RectF(rl, top, rr, bottom));
 }
 
 // ---- Batteries and system: 2 x 2 rings with a device glyph, as the macOS Batteries widget ----------------------
@@ -465,62 +734,90 @@ std::wstring HourLabel(int h, bool first) {
     return std::to_wstring(h12) + (h < 12 ? L"AM" : L"PM");
 }
 
+// One forecast day: name, icon, low, range bar on the week's shared scale, high (macOS 10-day forecast row).
+float WeatherDayRow(ID2D1RenderTarget* rt, const WeatherData& d, const WeatherDay& day, float left, float right, float yy, bool compact) {
+    const D2D1_COLOR_F white = D2D1::ColorF(1, 1, 1, 1), soft = D2D1::ColorF(1, 1, 1, 0.82f);
+    const float span = (std::max)(1.f, d.weekHigh - d.weekLow);
+    Text(rt, day.name, Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, yy, left + 60, yy + 26), white);
+    SkyIcon(rt, SkyOf(day.code), true, D2D1::Point2F(left + (compact ? 58.f : 78.f), yy + 13), 17.f);
+    if (compact) {  // small widget: no bar
+        Text(rt, Deg(day.low) + L"  " + Deg(day.high), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(left + 70, yy, right, yy + 26), white);
+        return yy + 28;
+    }
+    Text(rt, Deg(day.low), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(left + 96, yy, left + 136, yy + 26), soft);
+    const float bx0 = left + 144, bx1 = right - 44, by = yy + 13;
+    auto track = Brush(rt, D2D1::ColorF(0, 0, 0, 0.18f)); rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by - 2.5f, bx1, by + 2.5f), 2.5f, 2.5f), track.Get());
+    ComPtr<ID2D1GradientStopCollection> stops; ComPtr<ID2D1LinearGradientBrush> grad;
+    const D2D1_GRADIENT_STOP st[2] = {{0.f, Hex(0x5AC8FA)}, {1.f, Hex(0xFFCC00)}};
+    rt->CreateGradientStopCollection(st, 2, &stops);
+    rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(bx0, 0), D2D1::Point2F(bx1, 0)), stops.Get(), &grad);
+    const float a = bx0 + (bx1 - bx0) * (day.low - d.weekLow) / span, b = bx0 + (bx1 - bx0) * (day.high - d.weekLow) / span;
+    if (grad) rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(a, by - 2.5f, (std::max)(b, a + 5), by + 2.5f), 2.5f, 2.5f), grad.Get());
+    Text(rt, Deg(day.high), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(bx1 + 4, yy, right, yy + 26), white);
+    return yy + 28;
+}
+
+// Weather: the current conditions, the hourly row and the 10-day forecast as one column that scrolls (the sky stays).
 void PaintWeather(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r) {
     const WeatherData d = WeatherService().Data();
     const Sky sky = SkyOf(d.code);
     SkyPlate(rt, r, d.valid ? sky : Sky::Cloudy, d.valid ? d.day : true);
     const D2D1_COLOR_F white = D2D1::ColorF(1, 1, 1, 1), soft = D2D1::ColorF(1, 1, 1, 0.82f);
     const float left = r.left + kPad;
+    WidgetScroll& sc = PaintScroll();
     if (!d.valid) {
+        sc.min = sc.max = 0;
         Text(rt, L"Weather", Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.top + 14, r.right - kPad, r.top + 34), white);
         Text(rt, d.error.empty() ? L"Loading…" : d.error, Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(left, r.top + 40, r.right - kPad, r.top + 58), soft);
         if (!d.error.empty()) Text(rt, L"Set a city in Widget Settings", Font(11.5f), D2D1::RectF(left, r.top + 58, r.right - kPad, r.top + 74), soft);
         return;
     }
-    // Left block (all sizes): place, temperature, condition / H-L.
-    const float colRight = size == Size::Small ? r.right - kPad : r.left + 170;
-    float y = r.top + 13;
-    if (d.automatic) { Text(rt, L"NEARBY LOCATION", Font(10.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 13), soft); y += 13; }
-    Text(rt, d.place + (d.automatic ? L" ↗" : L""), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 20), white);
-    Text(rt, Deg(d.temp), Font(44.f, DWRITE_FONT_WEIGHT_LIGHT), D2D1::RectF(left - 2, y + 18, colRight, y + 72), white);
-    if (size == Size::Small) {
-        SkyIcon(rt, sky, d.day, D2D1::Point2F(left + 10, r.bottom - 42), 20.f);
-        Text(rt, ConditionText(d.code, d.day), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.bottom - 32, r.right - kPad, r.bottom - 16), white);
-        Text(rt, L"H:" + Deg(d.high) + L" L:" + Deg(d.low), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.bottom - 18, r.right - kPad, r.bottom - 2), white);
-        return;
+    float end = r.bottom;
+    {
+        ScrollView view(rt, r, sc.offset, sc.offset > sc.min + 0.5f, sc.offset < sc.max - 0.5f);
+        // Left block (all sizes): place, temperature, condition / H-L.
+        const float colRight = size == Size::Small ? r.right - kPad : r.left + 170;
+        float y = r.top + 13;
+        if (d.automatic) { Text(rt, L"NEARBY LOCATION", Font(10.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 13), soft); y += 13; }
+        Text(rt, d.place + (d.automatic ? L" ↗" : L""), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 20), white);
+        Text(rt, Deg(d.temp), Font(44.f, DWRITE_FONT_WEIGHT_LIGHT), D2D1::RectF(left - 2, y + 18, colRight, y + 72), white);
+        auto divider = Brush(rt, D2D1::ColorF(1, 1, 1, 0.22f));
+        float yy = 0;
+        if (size == Size::Small) {
+            SkyIcon(rt, sky, d.day, D2D1::Point2F(left + 10, r.bottom - 42), 20.f);
+            Text(rt, ConditionText(d.code, d.day), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.bottom - 32, r.right - kPad, r.bottom - 16), white);
+            Text(rt, L"H:" + Deg(d.high) + L" L:" + Deg(d.low), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.bottom - 18, r.right - kPad, r.bottom - 2), white);
+            // Below the first screen: the daily forecast.
+            yy = r.bottom + 10;
+            rt->FillRectangle(D2D1::RectF(left, yy - 5, r.right - kPad, yy - 4.5f), divider.Get());
+            for (const auto& day : d.days) yy = WeatherDayRow(rt, d, day, left, r.right - kPad, yy, true);
+        } else {
+            // Medium / large: condition at the top right, hourly row below, then the daily forecast.
+            SkyIcon(rt, sky, d.day, D2D1::Point2F(r.right - kPad - 12, r.top + 22), 22.f);
+            Text(rt, ConditionText(d.code, d.day), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(r.left + 180, r.top + 38, r.right - kPad, r.top + 54), white);
+            Text(rt, L"H:" + Deg(d.high) + L" L:" + Deg(d.low), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(r.left + 180, r.top + 54, r.right - kPad, r.top + 70), white);
+            const float rowTop = r.top + 98, cw = (r.right - r.left - 2 * kPad) / 6;
+            // Hourly rows of six: the first under the conditions, the rest of the day below it when scrolled.
+            const size_t rows = size == Size::Large ? 1 : (std::min<size_t>)(3, (d.hours.size() + 5) / 6);
+            float hy = rowTop;
+            for (size_t row = 0; row < rows; ++row, hy += 64) {
+                for (size_t c = 0; c < 6; ++c) {
+                    const size_t i = row * 6 + c;
+                    if (i >= d.hours.size()) break;
+                    const float cx = left + cw * (c + 0.5f);
+                    Text(rt, HourLabel(d.hours[i].hour, i == 0), Font(11.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cx - cw / 2, hy, cx + cw / 2, hy + 14), soft);
+                    SkyIcon(rt, SkyOf(d.hours[i].code), d.hours[i].day, D2D1::Point2F(cx, hy + 28), 16.f);
+                    Text(rt, Deg(d.hours[i].temp), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cx - cw / 2, hy + 40, cx + cw / 2, hy + 56), white);
+                }
+            }
+            yy = hy + 2;
+            rt->FillRectangle(D2D1::RectF(left, yy, r.right - kPad, yy + 0.5f), divider.Get());
+            yy += 8;
+            for (const auto& day : d.days) yy = WeatherDayRow(rt, d, day, left, r.right - kPad, yy, false);
+        }
+        end = yy + 6;
     }
-    // Medium / large: condition at the top right, hourly row below.
-    SkyIcon(rt, sky, d.day, D2D1::Point2F(r.right - kPad - 12, r.top + 22), 22.f);
-    Text(rt, ConditionText(d.code, d.day), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(r.left + 180, r.top + 38, r.right - kPad, r.top + 54), white);
-    Text(rt, L"H:" + Deg(d.high) + L" L:" + Deg(d.low), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(r.left + 180, r.top + 54, r.right - kPad, r.top + 70), white);
-    const float rowTop = r.top + 98, cw = (r.right - r.left - 2 * kPad) / 6;
-    for (size_t i = 0; i < d.hours.size() && i < 6; ++i) {
-        const float cx = left + cw * (i + 0.5f);
-        Text(rt, HourLabel(d.hours[i].hour, i == 0), Font(11.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cx - cw / 2, rowTop, cx + cw / 2, rowTop + 14), soft);
-        SkyIcon(rt, SkyOf(d.hours[i].code), d.hours[i].day, D2D1::Point2F(cx, rowTop + 28), 16.f);
-        Text(rt, Deg(d.hours[i].temp), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cx - cw / 2, rowTop + 40, cx + cw / 2, rowTop + 56), white);
-    }
-    if (size != Size::Large) return;
-    // Large: 6-day forecast with temperature range bars (shared scale for the week).
-    auto divider = Brush(rt, D2D1::ColorF(1, 1, 1, 0.22f));
-    rt->FillRectangle(D2D1::RectF(left, rowTop + 66, r.right - kPad, rowTop + 66.5f), divider.Get());
-    float yy = rowTop + 74; const float span = (std::max)(1.f, d.weekHigh - d.weekLow);
-    for (const auto& day : d.days) {
-        if (yy + 26 > r.bottom - 8) break;
-        Text(rt, day.name, Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, yy, left + 60, yy + 26), white);
-        SkyIcon(rt, SkyOf(day.code), true, D2D1::Point2F(left + 78, yy + 13), 17.f);
-        Text(rt, Deg(day.low), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(left + 96, yy, left + 136, yy + 26), soft);
-        const float bx0 = left + 144, bx1 = r.right - kPad - 44, by = yy + 13;
-        auto track = Brush(rt, D2D1::ColorF(0, 0, 0, 0.18f)); rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(bx0, by - 2.5f, bx1, by + 2.5f), 2.5f, 2.5f), track.Get());
-        ComPtr<ID2D1GradientStopCollection> stops; ComPtr<ID2D1LinearGradientBrush> grad;
-        const D2D1_GRADIENT_STOP st[2] = {{0.f, Hex(0x5AC8FA)}, {1.f, Hex(0xFFCC00)}};
-        rt->CreateGradientStopCollection(st, 2, &stops);
-        rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(bx0, 0), D2D1::Point2F(bx1, 0)), stops.Get(), &grad);
-        const float a = bx0 + (bx1 - bx0) * (day.low - d.weekLow) / span, b = bx0 + (bx1 - bx0) * (day.high - d.weekLow) / span;
-        if (grad) rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(a, by - 2.5f, (std::max)(b, a + 5), by + 2.5f), 2.5f, 2.5f), grad.Get());
-        Text(rt, Deg(day.high), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(bx1 + 4, yy, r.right - kPad, yy + 26), white);
-        yy += 28;
-    }
+    sc.min = 0; sc.max = (std::max)(0.f, end - r.bottom);
 }
 
 // ---- Third-party templates ---------------------------------------------------------------------------------
@@ -683,6 +980,9 @@ std::vector<Kind> BuiltinKinds() {
             {L"weather", L"Weather", Size::Small, L"Weather"}, {L"battery", L"Batteries", Size::Small, L"Batteries"}, {L"system", L"System", Size::Small, L"System"}};
 }
 
+WidgetScroll& PaintScroll() { static WidgetScroll scroll; return scroll; }
+bool Scrollable(const std::wstring& kind) { return kind == L"calendar" || kind == L"weather"; }
+
 void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D1_RECT_F r, const Theme& t, const ExtWidget* ext) {
     if (kind == L"clock") PaintDigital(rt, size, r, t);
     else if (kind == L"clock.analog") PaintAnalog(rt, size, r, t);
@@ -704,7 +1004,11 @@ int ListRowAt(const ExtWidget& e, Size, D2D1_RECT_F r, D2D1_POINT_2F p) {
     return items && items->type == Value::Type::Array && row < static_cast<int>(items->array.size()) ? row : -1;
 }
 
-bool LightPlate(const std::wstring& kind) { return kind == L"clock"; }
+PlateTone PlateToneOf(const std::wstring& kind) {
+    if (kind == L"clock") return CurrentPrefs().clockDark ? PlateTone::Black : PlateTone::Light;
+    if (kind == L"battery" && CurrentPrefs().batteryGlass) return PlateTone::Glass;
+    return PlateTone::Theme;
+}
 
 UINT RefreshMs(const std::wstring& kind) {
     if (kind == L"clock" || kind == L"clock.analog") return 1000;

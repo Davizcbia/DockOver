@@ -1,4 +1,5 @@
 #include "glass_window.h"
+#include "../capture_visible.h"
 #include "../glass_params.h"
 #include "../menu_surface.h"
 #include "../log.h"
@@ -24,7 +25,7 @@ ID3D11Device* SharedUiDevice() {
     return device.Get();
 }
 
-GlassWindow::~GlassWindow() { if (renderer_) renderer_->Shutdown(); if (hwnd_ && IsWindow(hwnd_)) DestroyWindow(hwnd_); }
+GlassWindow::~GlassWindow() { liveCapture_.SetDevice(nullptr); if (renderer_) renderer_->Shutdown(); if (hwnd_ && IsWindow(hwnd_)) DestroyWindow(hwnd_); }
 
 bool GlassWindow::Create(const wchar_t* className, WNDPROC proc, DWORD extraExStyle, bool noActivate) {
     HINSTANCE instance = GetModuleHandleW(nullptr);
@@ -42,21 +43,44 @@ bool GlassWindow::Render(const RECT& screen, HWND insertAfter, D2D1_RECT_F plate
 
 bool GlassWindow::Redraw() { return rendered_ && content_ && Draw(nullptr); }
 
-bool GlassWindow::StartDuplication(const RECT& around) {
-    if (!renderer_) return false;
-    if (!dup_.Start(renderer_->Device(), around)) return false;
-    dup_.SetOwnWindow(lastScreen_);  // this window's own redraws are not changes behind it
-    return dup_.Covers(around);
+bool GlassWindow::PollLiveCapture(bool& changed) {
+    liveCapture_.Request(true, MonitorFromRect(&lastScreen_, MONITOR_DEFAULTTONEAREST));
+    const ULONGLONG now = GetTickCount64();
+    bool published = false;
+    if (now - healthAt_ >= 1000) {
+        healthAt_ = now;
+        liveCapture_.CheckHealth();
+    }
+    if (const HANDLE event = liveCapture_.CompletionEvent(); event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0)
+        published = liveCapture_.CompleteCompare(lastScreen_);
+    published = liveCapture_.ProcessCapture(lastScreen_) || published;
+    const bool hasLiveFrame = frame_.texture && frame_.texture != texture_.Get();
+    if (liveCapture_.State() == 2 && hasLiveFrame && !published) return true;
+    dock::BackdropFrame captured;
+    if (liveCapture_.State() == 2 && liveCapture_.Latest(lastScreen_, captured)) {
+        changed = frame_.texture != captured.texture || frame_.frameId != captured.frameId;
+        liveTexture_ = captured.texture;
+        frame_ = captured;
+        haveFrame_ = true;
+        return true;
+    }
+    if (hasLiveFrame) {
+        frame_ = {};
+        liveTexture_.Reset();
+        haveFrame_ = false;
+        changed = true;
+    }
+    return false;
 }
 
-bool GlassWindow::PollDuplication(const RECT& area, UINT timeoutMs) {
-    const bool changed = dup_.Poll(area, timeoutMs);
-    if (!dup_.Valid()) {  // lost (mode change, secure desktop): drop the frame; the next Draw takes a new backdrop
-        if (frame_.texture && frame_.texture != texture_.Get()) { haveFrame_ = false; frame_.texture = nullptr; return rendered_; }
-        return false;
-    }
-    if (changed) haveFrame_ = dup_.Frame(frame_);
-    return changed;
+bool GlassWindow::CaptureExcludedScreen(const RECT& screen, std::vector<std::uint32_t>& pixels) {
+    if (docky::capture_visible::Frozen()) return false;  // shown to a screenshot (capture_visible.h): keep the old image
+    DWORD affinity = WDA_NONE;
+    if (!GetWindowDisplayAffinity(hwnd_, &affinity)) return false;
+    if (affinity != WDA_EXCLUDEFROMCAPTURE &&
+        (!SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE) ||
+         !GetWindowDisplayAffinity(hwnd_, &affinity) || affinity != WDA_EXCLUDEFROMCAPTURE)) return false;
+    return CaptureScreen(screen, pixels);
 }
 
 bool GlassWindow::Draw(const std::function<void(ID2D1DeviceContext*, bool)>* content) {
@@ -72,6 +96,8 @@ bool GlassWindow::Draw(const std::function<void(ID2D1DeviceContext*, bool)>* con
         renderer_ = std::make_unique<dock::Renderer>();
         renderer_->UseDevice(deviceSource_ && deviceSource_->renderer_ ? deviceSource_->renderer_->Device() : SharedUiDevice());
         if (FAILED(renderer_->Init(hwnd_, w, h, static_cast<float>(dpi)))) { renderer_.reset(); return false; }
+        liveCapture_.SetDevice(renderer_->Device());
+        liveCapture_.SetExcludedWindow(hwnd_);
         renderer_->SetSyncInterval(0);  // paced by the display ticker and the frame-latency waitable (see Draw)
         w_ = w; h_ = h; dpi_ = static_cast<float>(dpi);
     } else if (w != w_ || h != h_ || dpi != dpi_) {
@@ -82,14 +108,11 @@ bool GlassWindow::Draw(const std::function<void(ID2D1DeviceContext*, bool)>* con
     const LONG m = static_cast<LONG>(96.f * dpi_ / 96.f);
     const RECT want{screen.left - m, screen.top - m, screen.right + m, screen.bottom + m};
     if (!haveFrame_ || !EqualRect(&want, &backdropRect_)) {
-        bool done = false;
-        if (live_ && StartDuplication(want)) {
-            if (!dup_.Valid()) dup_.Poll(want, 100);  // the first frame is the whole desktop
-            if (dup_.Valid() && dup_.Frame(frame_)) { haveFrame_ = true; done = true; }
-        }
+        bool changed = false;
+        const bool done = live_ && PollLiveCapture(changed);
         if (!done) {
             std::vector<std::uint32_t> px;
-            const bool got = (live_ && CaptureScreen(want, px)) || ComposeBackdrop(want, px);
+            const bool got = (live_ && CaptureExcludedScreen(want, px)) || ComposeBackdrop(want, px);
             backdropHash_ = got ? Hash(px) : 0;
             haveFrame_ = got && liquid::popup::UploadBackdrop(renderer_->Device(), want, px, texture_, frameId_, frame_);
         }
@@ -188,6 +211,7 @@ void GlassWindow::UpdateHalo(const RECT& screen, float radius) {
 
 void GlassWindow::SetLiveBackdrop(bool live) {
     live_ = live;
+    if (!live) liveCapture_.Request(false, nullptr);
     if (hwnd_) SetWindowDisplayAffinity(hwnd_, live ? WDA_EXCLUDEFROMCAPTURE : WDA_NONE);
     backdropRect_ = RECT{};
 }
@@ -195,14 +219,14 @@ void GlassWindow::SetLiveBackdrop(bool live) {
 bool GlassWindow::RefreshLiveBackdrop() {
     if (!live_ || !Visible() || !renderer_) return false;
     if (haloWin_ && haloWin_->Visible() && haloWin_->RefreshLiveBackdrop()) haloWin_->Redraw();
-    if (pendingRedraw_) { if (StartDuplication(backdropRect_)) PollDuplication(backdropRect_, 0); return true; }  // a skipped frame
-    if (!haveFrame_) return rendered_;  // duplication was reset (mode change): the next Draw takes a new backdrop
-    if (StartDuplication(backdropRect_)) return PollDuplication(backdropRect_, 0);
+    bool changed = false;
+    if (PollLiveCapture(changed)) return pendingRedraw_ || changed;
+    if (pendingRedraw_ || changed || !haveFrame_) return rendered_;
     const ULONGLONG now = GetTickCount64();  // GDI fallback: a full readback of the screen, so at most 5 per second
     if (now - gdiAt_ < 200) return false;
     gdiAt_ = now;
     std::vector<std::uint32_t> px;
-    if (!CaptureScreen(backdropRect_, px)) return false;
+    if (!CaptureExcludedScreen(backdropRect_, px)) return false;
     const std::uint64_t h = Hash(px);
     if (h == backdropHash_) return false;
     backdropHash_ = h;
@@ -221,8 +245,9 @@ bool GlassWindow::GlassChanged() {
 
 void GlassWindow::Hide() {
     hidden_ = true;
-    if (frame_.texture && frame_.texture != texture_.Get()) { haveFrame_ = false; frame_.texture = nullptr; }  // it pointed into the duplication, which stops now
-    dup_.Reset();
+    if (frame_.texture && frame_.texture != texture_.Get()) { haveFrame_ = false; frame_ = {}; }
+    liveTexture_.Reset();
+    liveCapture_.Request(false, nullptr);
     if (haloWin_) haloWin_->Hide();
     if (hwnd_) ShowWindow(hwnd_, SW_HIDE);
 }

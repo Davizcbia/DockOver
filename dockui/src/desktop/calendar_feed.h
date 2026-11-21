@@ -11,6 +11,7 @@ namespace docky::desk {
 
 struct CalEvent {
     std::wstring title;
+    std::wstring location;         // LOCATION, may be empty
     ULONGLONG start = 0, end = 0;  // local FILETIME ticks
     bool allDay = false;
     unsigned color = 0x0A84FF;     // RGB
@@ -22,8 +23,18 @@ ULONGLONG LocalNow();                                // local FILETIME ticks
 ULONGLONG DayStart(ULONGLONG localTicks);            // local midnight of that day
 inline constexpr ULONGLONG kDayTicks = 864000000000ull;
 
+// One subscription as last fetched (the Calendar settings page shows these).
+struct FeedStatus {
+    std::wstring source;   // the line in calendars.txt, without its colour
+    std::wstring name;     // the calendar's own name (X-WR-CALNAME), empty when the feed has none
+    int events = 0;        // events in today - 1 .. today + 31
+    bool ok = false;       // the feed was read and is an iCalendar
+};
+
 class CalendarFeeds {
 public:
+    std::vector<FeedStatus> Feeds() const;   // in file order, from the last finished fetch
+    bool Fetching() const;
     void Start(HWND notify, UINT message);   // message is posted when the event list changed
     void Stop();
     void Refresh();                          // fetch now (also after calendars.txt changed)

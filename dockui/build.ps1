@@ -26,9 +26,9 @@ $command = 'call "{0}" -arch=x64 >nul && "{1}" -S "{2}" -B "{3}" -G Ninja -DCMAK
 & cmd.exe /d /s /c $command
 if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
 $exe = Join-Path $BuildDir 'LiquidDesktopManager.exe'
-Write-Host "Built docky: $exe"
+Write-Host "Built DockOver: $exe"
 if ($Run) {
-    Write-Host 'Starting docky (Dock and Menu Bar). Windows taskbar remains unchanged by default.'
+    Write-Host 'Starting DockOver (Dock and Menu Bar). Windows taskbar remains unchanged by default.'
     $argList = @()
     if ($Config) { $argList += @('--dock-config', ('"' + ($Config -replace '(\\+)$','$1$1') + '"')) }
     if ($Log) { $argList += @('--dock-log', ('"' + ($Log -replace '(\\+)$','$1$1') + '"')) }

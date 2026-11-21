@@ -1,6 +1,6 @@
 # Apple Design review — partial code review
 
-Status: **incomplete; no real desktop visual acceptance**. Artifact: native Win32/D3D docky source and isolated model/input tests, not a macOS application. Apple HIG is used as a design reference, not a claim of native-platform compliance. No pixel dimensions are asserted as Apple requirements. The design purpose is to make app launching and desktop controls discoverable while leaving the desktop visible.
+Status: **incomplete; no real desktop visual acceptance**. Artifact: native Win32/D3D DockOver source and isolated model/input tests, not a macOS application. Apple HIG is used as a design reference, not a claim of native-platform compliance. No pixel dimensions are asserted as Apple requirements. The design purpose is to make app launching and desktop controls discoverable while leaving the desktop visible.
 
 ## Critical — accessibility
 

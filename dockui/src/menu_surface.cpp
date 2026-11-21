@@ -4,11 +4,8 @@
 namespace liquid::popup {
 namespace { StaticBackdrop& Provider(){static StaticBackdrop p;return p;} }
 void SetStaticBackdrop(StaticBackdrop provider){Provider()=std::move(provider);}
-namespace { LiveBackdrop& Live(){static LiveBackdrop p;return p;} }
-void SetLiveBackdrop(LiveBackdrop provider){Live()=std::move(provider);}
 namespace { Microsoft::WRL::ComPtr<ID3D11Device>& RenderDevice(){static Microsoft::WRL::ComPtr<ID3D11Device> d;return d;} }
 void SetRenderDevice(ID3D11Device* device){RenderDevice()=device;}
-const LiveBackdrop& GetLiveBackdrop(){return Live();}
 const StaticBackdrop& GetStaticBackdrop(){return Provider();}
 bool UploadBackdrop(ID3D11Device* device,const RECT& screen,const std::vector<std::uint32_t>& bgra,Microsoft::WRL::ComPtr<ID3D11Texture2D>& texture,std::uint64_t& frameId,dock::BackdropFrame& out){
  const UINT w=static_cast<UINT>(screen.right-screen.left),h=static_cast<UINT>(screen.bottom-screen.top);
@@ -34,37 +31,31 @@ void MenuSurface::Start(){
 #ifdef LIQUID_MENU_DIAGNOSTICS
  wchar_t disabled[4]{};if(GetEnvironmentVariableW(L"LIQUID_TEST_DISABLE_MENU_WGC",disabled,ARRAYSIZE(disabled))>0)return;
 #endif
- backdropSeen_=false;staticValid_=false;
- if(GetStaticBackdrop())return;  // no capture at all
+ backdropSeen_=false;staticValid_=false;startedAt_=GetTickCount64();
  backdrop_.Request(!captureDisabled_,MonitorFromWindow(window_,MONITOR_DEFAULTTONEAREST));
 }
-void MenuSurface::Suspend(){backdrop_.Request(false,nullptr);
- if(const auto& live=GetLiveBackdrop()){dock::BackdropFrame none;bool changed=false;live(renderer_.Device(),RECT{},RECT{},false,none,changed);}}
-bool MenuSurface::PollLive(){
- const auto& live=GetLiveBackdrop();RECT rect{};if(!live||opaque_||!GetWindowRect(window_,&rect))return false;
- const LONG m=static_cast<LONG>(96.f*dpi_/96.f);const RECT want{rect.left-m,rect.top-m,rect.right+m,rect.bottom+m};
- dock::BackdropFrame frame;bool changed=false;return live(renderer_.Device(),want,rect,true,frame,changed)&&changed;
-}
+void MenuSurface::Suspend(){backdrop_.Request(false,nullptr);}
 bool MenuSurface::Resize(UINT width,UINT height,float dpi){
  if(width==width_&&height==height_&&dpi==dpi_)return true;
  const HRESULT hr=renderer_.Resize(width,height,dpi);if(FAILED(hr)){DLOG(L"menu surface: resize failed 0x%08X",hr);return false;}
  width_=width;height_=height;dpi_=dpi;return true;
 }
-bool MenuSurface::Draw(const std::vector<dock::MenuRowVisual>& rows){
+bool MenuSurface::Draw(const std::vector<dock::MenuRowVisual>& rows,int gridColumns,const std::wstring& footer){
  RECT rect{};if(!GetWindowRect(window_,&rect))return false;
  dock::BackdropFrame frame;bool have=false;
- dock::BackdropFrame liveFrame;bool liveChanged=false;
- if(const auto& live=GetLiveBackdrop();live&&live(renderer_.Device(),RECT{rect.left-static_cast<LONG>(dpi_),rect.top-static_cast<LONG>(dpi_),rect.right+static_cast<LONG>(dpi_),rect.bottom+static_cast<LONG>(dpi_)},rect,false,liveFrame,liveChanged)){
-  frame=liveFrame;have=true;  // live desktop duplication (follows video wallpapers)
- }else if(const auto& provider=GetStaticBackdrop()){  // capture-free backdrop: composed once per window position
+ if(backdrop_.Latest(rect,frame)){
+  have=true;
+ }else if(const auto& provider=GetStaticBackdrop();provider&&GetTickCount64()-startedAt_>300){
+  // The composed backdrop is the desktop without windows: shown through glass over a window it looks like a hole to
+  // the desktop. Only when the live capture has not delivered in 0.3 s (the popup waits for glass until then).
   const LONG m=static_cast<LONG>(96.f*dpi_/96.f);RECT want{rect.left-m,rect.top-m,rect.right+m,rect.bottom+m};
   if(!staticValid_||!EqualRect(&want,&staticRect_)){std::vector<std::uint32_t> px;staticValid_=provider(want,px)&&UploadBackdrop(renderer_.Device(),want,px,staticTexture_,staticId_,staticFrame_);staticRect_=want;}
   have=staticValid_;if(have)frame=staticFrame_;
- }else have=backdrop_.Latest(rect,frame);
+ }
  dock::DockFrame geometry;const float scale=dpi_/96.0f;geometry.dockLeft=0;geometry.dockTop=0;geometry.dockRight=width_/scale;geometry.dockBottom=height_/scale;
  dock::DockMetrics metrics;dock::GlassParameters glass=dock::RoleGlass(dock::GlassRole::Menu);
  dock::Materialize(glass,materialize_);glass.opacity=1.f;  // coverage is the visual's opacity, which also carries the text
- dock::Scene scene;scene.frame=&geometry;scene.metrics=&metrics;scene.menuMode=true;scene.menuRows=rows;scene.windowW=geometry.dockRight;scene.windowH=geometry.dockBottom;scene.windowScreenRect=rect;scene.glass=&glass;scene.opaqueFallback=opaque_;scene.opaqueBackground=background_;scene.opaqueForeground=foreground_;scene.backdrop=have&&!opaque_?&frame:nullptr;
+ dock::Scene scene;scene.frame=&geometry;scene.metrics=&metrics;scene.menuMode=true;scene.menuRows=rows;scene.menuGridColumns=gridColumns;scene.menuFooter=footer;scene.windowW=geometry.dockRight;scene.windowH=geometry.dockBottom;scene.windowScreenRect=rect;scene.glass=&glass;scene.opaqueFallback=opaque_;scene.opaqueBackground=background_;scene.opaqueForeground=foreground_;scene.backdrop=have&&!opaque_?&frame:nullptr;
  const HRESULT hr=renderer_.Render(scene);if(FAILED(hr)){DLOG(L"menu surface: render failed 0x%08X",hr);return false;}
  if(have&&!opaque_&&renderer_.LastUsedGpu())backdropSeen_=true;
  DLOG_DEBUG(L"menu surface: rendered material=%ls backdrop=%d",renderer_.LastUsedGpu()?L"liquid":L"smoked",have);  // per frame: debug only

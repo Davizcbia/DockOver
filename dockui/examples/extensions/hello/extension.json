@@ -1,13 +1,13 @@
 {
   "id": "com.example.hello",
-  "name": "Hello docky",
+  "name": "Hello DockOver",
   "statusItems": [
     {
       "id": "com.example.hello.focus",
       "title": "Focus",
       "icon": "icon.svg",
       "template": true,
-      "tooltip": "Hello docky sample item",
+      "tooltip": "Hello DockOver sample item",
       "menu": [
         { "id": "notepad", "title": "Open Notepad", "run": "notepad.exe" },
         { "separator": true },

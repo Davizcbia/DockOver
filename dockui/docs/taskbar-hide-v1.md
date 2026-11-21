@@ -1,7 +1,7 @@
 # Windows taskbar hiding (production v1)
 
-docky can fully hide Windows' own taskbar while it runs. This is separate from the Windows setting
-"Automatically hide the taskbar", which docky never changes.
+DockOver can fully hide Windows' own taskbar while it runs. This is separate from the Windows setting
+"Automatically hide the taskbar", which DockOver never changes.
 
 ## Components and responsibilities
 
@@ -10,17 +10,17 @@ docky can fully hide Windows' own taskbar while it runs. This is separate from t
 | `LiquidDesktopManager.exe` | Only owner of taskbar state (single-instance gate `Local\LiquidDesktopManagerV05SingleInstance`). Hides/shows via `ShowWindow` on Explorer's `Shell_TrayWnd` / `Shell_SecondaryTrayWnd`, registers the global shortcut, publishes `%LOCALAPPDATA%\LiquidDesktop\taskbar-status-v1.txt`. |
 | `docky-taskbar-guardian.exe` | Started by the Manager after the Dock's first frame. Signals readiness; **nothing is hidden before that**. Restores the taskbar if the Manager exits without a clean stop, and on "Restore now". Logs to `taskbar-guardian.log`. |
 | `docky-taskbar-restore.exe` | Standalone user tool. Without a running Manager it restores directly; with one, it asks the guardian. |
-| Windows Explorer | Owns the taskbar windows. docky never changes Explorer settings, the registry, `ABM_SETSTATE`, the work area or the Explorer process. |
+| Windows Explorer | Owns the taskbar windows. DockOver never changes Explorer settings, the registry, `ABM_SETSTATE`, the work area or the Explorer process. |
 
-All three docky parts share the write-ahead record `%LOCALAPPDATA%\LiquidDesktop\taskbar-windows-v1.txt`
-(and the named lock `Local\LiquidDesktopTaskbarRecordV1`). Only windows docky hid, that still belong to the same
+All three DockOver parts share the write-ahead record `%LOCALAPPDATA%\LiquidDesktop\taskbar-windows-v1.txt`
+(and the named lock `Local\LiquidDesktopTaskbarRecordV1`). Only windows DockOver hid, that still belong to the same
 Explorer process and are still hidden, are ever shown again. Corrupt, Pending or Conflict records and existing
 `.tmp` files are preserved and never acted on.
 
 ## Behaviour
 
-- Hide on startup (Settings › Windows Taskbar) is a preference; it is applied once when docky starts and again only
-  when Explorer recreates its taskbar (restart / new monitor) while docky keeps it hidden.
+- Hide on startup (Settings › Windows Taskbar) is a preference; it is applied once when DockOver starts and again only
+  when Explorer recreates its taskbar (restart / new monitor) while DockOver keeps it hidden.
 - Showing the taskbar by any means (shortcut, Settings, the user, another program) is respected and never undone
   automatically.
 - Default shortcut Ctrl + Alt + T (`RegisterHotKey`, no keyboard hook). It can be recorded, cleared or disabled in
@@ -38,17 +38,17 @@ mutex); the Manager then re-registers from the saved settings. Only one Settings
 
 ## Free work area (v2, opt-in, default off)
 
-Settings › Windows Taskbar › "Free work area when taskbar is hidden" (with confirmation). While docky hides the
+Settings › Windows Taskbar › "Free work area when taskbar is hidden" (with confirmation). While DockOver hides the
 taskbar, each affected monitor's work area is extended by exactly that taskbar's thickness on its edge using
 `SPI_SETWORKAREA` without `SPIF_UPDATEINIFILE` (never saved to the profile). Measured on Windows 11 (2026-11-08):
-with the `WM_SETTINGCHANGE` broadcast Explorer re-derives its hidden appbar's strip within ~0.5 s, so docky applies
+with the `WM_SETTINGCHANGE` broadcast Explorer re-derives its hidden appbar's strip within ~0.5 s, so DockOver applies
 its value without the broadcast and restores with it. Windows maximized to the previous work area (exact frame
 shape) are refit asynchronously (`SetWindowPos` + `SWP_ASYNCWINDOWPOS`, still maximized) on apply and on restore.
-If Explorer later reverts a monitor to exactly the recorded original, docky frees it again at most 3 times per
+If Explorer later reverts a monitor to exactly the recorded original, DockOver frees it again at most 3 times per
 minute; any other value is treated as a user/program change. Showing the taskbar lets Explorer re-derive its own
 work area. A write-ahead
 record (`taskbar-windows-v1.txt.workarea.txt`) keeps original and applied rects per monitor (device + monitor rect).
-A monitor is restored only while its work rect still equals docky's value; a change by Explorer, the user, a display
+A monitor is restored only while its work rect still equals DockOver's value; a change by Explorer, the user, a display
 change or another app is released and never re-applied (no loops). Restore happens before the taskbar is shown, on
 exit, by the guardian after a crash and by the restore tool. Monitors where Windows auto-hide already reserves nothing
 are left unchanged. Real-desktop acceptance (user-approved, single 2560×1440 monitor): 22/22 — freed on startup and
@@ -58,8 +58,8 @@ shortcut show, normal exit and by the guardian after a Manager crash. Multi-moni
 ## Explorer and multiple monitors (v2)
 
 Taskbar windows are tracked per window (HWND + Explorer PID + process start), so a restarted Explorer's new windows
-are never confused with old handles. New/rebuilt taskbars are re-hidden only while docky's state is Hidden, after two
-stable polls, at most 3 times per minute; then docky leaves the taskbar visible instead of looping. Manager, guardian
+are never confused with old handles. New/rebuilt taskbars are re-hidden only while DockOver's state is Hidden, after two
+stable polls, at most 3 times per minute; then DockOver leaves the taskbar visible instead of looping. Manager, guardian
 and restore tool are per-monitor DPI aware so taskbar and work-area rects are physical pixels.
 
 ## MyDockFinder comparison (behaviour only)
@@ -73,8 +73,8 @@ MyDockFinder was not run because it would change the real taskbar).
 
 ## Manual recovery
 
-Settings › Windows Taskbar › **Restore Windows taskbar now**, or run `docky-taskbar-restore.exe` from the docky
-folder. If both report a preserved/ambiguous record, the taskbar was not provably hidden by docky; showing it is
+Settings › Windows Taskbar › **Restore Windows taskbar now**, or run `docky-taskbar-restore.exe` from the DockOver
+folder. If both report a preserved/ambiguous record, the taskbar was not provably hidden by DockOver; showing it is
 then a manual decision (e.g. restarting Explorer from Task Manager).
 
 ## Known limits

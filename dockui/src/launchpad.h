@@ -13,6 +13,9 @@ namespace dock::launchpad {
 
 // Starts application discovery and icon loading in the background (call once at Dock start-up).
 void Prewarm();
+void RefreshApps();
+// Explicit isolated diagnostic: synthetic app labels, static backdrop, own-render BMP only.
+void ConfigureVisualTest(const std::wstring& snapshot);
 // Opens Launchpad on the Dock's monitor, or closes it when it is open. layoutPath: launchpad.json.
 void Toggle(HWND dock, const std::wstring& layoutPath, const std::wstring& settingsPath = {});
 // Posted to the Dock window: wParam 1 = Launchpad now covers the screen, 0 = closed.
@@ -27,10 +30,13 @@ struct AppMenuRequest {
     std::string appId;    // Launchpad id ("app:...")
     std::wstring target;  // what Launchpad launches (shell:AppsFolder\... or a shortcut path)
     std::wstring name;    // display name
+    int folder=-1;         // folder context menu, when no application is selected
+    HWND owner=nullptr;     // Launchpad owns its popup, keeping the Dock below it
     POINT screen{};       // physical screen pixels
 };
 // Thread-safe commands the Dock sends back to an open Launchpad (no-ops when it is closed).
 void OpenApp(const std::string& appId);  // launches the app and closes Launchpad
+void RenameFolderFromMenu(HWND owner,int folder);
 void Dismiss();                          // closes Launchpad (before a dialog or Explorer opens)
 void MenuClosed();                       // the app menu closed: Launchpad takes clicks again
 

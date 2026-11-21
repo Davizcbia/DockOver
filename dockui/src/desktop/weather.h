@@ -17,8 +17,8 @@ struct WeatherData {
     std::wstring place, error;
     float temp = 0, high = 0, low = 0;
     int code = 0; bool day = true;
-    std::vector<WeatherHour> hours;   // next 6 hours
-    std::vector<WeatherDay> days;     // today + 5
+    std::vector<WeatherHour> hours;   // next 24 hours
+    std::vector<WeatherDay> days;     // today + 9
     float weekLow = 0, weekHigh = 0;  // range of `days`, for the large widget's bars
 };
 

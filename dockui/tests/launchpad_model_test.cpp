@@ -6,6 +6,10 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <fstream>
+#include <shobjidl.h>
+#include <wrl/client.h>
 
 #include "app_registry.h"
 #include "launchpad_model.h"
@@ -118,6 +122,26 @@ int wmain(int argc, wchar_t** argv) {
     DeleteFileW(path.c_str());
     CHECK(Load(path, loaded, err, &exists) && !exists);
 
+    { // Dropping an executable/shortcut creates independent, idempotent launch entries.
+        const HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+        wchar_t temp[MAX_PATH]{},unique[MAX_PATH]{};GetTempPathW(MAX_PATH,temp);GetTempFileNameW(temp,L"lpi",0,unique);DeleteFileW(unique);CreateDirectoryW(unique,nullptr);
+        const auto root=std::filesystem::path(unique),source=root/L"Example file with a very long name.exe",dest=root/L"Launchpad Apps";
+        {std::ofstream out(source,std::ios::binary);out<<"fixture: do not execute";}
+        std::wstring error;CHECK(dock::apps::AddFilesToLaunchpad({source.wstring()},dest.wstring(),error)==1&&error.empty());
+        CHECK(dock::apps::AddFilesToLaunchpad({source.wstring()},dest.wstring(),error)==0&&error.empty());
+        CHECK(std::filesystem::exists(source));std::filesystem::path linkPath;
+        for(const auto& file:std::filesystem::directory_iterator(dest))linkPath=file.path();
+        Microsoft::WRL::ComPtr<IShellLinkW> link;Microsoft::WRL::ComPtr<IPersistFile> persist;
+        CHECK(SUCCEEDED(CoCreateInstance(CLSID_ShellLink,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&link))));
+        CHECK(SUCCEEDED(link.As(&persist))&&SUCCEEDED(persist->Load(linkPath.c_str(),STGM_READ)));
+        wchar_t target[MAX_PATH]{};link->GetPath(target,MAX_PATH,nullptr,SLGP_RAWPATH);if(_wcsicmp(source.c_str(),target)!=0)std::fwprintf(stderr,L"link expected [%ls] actual [%ls]\n",source.c_str(),target);CHECK(_wcsicmp(source.c_str(),target)==0);
+        link->SetArguments(L"--keep-original-arguments");const auto original=root/L"Existing shortcut.lnk";CHECK(SUCCEEDED(persist->Save(original.c_str(),TRUE)));
+        CHECK(dock::apps::AddFilesToLaunchpad({original.wstring()},dest.wstring(),error)==1);
+        for(const auto& file:std::filesystem::directory_iterator(dest))if(file.path().filename().wstring().find(L"Existing shortcut")!=std::wstring::npos){CHECK(SUCCEEDED(persist->Load(file.path().c_str(),STGM_READ)));wchar_t args[256]{};link->GetArguments(args,256);CHECK(wcscmp(args,L"--keep-original-arguments")==0);}
+        CHECK(dock::apps::AddFilesToLaunchpad({(root/L"missing.exe").wstring()},dest.wstring(),error)==0&&!error.empty());
+        persist.Reset();link.Reset();std::error_code ec;auto tempRoot=std::filesystem::path(temp).lexically_normal();if(tempRoot.filename().empty())tempRoot=tempRoot.parent_path();if(root.parent_path().lexically_normal()==tempRoot&&root.filename().wstring().rfind(L"lpi",0)==0)std::filesystem::remove_all(root,ec);if(SUCCEEDED(co))CoUninitialize();
+    }
+
     // Registry helpers.
     using dock::apps::IsLaunchableEntry;
     using dock::apps::MatchesQuery;
@@ -143,6 +167,7 @@ int wmain(int argc, wchar_t** argv) {
         CHECK(ok);
         CHECK(found.size() > 5);
         std::printf("discover: %zu apps in %.0f ms\n", found.size(), (t1.QuadPart - t0.QuadPart) * 1000.0 / fq.QuadPart);
+        std::vector<dock::apps::AppEntry> start;std::wstring startError;CHECK(dock::apps::DiscoverStartMenuApps(start,startError));CHECK(!start.empty());for(const auto& app:start)CHECK(!app.extraFile&&app.Target().rfind(L"shell:AppsFolder\\",0)==0);std::printf("start menu sources: %zu apps\n",start.size());
         CoUninitialize();
     }
 

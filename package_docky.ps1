@@ -43,7 +43,7 @@ if ($built -notmatch "DOCKY_VERSION `"$([regex]::Escape($version))`"") { throw "
 # Program files only. User settings, packs and logs live in %LOCALAPPDATA% and are never part of the package.
 $programs = 'LiquidDesktopManager.exe', 'LiquidDock.exe', 'LiquidMenuBar.exe', 'LiquidDesktopSettings.exe',
             'docky-taskbar-guardian.exe', 'docky-taskbar-restore.exe', 'docky-taskbar-guard-sim.exe',
-            'docky-wifi-list.exe', 'docky-ext.exe', 'docky-updater.exe'
+            'docky-wifi-list.exe', 'docky-ext.exe', 'docky-updater.exe', 'docky-now-playing.exe'
 $name = $(if ($Release) { "$asset-$version" } else { "DockOver-Windows-Dev-$version" })
 $stage = Join-Path $root "dist\$name"
 if (Test-Path -LiteralPath $stage) { $stage = "$stage-build-$([guid]::NewGuid().ToString('N'))" }
@@ -55,6 +55,9 @@ foreach ($p in $programs) {
     if (-not (Test-Path -LiteralPath $from)) { throw "$p is missing from $BuildDir." }
     Copy-Item -LiteralPath $from -Destination $programDir
 }
+$appsDir = Join-Path $BuildDir 'applications-menu'
+if (-not (Test-Path (Join-Path $appsDir 'DockOverApplications.exe'))) { throw 'Applications menu is missing. Rebuild DockOver.' }
+Copy-Item -LiteralPath $appsDir -Destination (Join-Path $programDir 'applications-menu') -Recurse
 $sounds = Join-Path $BuildDir 'assets\user-sound'
 if (Test-Path -LiteralPath $sounds) {
     New-Item (Join-Path $programDir 'assets') -ItemType Directory | Out-Null

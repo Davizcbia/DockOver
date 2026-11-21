@@ -38,6 +38,8 @@ std::vector<uint32_t> ApplyIconEdit(const std::vector<uint32_t>& pixels, UINT w,
 class CustomIconStore {
 public:
     bool Load(const std::wstring& path, std::wstring& error);
+    std::wstring Label(const std::string& id) const;
+    bool SetLabel(const std::string& id, const std::wstring& label, std::wstring& error);
     bool Available() const { return available_; }
     const std::wstring* Find(const std::string& id) const;
     bool Set(const std::string& id, const std::wstring& path, std::wstring& error);

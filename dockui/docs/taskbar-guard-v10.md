@@ -1,4 +1,4 @@
-# docky V0.10 — taskbar safety interim
+# DockOver V0.10 — taskbar safety interim
 
 The production watchdog is **not integrated**. Both default and explicit `--hide-taskbar` paths currently refuse to hide; the prior unguarded hide call was removed from the Manager path. Existing startup recovery behavior for an old record remains. Do not enable hiding until the complete guardian/first-Present/transaction protocol in `taskbar-guard-v09.md` is implemented and verified. No real taskbar hiding is authorized for this task.
 

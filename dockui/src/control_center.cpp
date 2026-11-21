@@ -1,4 +1,9 @@
 #include "control_center.h"
+#include "audio_output_icons.h"
+#include <shellapi.h>
+#include <shobjidl.h>
+#include <wrl/client.h>
+#include <cwctype>
 #include "vblank.h"
 #include "status_glyphs.h"
 #include "battery_indicator.h"
@@ -10,6 +15,7 @@
 #include "design_tokens.h"
 #include "glass_params.h"
 #include "motion.h"
+#include "popup_dismiss_watch.h"
 #include <winrt/Windows.UI.ViewManagement.h>
 
 #include <windowsx.h>
@@ -43,6 +49,7 @@
 #include <vector>
 
 #include "backdrop_wgc.h"
+#include "desktop/duplication.h"
 #include "glass_params.h"
 #include "log.h"
 #include "material.h"
@@ -72,6 +79,7 @@ constexpr float kMenuSwitchW = 54.0f, kMenuSwitchH = 24.0f;
 constexpr float kSliderThumbInset = 12.0f;  // half the resting slider thumb (24 DIP): its centre's distance from the track ends
 std::mutex g_anchorMutex;
 RECT g_anchor{};
+bool g_openAbove = false;  // guarded by g_anchorMutex
 
 double Now() {
     static LARGE_INTEGER f{};
@@ -84,7 +92,58 @@ double Now() {
 // ---------------------------------------------------------------------------------------------
 // System worker: one MTA thread running blocking system calls. Volume/brightness writes coalesce
 // (only the newest pending value is applied), so slider drags never queue up stale work.
-struct OutputDevice {std::wstring id,name;bool selected=false;};
+struct OutputDevice {
+    std::wstring id, name, alias;
+    std::string icon;
+    bool selected = false, hidden = false;
+    const std::wstring& Label() const { return alias.empty() ? name : alias; }
+};
+
+constexpr int kOutputNameLimit = 80;
+
+INT_PTR CALLBACK RenameOutputDialog(HWND window, UINT message, WPARAM w, LPARAM l) {
+    constexpr int editId = 100;
+    if (message == WM_INITDIALOG) {
+        auto* name = reinterpret_cast<std::wstring*>(l);
+        SetWindowLongPtrW(window, DWLP_USER, l);
+        SetWindowTextW(window, L"Rename output");
+        auto create = [&](DWORD ex, const wchar_t* kind, const wchar_t* label,
+                          DWORD style, int id, RECT bounds) {
+            MapDialogRect(window, &bounds);
+            HWND control = CreateWindowExW(ex, kind, label, WS_CHILD | WS_VISIBLE | style,
+                bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), GetModuleHandleW(nullptr), nullptr);
+            SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            return control;
+        };
+        create(0, L"STATIC", L"Display name (leave blank to use the Windows name)", 0, -1, {8, 8, 210, 20});
+        HWND edit = create(WS_EX_CLIENTEDGE, L"EDIT", name->c_str(),
+            WS_TABSTOP | ES_AUTOHSCROLL, editId, {8, 24, 212, 39});
+        create(0, L"BUTTON", L"Save", WS_TABSTOP | BS_DEFPUSHBUTTON, IDOK, {107, 49, 157, 64});
+        create(0, L"BUTTON", L"Cancel", WS_TABSTOP, IDCANCEL, {162, 49, 212, 64});
+        SendMessageW(edit, EM_SETLIMITTEXT, kOutputNameLimit, 0);
+        SendMessageW(edit, EM_SETSEL, 0, -1);
+        SendMessageW(window, DM_SETDEFID, IDOK, 0);
+        SetFocus(edit);
+        return FALSE;
+    }
+    if (message == WM_CLOSE) { EndDialog(window, IDCANCEL); return TRUE; }
+    if (message != WM_COMMAND) return FALSE;
+    switch (LOWORD(w)) {
+    case IDOK: {
+        wchar_t buffer[kOutputNameLimit + 1]{};
+        GetDlgItemTextW(window, editId, buffer, ARRAYSIZE(buffer));
+        std::wstring text(buffer);
+        const auto first = text.find_first_not_of(L" \t");
+        auto* name = reinterpret_cast<std::wstring*>(GetWindowLongPtrW(window, DWLP_USER));
+        *name = first == std::wstring::npos ? L"" : text.substr(first, text.find_last_not_of(L" \t") - first + 1);
+        EndDialog(window, IDOK);
+        return TRUE;
+    }
+    case IDCANCEL: EndDialog(window, IDCANCEL); return TRUE;
+    }
+    return FALSE;
+}
 std::vector<OutputDevice> QueryOutputs(){
     std::vector<OutputDevice> result;ComPtr<IMMDeviceEnumerator> e;ComPtr<IMMDeviceCollection> collection;ComPtr<IMMDevice> current;
     if(FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator),nullptr,CLSCTX_ALL,IID_PPV_ARGS(&e))) || FAILED(e->EnumAudioEndpoints(eRender,DEVICE_STATE_ACTIVE,&collection)))return result;
@@ -205,10 +264,47 @@ private:
 };
 
 // ---------------------------------------------------------------------------------------------
+// Brings the app behind the current media session forward. Its app id is a package app id ("Family!App": activated
+// through the shell) or, for desktop apps, usually the program file name ("Spotify.exe"): its main window is restored
+// and brought forward; a program running only in the tray is started again, which shows its window (single instance);
+// otherwise the shell opens shell:AppsFolder\<id>.
+bool ActivateMediaApp(const std::wstring& id) {
+    if (id.find(L'!') != std::wstring::npos) {
+        Microsoft::WRL::ComPtr<IApplicationActivationManager> manager; DWORD pid = 0;
+        if (SUCCEEDED(CoCreateInstance(CLSID_ApplicationActivationManager, nullptr, CLSCTX_LOCAL_SERVER, IID_PPV_ARGS(&manager))) &&
+            SUCCEEDED(manager->ActivateApplication(id.c_str(), nullptr, AO_NONE, &pid))) return true;
+    }
+    std::wstring exe = id; for (auto& c : exe) c = wchar_t(towlower(c));
+    if (exe.size() > 4 && exe.compare(exe.size() - 4, 4, L".exe") == 0) {
+        struct Find { std::wstring exe; HWND window = nullptr; std::wstring path; } find{exe};
+        EnumWindows([](HWND w, LPARAM l) -> BOOL {
+            auto* f = reinterpret_cast<Find*>(l);
+            DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid); if (!process) return TRUE;
+            wchar_t path[MAX_PATH]{}; DWORD size = MAX_PATH; const bool named = QueryFullProcessImageNameW(process, 0, path, &size) != FALSE; CloseHandle(process);
+            if (!named) return TRUE;
+            std::wstring name = path; name = name.substr(name.find_last_of(L'\\') + 1); for (auto& c : name) c = wchar_t(towlower(c));
+            if (name != f->exe) return TRUE;
+            f->path = path;
+            wchar_t title[8]{};
+            if (IsWindowVisible(w) && !GetWindow(w, GW_OWNER) && GetWindowTextW(w, title, 8) > 0 && !(GetWindowLongW(w, GWL_EXSTYLE) & WS_EX_TOOLWINDOW)) { f->window = w; return FALSE; }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&find));
+        if (find.window) {
+            if (IsIconic(find.window)) ShowWindow(find.window, SW_RESTORE);
+            if (!SetForegroundWindow(find.window)) SwitchToThisWindow(find.window, TRUE);
+            return true;
+        }
+        if (!find.path.empty() && reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", find.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32) return true;
+    }
+    const std::wstring target = L"shell:AppsFolder\\" + id;
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr, L"open", L"explorer.exe", target.c_str(), nullptr, SW_SHOWNORMAL)) > 32;
+}
+
 enum class Page { Main, Wifi, Bluetooth };
 enum class Hit {
-    None, WifiToggle, WifiBody, BtToggle, BtBody, Airplane, Focus, Battery, MediaPrev, MediaPlay, MediaNext, Media,
-    DisplayTitle, DisplaySlider, SoundTitle, SoundSlider, Mute, Back, PageSwitch, Row, OtherNetworks, Settings
+    None, WifiToggle, WifiBody, BtToggle, BtBody, Airplane, Focus, Battery, MediaPrev, MediaPlay, MediaNext, Media, MediaCover,
+    DisplayTitle, DisplaySlider, SoundTitle, SoundSlider, Mute, Back, PageSwitch, Row, OtherNetworks, Settings, ManageOutputs
 };
 
 struct Module {
@@ -238,6 +334,8 @@ private:
     D2D1::ColorF Surface(float a=1.f) const {const unsigned c=palette_.surface;return D2D1::ColorF(((c>>16)&255)/255.f,((c>>8)&255)/255.f,(c&255)/255.f,a);}
     liquid::design::Palette palette_=liquid::design::Dark;
     bool forceOpaque_=false, contrastMode_=false;
+    bool mediaArtworkBackground_=false;
+    ComPtr<ID2D1Bitmap1> mediaArtwork_; uint64_t mediaArtworkHash_=0;
     int backdropBlur_=60;  // Settings > Control Center > Background blur (0..100 %)
     // Blur radius (blurSpread) behind the whole panel: the Control Center uses docky Settings; menu bar popups (Wi-Fi,
     // Bluetooth, sound) use Glass Studio > Menu bar popups > Background blur.
@@ -331,9 +429,19 @@ private:
     float glassFade_ = 0.f;
     double tBackdropReady_ = 0, tFirstGlass_ = 0, tFirstFallback_ = 0, tAnimDone_ = 0;
 
-    bool soundOnly_=false, directDetail_=false;
+    bool soundOnly_=false, directDetail_=false, above_=false;  // above_: opened from a Dock cell, content sits above the anchor
     std::vector<OutputDevice> outputs_;
-    size_t outputOffset_=0;
+    std::vector<liquid::settings::AudioOutputPreference> outputPreferences_;
+    std::vector<OutputDevice> activeOutputs_;
+    std::wstring outputSettingsPath_;
+    docky::motion::Spring outputScroll_;
+    D2D1_RECT_F outputViewport_{}, manageOutputsRow_{};
+    bool managingOutputs_ = false, outputEditorOpen_ = false, closeAfterOutputEditor_ = false;
+    static constexpr float kOutputRowHeight = 32.0f;
+    double OutputScrollMax() const;
+    D2D1_RECT_F OutputRow(size_t index) const;
+    void RefreshOutputs();
+    void EditOutput(size_t index);
     Page page_ = Page::Main;
     std::vector<Module> modules_;  // glass plates of the current page
     // Main-page geometry
@@ -370,14 +478,16 @@ private:
     docky::motion::Spring open_;  // 0 closed .. 1 open
     // Critically damped: no overshoot on a panel that just appeared. 95% settle ~0.75 x response.
     // Reference: open ~0.12 s from first visible frame to settled, close ~0.16 s.
-    inline static const docky::motion::SpringSpec kOpenSpring = docky::motion::SpringSpec::FromResponse(0.22, 1.0);
-    inline static const docky::motion::SpringSpec kCloseSpring = docky::motion::SpringSpec::FromResponse(0.22, 1.0);
+    inline static const docky::motion::SpringSpec kOpenSpring = docky::motion::tokens::PopoverOpen;
+    inline static const docky::motion::SpringSpec kCloseSpring = docky::motion::tokens::PopoverClose;
     static constexpr float kOpenScaleFrom = 0.02f;  // reference shows < 2% scale; most of the "larger" look is defocus
     static constexpr float kDefocusMax = 6.0f;      // DIP of content/outline softening at the first visible frame
     double transitionAt_ = 0;
     bool closing_ = false, animating_ = true, needsFrame_ = true, reducedMotion_ = false;
-    double lastT_ = 0, openedAt_ = 0;
+    double lastT_ = 0;
+    liquid::popup::DismissWatch dismissal_;
     // Open-path timing (ms since Run start); logged once as 'cc: timing'.
+    bool wgcStarted_ = false, volumeStarted_ = false;
     double t0_ = 0, tWindow_ = 0, tDevice_ = 0, tSwapD2D_ = 0, tDcomp_ = 0, tText_ = 0, tGlass_ = 0, tWgc_ = 0, tShown_ = 0, tFirstFrame_ = 0, tFirstPresent_ = 0, tFirstCapture_ = 0;
     double prevFrame_ = 0, maxGap_ = 0; int frames_ = 0; bool timingLogged_ = false;
     double Ms() const { return (Now() - t0_) * 1000.0; }
@@ -482,8 +592,14 @@ HRESULT Panel::InitGraphics() {
     tGlass_ = Ms();
     backdrop_.SetDevice(d3d_.Get());
     backdrop_.SetExcludedWindow(hwnd);
-    // Capture startup may block for tens of milliseconds. Start it after the first fallback frames.
-    // Device and exclusion setup still happen here, before any capture can start.
+    // Capture startup may block for tens of milliseconds, so it normally starts after the first fallback frames
+    // (kTimerWgcStart). When this process already duplicates the monitor (the Dock's live glass), joining it costs
+    // nothing: start now, so the first visible frame is glass ~80 ms sooner (the reveal waits for it).
+    if (!forceOpaque_ && !g_visualCaptureTest && docky::desk::SharedDesktop::ForMonitor(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)).Active()) {
+        backdrop_.Request(true, MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+        tWgc_ = Ms(); wgcStarted_ = true;
+        DLOG(L"cc: capture joined the running desktop duplication at ms=%.1f", tWgc_);
+    }
     return S_OK;
 }
 
@@ -515,19 +631,161 @@ HRESULT Panel::ResizeTarget() {
 
 // Geometry follows the macOS Control Center module grid: 140 pt columns, 64 pt pills, 12 pt gaps,
 // large modules 140x140, full-width slider modules 292x64, continuous rounded corners.
+double Panel::OutputScrollMax() const {
+    return outputs_.size() > 8 ? (outputs_.size() - 8) * kOutputRowHeight : 0.0;
+}
+
+D2D1_RECT_F Panel::OutputRow(size_t index) const {
+    const float top = outputViewport_.top + index * kOutputRowHeight
+        - static_cast<float>(std::clamp(outputScroll_.Value(), 0.0, OutputScrollMax()));
+    return D2D1::RectF(outputViewport_.left, top, outputViewport_.right, top + kOutputRowHeight);
+}
+
+void Panel::RefreshOutputs() {
+    auto ordered = activeOutputs_;
+    auto preference = [&](const std::wstring& id) {
+        return std::find_if(outputPreferences_.begin(), outputPreferences_.end(),
+            [&](const auto& entry) { return entry.id == id; });
+    };
+    std::stable_sort(ordered.begin(), ordered.end(), [&](const auto& a, const auto& b) {
+        return preference(a.id) < preference(b.id);
+    });
+    for (auto& device : ordered) {
+        const auto entry = preference(device.id);
+        if (entry == outputPreferences_.end()) continue;
+        device.alias = entry->name;
+        device.icon = entry->icon;
+        device.hidden = entry->hidden;
+    }
+    if (!managingOutputs_)
+        ordered.erase(std::remove_if(ordered.begin(), ordered.end(), [](const auto& device) {
+            return device.hidden;
+        }), ordered.end());
+    const bool sameRows = ordered.size() == outputs_.size() &&
+        std::equal(ordered.begin(), ordered.end(), outputs_.begin(),
+            [](const auto& a, const auto& b) { return a.id == b.id; });
+    const bool sizeChanged = ordered.size() != outputs_.size();
+    outputs_ = std::move(ordered);
+    if (!sameRows) {
+        if (pressed_ == Hit::Row) pressed_ = Hit::None;
+        if (kbFocus_ == Hit::Row) { kbFocus_ = Hit::None; kbRow_ = -1; }
+        if (hover_ == Hit::Row) { hover_ = Hit::None; hoverRow_ = -1; }
+    }
+    const double maxScroll = OutputScrollMax();
+    if (outputScroll_.Value() > maxScroll) outputScroll_.SnapTo(maxScroll);
+    else if (outputScroll_.Target() > maxScroll) outputScroll_.SetTarget(maxScroll);
+    if (sizeChanged && haveState_) {
+        Layout();
+        Place();
+        ResizeTarget();
+    }
+    needsFrame_ = true;
+}
+
+void Panel::EditOutput(size_t index) {
+    if (outputEditorOpen_ || index >= outputs_.size()) return;
+    const auto device = outputs_[index];
+    enum : UINT { Rename = 1, Hide, MoveUp, MoveDown, FirstIcon = 100 };
+    HMENU menu = CreatePopupMenu();
+    HMENU icons = CreatePopupMenu();
+    if (!menu || !icons) {
+        if (menu) DestroyMenu(menu);
+        if (icons) DestroyMenu(icons);
+        return;
+    }
+    auto add = [](HMENU target, UINT id, const wchar_t* label, UINT flags = 0) {
+        AppendMenuW(target, MF_STRING | flags, id, label);
+    };
+    add(menu, Rename, L"Rename…");
+    add(menu, Hide, device.hidden ? L"Show in output list" : L"Hide from output list");
+    add(menu, MoveUp, L"Move up", index > 0 ? MF_ENABLED : MF_GRAYED);
+    add(menu, MoveDown, L"Move down", index + 1 < outputs_.size() ? MF_ENABLED : MF_GRAYED);
+    const auto& presets = docky::audio_output::presets;
+    for (UINT i = 0; i < ARRAYSIZE(presets); ++i)
+        add(icons, FirstIcon + i, presets[i].name, device.icon == presets[i].key ? MF_CHECKED : 0);
+    if (!AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(icons), L"Icon")) DestroyMenu(icons);
+    const auto bounds = OutputRow(index);
+    POINT anchor{static_cast<LONG>((bounds.right - 8) * scale_),
+                 static_cast<LONG>(std::min(bounds.bottom, outputViewport_.bottom) * scale_)};
+    ClientToScreen(hwnd, &anchor);
+    outputEditorOpen_ = true;
+    const UINT command = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTALIGN,
+        anchor.x, anchor.y, hwnd, nullptr);
+    DestroyMenu(menu);
+
+    auto next = outputPreferences_;
+    auto ensure = [&](const std::wstring& id) {
+        auto found = std::find_if(next.begin(), next.end(), [&](const auto& entry) { return entry.id == id; });
+        if (found != next.end()) return static_cast<size_t>(found - next.begin());
+        next.push_back({id, {}, {}, false});
+        return next.size() - 1;
+    };
+    if (command) {
+        // Preserve the current order when adding preferences for a previously unconfigured endpoint.
+        for (const auto& output : outputs_) ensure(output.id);
+    }
+    bool edited = false;
+    if (command == Rename && !closeAfterOutputEditor_) {
+        struct DialogTemplate {
+            DLGTEMPLATE dialog;
+            WORD menu, windowClass, title;
+        };
+        alignas(DWORD) DialogTemplate layout{};
+        layout.dialog.style = WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME | DS_CENTER;
+        layout.dialog.cx = 220;
+        layout.dialog.cy = 73;
+        auto alias = device.alias;
+        if (DialogBoxIndirectParamW(GetModuleHandleW(nullptr), &layout.dialog, hwnd, RenameOutputDialog,
+                                    reinterpret_cast<LPARAM>(&alias)) == IDOK) {
+            next[ensure(device.id)].name = std::move(alias);
+            edited = true;
+        }
+    } else if (command == Hide) {
+        next[ensure(device.id)].hidden = !device.hidden;
+        edited = true;
+    } else if (command == MoveUp || command == MoveDown) {
+        const auto current = std::find_if(outputs_.begin(), outputs_.end(), [&](const auto& row) { return row.id == device.id; });
+        if (current != outputs_.end()) {
+            const auto row = static_cast<size_t>(current - outputs_.begin());
+            if ((command == MoveUp && row > 0) || (command == MoveDown && row + 1 < outputs_.size())) {
+                const size_t from = ensure(device.id);
+                const size_t to = ensure(outputs_[command == MoveUp ? row - 1 : row + 1].id);
+                std::iter_swap(next.begin() + from, next.begin() + to);
+                edited = true;
+            }
+        }
+    } else if (command >= FirstIcon && command < FirstIcon + ARRAYSIZE(presets)) {
+        next[ensure(device.id)].icon = presets[command - FirstIcon].key;
+        edited = true;
+    }
+    outputEditorOpen_ = false;
+    if (edited) {
+        if (liquid::settings::WriteAudioOutputs(outputSettingsPath_, next) == liquid::settings::SaveStatus::Saved) {
+            outputPreferences_ = std::move(next);
+            RefreshOutputs();
+        } else {
+            status_ = L"Could not save output preferences.";
+            statusUntil_ = Now() + 4.0;
+            SetTimer(hwnd, kTimerStatus, 4000, nullptr);
+        }
+    }
+    needsFrame_ = true;
+    if (closeAfterOutputEditor_) Close(L"toggle");
+}
+
 void Panel::Layout() {
     modules_.clear();
     rows_.clear();
     const float x0 = kPadX, x1 = kPadX + kCol + kGap;
     float y = kPadTop;
     if (soundOnly_) {
-        const size_t n=std::max<size_t>(1,std::min<size_t>(outputs_.size(),8));
-        outputOffset_=std::min(outputOffset_,outputs_.size()>n?outputs_.size()-n:0);
-        const float listTop=y+92,footer=listTop+static_cast<float>(n)*32;
+        const size_t n = std::clamp<size_t>(outputs_.size(), 1, 8);
+        const float listTop = y + 92, footer = listTop + n * kOutputRowHeight;
+        outputViewport_ = D2D1::RectF(x0 + 8, listTop, x0 + kWidth - 8, footer);
+        manageOutputsRow_ = D2D1::RectF(x0 + kWidth - 84, y + 66, x0 + kWidth - 8, y + 91);
         sound_ = {D2D1::RectF(x0,y,x0+kWidth,footer+40),16.0f};
         soundTrack_=D2D1::RectF(x0+36,y+43,x0+kWidth-40,y+49);
         muteBtn_=D2D1::RectF(x0+kWidth-38,y+32,x0+kWidth-8,y+60);
-        for(size_t i=0;i<n;++i)rows_.push_back(D2D1::RectF(x0+8,listTop+i*32,x0+kWidth-8,listTop+(i+1)*32));
         settingsRow_=D2D1::RectF(x0+8,footer+4,x0+kWidth-8,footer+36);
         modules_.push_back(sound_);y=sound_.r.bottom;
     } else if (page_ == Page::Main) {
@@ -592,10 +850,14 @@ void Panel::Layout() {
                 if (known.empty() && other.empty()) section(L"Networks", {-1});
             }
         } else if (on) {
+            // Every paired device (macOS Bluetooth menu): connected ones highlighted, the rest dimmed; no header.
             std::vector<int> devices;
-            for (int i = 0; i < static_cast<int>(std::min<size_t>(st_.btDevices.size(), 10)); ++i) devices.push_back(i);
+            for (int i = 0; i < static_cast<int>(std::min<size_t>(st_.btPaired.size(), 12)); ++i) devices.push_back(i);
             if (devices.empty()) devices.push_back(-1);
-            section(L"Devices", devices);
+            float ry = sep + 6.0f;
+            for (int item : devices) { rows_.push_back(D2D1::RectF(x0 + kMenuRowInset, ry, x0 + W - kMenuRowInset, ry + kMenuRow)); rowItem_.push_back(item); ry += kMenuRow; }
+            sep = ry + kMenuAfterRows;
+            menuSeparators_.push_back(sep);
         }
         if (wifi && on) {
             otherNetworks_ = D2D1::RectF(x0 + kMenuRowInset, sep + 1.0f, x0 + W - kMenuRowInset, sep + kMenuAction);
@@ -623,6 +885,17 @@ void Panel::Place() {
     int x = (directDetail_||soundOnly_) ? static_cast<int>(anchor_.right) - static_cast<int>(pxW_) + static_cast<int>(kPadX*scale_)
                                         : static_cast<int>(mi.rcMonitor.right) - static_cast<int>(pxW_) + static_cast<int>((kPadX - kMargin)*scale_);
     int y = anchor_.bottom;
+    if (above_) {  // Dock cell: the content's bottom 8 DIP above the anchor, centred on it, kept on the monitor
+        const int contentW = static_cast<int>((W_ - 2 * kPadX) * scale_), padX = static_cast<int>(kPadX * scale_), margin = static_cast<int>(kMargin * scale_);
+        int left = (anchor_.left + anchor_.right) / 2 - contentW / 2;
+        left = std::clamp(left, static_cast<int>(mi.rcMonitor.left) + margin, std::max(static_cast<int>(mi.rcMonitor.left) + margin, static_cast<int>(mi.rcMonitor.right) - margin - contentW));
+        x = left - padX;
+        y = anchor_.top - static_cast<int>(8.0f * scale_) - static_cast<int>((H_ - kPadBottom) * scale_);
+        y = std::max(y, static_cast<int>(mi.rcMonitor.top) - static_cast<int>(kPadTop * scale_));
+        SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(pxW_), static_cast<int>(pxH_), SWP_NOACTIVATE);
+        GetWindowRect(hwnd, &windowRect_);
+        return;
+    }
     x = std::max(x, static_cast<int>(mi.rcMonitor.left) - static_cast<int>((kPadX - kMargin)*scale_));
     y = std::clamp(y, static_cast<int>(mi.rcMonitor.top), std::max(static_cast<int>(mi.rcMonitor.top), static_cast<int>(mi.rcMonitor.bottom - pxH_)));
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, static_cast<int>(pxW_), static_cast<int>(pxH_), SWP_NOACTIVATE);
@@ -705,9 +978,9 @@ bool Panel::SwitchStateOn() const {
 bool Panel::UpdateSwitchMotion(double dt) {
     const bool on = SwitchStateOn();
     if (!switchInit_) { switchInit_ = true;
-        switchOn_.SetSpec(docky::motion::SpringSpec::FromResponse(0.40, 0.74)); switchOn_.SetRest(0.001, 0.01); switchOn_.SnapTo(on ? 1.0 : 0.0);
-        switchPress_.SetSpec(docky::motion::SpringSpec::FromResponse(0.18, 1.0)); switchPress_.SetRest(0.002, 0.02);
-        switchColor_.SetSpec(docky::motion::SpringSpec::FromResponse(0.26, 1.0)); switchColor_.SetRest(0.002, 0.02); switchColor_.SnapTo(on ? 1.0 : 0.0); }
+        switchOn_.SetSpec(docky::motion::tokens::Toggle); switchOn_.SetRest(0.001, 0.01); switchOn_.SnapTo(on ? 1.0 : 0.0);
+        switchPress_.SetSpec(docky::motion::tokens::Press); switchPress_.SetRest(0.002, 0.02);
+        switchColor_.SetSpec(docky::motion::tokens::Tint); switchColor_.SetRest(0.002, 0.02); switchColor_.SnapTo(on ? 1.0 : 0.0); }
     if (switchDragging_) switchOn_.SnapTo(switchDragPos_);  // 1:1 with the pointer
     else switchOn_.SetTarget(on ? 1.0 : 0.0);
     switchColor_.SetTarget(switchDragging_ ? (switchDragPos_ >= 0.5 ? 1.0 : 0.0) : (on ? 1.0 : 0.0));
@@ -773,12 +1046,13 @@ void Panel::DrawLensHighlights(D2D1_RECT_F t, float op, float k, D2D1_POINT_2F p
 
 bool Panel::RefreshTheme(){
  const auto loaded=liquid::settings::Load(g_settingsPath.empty()?liquid::settings::DefaultPath():g_settingsPath).value;
- const int mode=loaded.appearance.mode;backdropBlur_=loaded.controlCenter.backdropBlur;
+ const bool mediaChanged=mediaArtworkBackground_!=loaded.controlCenter.mediaArtworkBackground;
+ const int mode=loaded.appearance.mode;backdropBlur_=loaded.controlCenter.backdropBlur;mediaArtworkBackground_=loaded.controlCenter.mediaArtworkBackground;
  bool systemDark=true;try{auto ui=winrt::Windows::UI::ViewManagement::UISettings();auto c=ui.GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Background);systemDark=(int(c.R)*299+int(c.G)*587+int(c.B)*114)<128000;}catch(...){}
  HIGHCONTRASTW hc{sizeof(hc)};const bool contrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0)&&(hc.dwFlags&HCF_HIGHCONTRASTON);
  const bool opaque=contrast||!liquid::theme::IsDark(mode,systemDark);const auto next=liquid::theme::Palette(mode,systemDark,contrast);
  const bool changed=forceOpaque_!=opaque||contrastMode_!=contrast||palette_.surface!=next.surface||palette_.primary!=next.primary;
- forceOpaque_=opaque;contrastMode_=contrast;palette_=next;if(changed)DLOG(L"cc: appearance=%d opaque=%d contrast=%d",mode,opaque,contrast);return changed;
+ forceOpaque_=opaque;contrastMode_=contrast;palette_=next;if(changed)DLOG(L"cc: appearance=%d opaque=%d contrast=%d",mode,opaque,contrast);return changed||mediaChanged;
 }
 void Panel::Text(const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, float alpha, D2D1::ColorF c) {
     if(forceOpaque_&&c.r==1.f&&c.g==1.f&&c.b==1.f)c=Ink(c.a);
@@ -813,22 +1087,40 @@ bool Panel::MakeIconMask(const std::vector<uint32_t>& pixels,UINT w,UINT h,IconM
     const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96);
     return SUCCEEDED(dc_->CreateBitmap(D2D1::SizeU(w,h),pixels.data(),w*4,&props,result.bitmap.GetAddressOf()));
 }
+// Decoded status icon pixels, kept between openings: decoding the PNGs and drawing the fallback Wi-Fi glyph with GDI+
+// took a good part of each opening. Reused while the active pack's files are unchanged (path and write time).
+struct DecodedStatusIcons { std::wstring signature; std::vector<std::pair<std::string,std::vector<uint32_t>>> icons; std::vector<std::pair<UINT,UINT>> sizes; std::vector<uint32_t> wifi; };
+std::mutex g_decodedMutex;
+DecodedStatusIcons g_decoded;
 void Panel::LoadStatusIcons(){
     statusIcons_.clear();docky::workshop::Pack pack;bool enabled=false;std::wstring error;
     const auto root=g_workshopRoot.empty()?docky::workshop::DefaultRoot():g_workshopRoot;
-    if(docky::workshop::Active(root,pack,enabled,error)&&enabled){
+    std::vector<std::pair<std::string,std::wstring>> files;std::wstring signature=root;
+    if(docky::workshop::Active(root,pack,enabled,error)&&enabled)
       for(const auto& [key,path]:pack.icons){if(key.rfind("wifi.",0)!=0&&key.rfind("sound.",0)!=0&&key.rfind("battery.",0)!=0)continue;
-        std::vector<uint32_t> pixels;UINT w=0,h=0;std::wstring why;IconMask icon;
-        if(dock::LoadCustomIconPixels(path,pixels,w,h,why)&&MakeIconMask(pixels,w,h,icon))statusIcons_.emplace(key,std::move(icon));}
+        files.emplace_back(key,path);WIN32_FILE_ATTRIBUTE_DATA a{};GetFileAttributesExW(path.c_str(),GetFileExInfoStandard,&a);
+        signature+=L"|"+path+L"@"+std::to_wstring(a.ftLastWriteTime.dwLowDateTime)+L"."+std::to_wstring(a.ftLastWriteTime.dwHighDateTime);}
+    DecodedStatusIcons decoded;bool reused=false;
+    {   std::lock_guard<std::mutex> lock(g_decodedMutex);
+        if(!g_decoded.wifi.empty()&&g_decoded.signature==signature){decoded=g_decoded;reused=true;}
     }
-    for(const auto& entry:docky::usersound::entries){std::vector<uint32_t> pixels;UINT w=0,h=0;IconMask icon;
-      if(docky::usersound::Load(entry.file,pixels,w,h)&&MakeIconMask(pixels,w,h,icon))statusIcons_[entry.key]=std::move(icon);}
-    std::vector<uint32_t> pixels(128*128,0);ULONG_PTR token=0;Gdiplus::GdiplusStartupInput input;
-    if(Gdiplus::GdiplusStartup(&token,&input,nullptr)==Gdiplus::Ok){
-      {Gdiplus::Bitmap bmp(128,128,128*4,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(pixels.data()));Gdiplus::Graphics g(&bmp);docky::statusart::Wifi(g,64,64,4,Gdiplus::Color(255,255,255,255));}
-      Gdiplus::GdiplusShutdown(token);MakeIconMask(pixels,128,128,fallbackWifi_);
+    if(!reused){
+        decoded.signature=signature;
+        for(const auto& [key,path]:files){std::vector<uint32_t> pixels;UINT w=0,h=0;std::wstring why;
+          if(dock::LoadCustomIconPixels(path,pixels,w,h,why)){decoded.icons.emplace_back(key,std::move(pixels));decoded.sizes.emplace_back(w,h);}}
+        for(const auto& entry:docky::usersound::entries){std::vector<uint32_t> pixels;UINT w=0,h=0;
+          if(docky::usersound::Load(entry.file,pixels,w,h)){decoded.icons.emplace_back(entry.key,std::move(pixels));decoded.sizes.emplace_back(w,h);}}
+        decoded.wifi.assign(128*128,0);ULONG_PTR token=0;Gdiplus::GdiplusStartupInput input;
+        if(Gdiplus::GdiplusStartup(&token,&input,nullptr)==Gdiplus::Ok){
+          {Gdiplus::Bitmap bmp(128,128,128*4,PixelFormat32bppPARGB,reinterpret_cast<BYTE*>(decoded.wifi.data()));Gdiplus::Graphics g(&bmp);docky::statusart::Wifi(g,64,64,4,Gdiplus::Color(255,255,255,255));}
+          Gdiplus::GdiplusShutdown(token);
+        }
+        std::lock_guard<std::mutex> lock(g_decodedMutex);g_decoded=decoded;
     }
-    DLOG(L"cc: loaded %zu shared Workshop status icons",statusIcons_.size());
+    for(size_t i=0;i<decoded.icons.size();++i){IconMask icon;  // later entries win (user sound icons over the pack's)
+      if(MakeIconMask(decoded.icons[i].second,decoded.sizes[i].first,decoded.sizes[i].second,icon))statusIcons_[decoded.icons[i].first]=std::move(icon);}
+    MakeIconMask(decoded.wifi,128,128,fallbackWifi_);
+    DLOG(L"cc: %ls %zu shared Workshop status icons",reused?L"reused":L"loaded",statusIcons_.size());
 }
 void Panel::DrawMask(const IconMask& icon,D2D1_POINT_2F c,float size,D2D1::ColorF color,float alpha){
     if(!icon.bitmap)return;const float w=icon.source.right-icon.source.left,h=icon.source.bottom-icon.source.top;if(w<=0||h<=0)return;
@@ -858,14 +1150,15 @@ void Panel::DrawWifi(D2D1_POINT_2F c,float size,const char* key,D2D1::ColorF col
     auto it=statusIcons_.find(key);if(it==statusIcons_.end())it=statusIcons_.find("wifi.connected");DrawMask(it==statusIcons_.end()?fallbackWifi_:it->second,c,size,color,alpha);
 }
 void Panel::DrawBluetooth(D2D1_POINT_2F c,float size,D2D1::ColorF color,float alpha){
-    color.a*=alpha;brush_->SetColor(color);const float s=size/18.f,w=1.8f*s;
-    const D2D1_POINT_2F p[]={{c.x,c.y-8*s},{c.x+5*s,c.y-4*s},{c.x-5*s,c.y+4*s},
-      {c.x,c.y-0*s},{c.x+5*s,c.y+4*s},{c.x,c.y+8*s},{c.x,c.y-8*s}};
-    dc_->DrawLine(p[0],p[1],brush_.Get(),w);dc_->DrawLine(p[1],p[2],brush_.Get(),w);
-    dc_->DrawLine(D2D1::Point2F(c.x-5*s,c.y-4*s),p[4],brush_.Get(),w);
-    dc_->DrawLine(p[4],p[5],brush_.Get(),w);dc_->DrawLine(p[5],p[6],brush_.Get(),w);
-    for(int i:{0,1,2,4,5})dc_->FillEllipse(D2D1::Ellipse(p[i],w*.5f,w*.5f),brush_.Get());
-    dc_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x-5*s,c.y-4*s),w*.5f,w*.5f),brush_.Get());
+    color.a*=alpha;brush_->SetColor(color);const float s=size/18.f,w=2.15f*s;
+    // The rune as one polyline (left wing, up-right, down the stem, right arrowheads, right wing) with round caps and
+    // round joins, so every corner is rounded; slightly heavier than before (2.15 vs 1.8 / 18), matching the Dock and menu bar.
+    const D2D1_POINT_2F p[]={{c.x-5*s,c.y-4*s},{c.x+5*s,c.y+4*s},{c.x,c.y+8*s},{c.x,c.y-8*s},{c.x+5*s,c.y-4*s},{c.x-5*s,c.y+4*s}};
+    ComPtr<ID2D1Factory> factory;dc_->GetFactory(&factory);ComPtr<ID2D1StrokeStyle> round;ComPtr<ID2D1PathGeometry> path;ComPtr<ID2D1GeometrySink> sink;
+    if(!factory||FAILED(factory->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_CAP_STYLE_ROUND,D2D1_LINE_JOIN_ROUND),nullptr,0,&round))||
+       FAILED(factory->CreatePathGeometry(&path))||FAILED(path->Open(&sink)))return;
+    sink->BeginFigure(p[0],D2D1_FIGURE_BEGIN_HOLLOW);sink->AddLines(p+1,5);sink->EndFigure(D2D1_FIGURE_END_OPEN);sink->Close();
+    dc_->DrawGeometry(path.Get(),brush_.Get(),w,round.Get());
 }
 void Panel::DrawSound(D2D1_POINT_2F c,float size,D2D1::ColorF color,float alpha){
     const char* key=!st_.audio?"sound.unavailable":st_.muted?"sound.muted":st_.volume<34?"sound.low":st_.volume<67?"sound.medium":"sound.high";
@@ -910,7 +1203,7 @@ void Panel::DetailCircle(D2D1_POINT_2F c,wchar_t g,bool active,float a){
 }
 
 bool Panel::UpdateSliderMotion(double dt) {
-    if (!sliderInit_) { sliderInit_ = true; sliderPress_.SetSpec(docky::motion::SpringSpec::FromResponse(0.18, 1.0)); sliderPress_.SetRest(0.002, 0.02); }
+    if (!sliderInit_) { sliderInit_ = true; sliderPress_.SetSpec(docky::motion::tokens::Press); sliderPress_.SetRest(0.002, 0.02); }
     const bool pressing = pressed_ == Hit::DisplaySlider || pressed_ == Hit::SoundSlider;
     if (pressing) sliderPressHit_ = pressed_;
     sliderPress_.SetTarget(pressing ? 1.0 : 0.0);
@@ -1083,27 +1376,60 @@ void Panel::Render() {
         CenteredText(bsub, sub_.Get(), D2D1::RectF(bt_.r.left + 58, bt_.r.top + 32, bt_.r.right - 10, bt_.r.top + 50), a, Ink( 0.62f));
         // Media
         DrawModuleBase(media_, a, false, false);
-        if (st_.media && !st_.title.empty()) {
-            Text(st_.title, title_.Get(), D2D1::RectF(media_.r.left + 14, media_.r.top + 16, media_.r.right - 12, media_.r.top + 36), a);
-            Text(st_.artist.empty() ? st_.source : st_.artist, sub_.Get(),
-                 D2D1::RectF(media_.r.left + 14, media_.r.top + 36, media_.r.right - 12, media_.r.top + 54), a, Ink( 0.62f));
-            Text(st_.playing ? L"Playing" : L"Paused", small_.Get(), D2D1::RectF(media_.r.left + 14, media_.r.top + 56, media_.r.right - 12, media_.r.top + 72),
-                 a, Ink( 0.45f));
-        } else {
-            Text(st_.media ? L"Media" : L"Not Playing", title_.Get(), D2D1::RectF(media_.r.left + 14, media_.r.top + 46, media_.r.right - 12, media_.r.top + 68),
-                 a, Ink( 0.85f));
+        if (!st_.artwork) {mediaArtwork_.Reset();mediaArtworkHash_=0;}
+        else if (!mediaArtwork_ || mediaArtworkHash_!=st_.artworkHash) {
+            const auto props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96,96);
+            mediaArtwork_.Reset();
+            if(SUCCEEDED(dc_->CreateBitmap(D2D1::SizeU(st_.artworkWidth,st_.artworkHeight),st_.artwork->data(),st_.artworkWidth*4,&props,&mediaArtwork_)))mediaArtworkHash_=st_.artworkHash;
         }
-        auto mediaButton = [&](Hit h, D2D1_RECT_F r, wchar_t g, bool enabled, float size) {
+        auto artwork=[&](D2D1_RECT_F rect,float radius,float alpha) {
+            if(!mediaArtwork_)return;
+            ComPtr<ID2D1RoundedRectangleGeometry> clip;
+            factory_->CreateRoundedRectangleGeometry(D2D1::RoundedRect(rect,radius,radius),&clip);
+            if(!clip)return;
+            dc_->PushLayer(D2D1::LayerParameters(D2D1::InfiniteRect(),clip.Get()),nullptr);
+            const auto size=mediaArtwork_->GetSize();const float aspect=(rect.right-rect.left)/(rect.bottom-rect.top);
+            float w=size.width,h=size.height;if(w/h>aspect)w=h*aspect;else h=w/aspect;
+            const auto src=D2D1::RectF((size.width-w)*.5f,(size.height-h)*.5f,(size.width+w)*.5f,(size.height+h)*.5f);
+            dc_->DrawBitmap(mediaArtwork_.Get(),rect,alpha,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,src);
+            dc_->PopLayer();
+        };
+        if(mediaArtworkBackground_ && mediaArtwork_ && !contrastMode_) {
+            artwork(media_.r,media_.radius,a*.7f);
+            brush_->SetColor(D2D1::ColorF(0,0,0,a*.48f));
+            dc_->FillRoundedRectangle(D2D1::RoundedRect(media_.r,media_.radius,media_.radius),brush_.Get());
+        }
+        const bool artworkBackground=mediaArtworkBackground_ && mediaArtwork_ && !contrastMode_;
+        auto mediaInk=[&](float opacity){return artworkBackground?D2D1::ColorF(1,1,1,opacity):Ink(opacity);};
+        const float ml=media_.r.left,mt=media_.r.top;
+        const auto cover=D2D1::RectF(ml+14,mt+14,ml+54,mt+54);
+        if(mediaArtwork_)artwork(cover,10,a);
+        else {brush_->SetColor(Ink(a*.1f));dc_->FillRoundedRectangle(D2D1::RoundedRect(cover,10,10),brush_.Get());Glyph(0xE8D6,20,D2D1::Point2F(ml+34,mt+34),a*.5f);}
+        Text(st_.media&&!st_.title.empty()?st_.title:L"Not Playing",title_.Get(),D2D1::RectF(ml+14,mt+63,media_.r.right-12,mt+82),a,mediaInk(1.f));
+        Text(st_.media?(st_.artist.empty()?st_.source:st_.artist):L"",sub_.Get(),D2D1::RectF(ml+14,mt+82,media_.r.right-12,mt+99),a,mediaInk(.55f));
+        auto mediaButton = [&](Hit h, D2D1_RECT_F r, bool enabled) {
             const D2D1_POINT_2F c = D2D1::Point2F((r.left + r.right) * 0.5f, (r.top + r.bottom) * 0.5f);
             if (enabled && (hovered(h) || pressedOn(h))) {
                 brush_->SetColor(Ink( (pressedOn(h) ? 0.22f : 0.12f) * a));
                 dc_->FillEllipse(D2D1::Ellipse(c, (r.right - r.left) * 0.5f, (r.right - r.left) * 0.5f), brush_.Get());
             }
-            Glyph(g, size, c, a * (enabled ? 1.0f : 0.32f));
+            brush_->SetColor(mediaInk(a * (enabled ? .85f : .32f)));
+            auto triangle=[&](float x,float y,float w,float height,bool reverse){
+                ComPtr<ID2D1PathGeometry> path;ComPtr<ID2D1GeometrySink> sink;
+                if(FAILED(factory_->CreatePathGeometry(&path))||FAILED(path->Open(&sink)))return;
+                sink->BeginFigure(D2D1::Point2F(x+(reverse?w:0),y-height*.5f),D2D1_FIGURE_BEGIN_FILLED);
+                sink->AddLine(D2D1::Point2F(x+(reverse?0:w),y));
+                sink->AddLine(D2D1::Point2F(x+(reverse?w:0),y+height*.5f));
+                sink->EndFigure(D2D1_FIGURE_END_CLOSED);if(SUCCEEDED(sink->Close()))dc_->FillGeometry(path.Get(),brush_.Get());
+            };
+            if(h==Hit::MediaPlay) {
+                if(st_.playing){dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x-7,c.y-9,c.x-2,c.y+9),1,1),brush_.Get());dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.x+2,c.y-9,c.x+7,c.y+9),1,1),brush_.Get());}
+                else triangle(c.x-7,c.y,17,20,false);
+            } else {triangle(c.x-11,c.y,11,13,h==Hit::MediaPrev);triangle(c.x,c.y,11,13,h==Hit::MediaPrev);}
         };
-        mediaButton(Hit::MediaPrev, prevBtn_, 0xE892, st_.media && st_.canPrevious, 15.0f);
-        mediaButton(Hit::MediaPlay, playBtn_, st_.playing ? 0xE769 : 0xE768, st_.media && st_.canPlayPause, 19.0f);
-        mediaButton(Hit::MediaNext, nextBtn_, 0xE893, st_.media && st_.canNext, 15.0f);
+        mediaButton(Hit::MediaPrev, prevBtn_, st_.media && st_.canPrevious);
+        mediaButton(Hit::MediaPlay, playBtn_, st_.media && st_.canPlayPause);
+        mediaButton(Hit::MediaNext, nextBtn_, st_.media && st_.canNext);
         // Airplane / Focus (links to Settings: Windows offers no supported switch for apps)
         for (auto [m, g, h] : {std::tuple{airplane_, wchar_t(0xE709), Hit::Airplane}, std::tuple{focus_, wchar_t(0xE708), Hit::Focus}}) {
             DrawModuleBase(m, a, hovered(h), pressedOn(h));
@@ -1153,22 +1479,69 @@ void Panel::Render() {
         if(soundOnly_){
             brush_->SetColor(Ink(0.16f*a));dc_->DrawLine(D2D1::Point2F(sound_.r.left+14,sound_.r.top+64),D2D1::Point2F(sound_.r.right-14,sound_.r.top+64),brush_.Get(),1.f);
             Text(L"Output",title_.Get(),D2D1::RectF(sound_.r.left+14,sound_.r.top+68,sound_.r.right-14,sound_.r.top+91),a,Ink(0.55f));
-            for(size_t i=0;i<rows_.size();++i){const auto r=rows_[i];
-              const size_t index=outputOffset_+i;
-              if(index>=outputs_.size()){Text(L"No audio output",sub_.Get(),D2D1::RectF(r.left+8,r.top,r.right-8,r.bottom),a,Ink(0.6f));continue;}
-              if(hover_==Hit::Row&&hoverRow_==static_cast<int>(i)){brush_->SetColor(Ink(0.10f*a));dc_->FillRoundedRectangle(D2D1::RoundedRect(r,7,7),brush_.Get());}
-              const auto center=D2D1::Point2F(r.left+18,(r.top+r.bottom)*.5f);const bool active=outputs_[index].selected;
-              brush_->SetColor(active?D2D1::ColorF(1,1,1,a):Ink(.22f*a));dc_->FillEllipse(D2D1::Ellipse(center,12,12),brush_.Get());
-              std::wstring lower=outputs_[index].name;std::transform(lower.begin(),lower.end(),lower.begin(),[](wchar_t c){return static_cast<wchar_t>(std::towlower(c));});
-              const bool monitor=lower.find(L"hdmi")!=std::wstring::npos||lower.find(L"display")!=std::wstring::npos||lower.find(L"monitor")!=std::wstring::npos||lower.find(L"nvidia")!=std::wstring::npos;
-              const auto iconColor=active?D2D1::ColorF(.04f,.47f,1.f):Ink();
-              if(monitor){auto c=iconColor;c.a*=a;brush_->SetColor(c);dc_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(center.x-7,center.y-5,center.x+7,center.y+4),1,1),brush_.Get(),1.4f);dc_->DrawLine(D2D1::Point2F(center.x,center.y+4),D2D1::Point2F(center.x,center.y+7),brush_.Get(),1.4f);dc_->DrawLine(D2D1::Point2F(center.x-3,center.y+7),D2D1::Point2F(center.x+3,center.y+7),brush_.Get(),1.4f);}
-              else DrawSound(center,12.f,iconColor,a);
-              Text(outputs_[index].name,rowFmt_.Get(),D2D1::RectF(r.left+39,r.top,r.right-6,r.bottom),a);
+            if (hovered(Hit::ManageOutputs)) {
+                brush_->SetColor(Ink(0.10f * a));
+                dc_->FillRoundedRectangle(D2D1::RoundedRect(manageOutputsRow_, 6, 6), brush_.Get());
             }
+            CenteredText(managingOutputs_ ? L"Done" : L"Manage", rowFmt_.Get(), manageOutputsRow_, a);
+            dc_->PushAxisAlignedClip(outputViewport_, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            if (outputs_.empty()) {
+                auto r = OutputRow(0);
+                r.left += 8;
+                Text(activeOutputs_.empty() ? L"No audio output" : L"All outputs are hidden",
+                     sub_.Get(), r, a, Ink(0.6f));
+            }
+            for (size_t i = 0; i < outputs_.size(); ++i) {
+                const auto r = OutputRow(i);
+                if (r.bottom <= outputViewport_.top) continue;
+                if (r.top >= outputViewport_.bottom) break;
+                const auto& device = outputs_[i];
+                if (hover_ == Hit::Row && hoverRow_ == static_cast<int>(i)) {
+                    brush_->SetColor(Ink(0.10f * a));
+                    dc_->FillRoundedRectangle(D2D1::RoundedRect(r, 7, 7), brush_.Get());
+                }
+                const auto center = D2D1::Point2F(r.left + 18, (r.top + r.bottom) * .5f);
+                const float opacity = device.hidden ? a * .55f : a;
+                auto color = device.selected ? D2D1::ColorF(.04f, .47f, 1.f) : Ink();
+                auto shape = docky::audio_output::FindShape(device.icon);
+                if (shape == docky::audio_output::Shape::None) {
+                    std::wstring lower = device.name;
+                    std::transform(lower.begin(), lower.end(), lower.begin(),
+                        [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+                    if (lower.find(L"display") != std::wstring::npos || lower.find(L"hdmi") != std::wstring::npos ||
+                        lower.find(L"nvidia") != std::wstring::npos)
+                        shape = docky::audio_output::Shape::Monitor;
+                }
+                if (shape == docky::audio_output::Shape::None) DrawSound(center, 12.f, color, opacity);
+                else {
+                    color.a *= opacity;
+                    brush_->SetColor(color);
+                    docky::audio_output::Draw(dc_.Get(), brush_.Get(), center, shape);
+                }
+                const float tail = (managingOutputs_ ? (device.hidden ? 65.f : 25.f) : 6.f)
+                    + (OutputScrollMax() > 0.0 ? 4.f : 0.f);
+                Text(device.Label(), rowFmt_.Get(), D2D1::RectF(r.left + 39, r.top, r.right - tail, r.bottom), opacity);
+                if (managingOutputs_) {
+                    if (device.hidden)
+                        Text(L"Hidden", sub_.Get(), D2D1::RectF(r.right - 62, r.top, r.right - 22, r.bottom), opacity);
+                    Glyph(0xE712, 12.f, D2D1::Point2F(r.right - 12, center.y), a, Ink(), true);
+                }
+            }
+            if (const double overflow = OutputScrollMax(); overflow > 0.0) {
+                const float height = outputViewport_.bottom - outputViewport_.top - 8.f;
+                const float thumb = std::max(16.f, height * 8.f / static_cast<float>(outputs_.size()));
+                const float fraction = static_cast<float>(std::clamp(outputScroll_.Value() / overflow, 0.0, 1.0));
+                const float top = outputViewport_.top + 4.f + (height - thumb) * fraction;
+                const float x = outputViewport_.right - 2.f;
+                brush_->SetColor(Ink(0.26f * a));
+                dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, top, x + 2.f, top + thumb), 1, 1), brush_.Get());
+            }
+            dc_->PopAxisAlignedClip();
             brush_->SetColor(Ink(0.16f*a));dc_->DrawLine(D2D1::Point2F(sound_.r.left+8,settingsRow_.top-4),D2D1::Point2F(sound_.r.right-8,settingsRow_.top-4),brush_.Get(),1.f);
             if(hovered(Hit::Settings)){brush_->SetColor(Ink(0.10f*a));dc_->FillRoundedRectangle(D2D1::RoundedRect(settingsRow_,8,8),brush_.Get());}
-            Text(L"Sound Settings…",rowFmt_.Get(),D2D1::RectF(settingsRow_.left+4,settingsRow_.top,settingsRow_.right-4,settingsRow_.bottom),a);
+            const auto footerLabel = Now() < statusUntil_ ? status_ : L"Sound Settings…";
+            Text(footerLabel, rowFmt_.Get(),
+                 D2D1::RectF(settingsRow_.left + 4, settingsRow_.top, settingsRow_.right - 4, settingsRow_.bottom), a);
         }
     } else {
         const bool wifi = page_ == Page::Wifi;
@@ -1194,12 +1567,12 @@ void Panel::Render() {
             const auto circle = D2D1::Point2F(L + 27.0f, cy);
             const D2D1_RECT_F label = D2D1::RectF(L + 48.5f, r.top, R - 34, r.bottom);
             if (item < 0) {
-                const wchar_t* empty = wifi ? L"Searching for networks…" : L"No connected devices";
+                const wchar_t* empty = wifi ? L"Searching for networks…" : L"No paired devices";
                 Text(empty, menuRow_.Get(), D2D1::RectF(L + kMenuInset + 0.5f, r.top, R - kMenuInset, r.bottom), a, ink(0.45f));
                 continue;
             }
             if (hover_ == Hit::Row && hoverRow_ == static_cast<int>(i)) hoverFill(r);
-            const bool active = wifi ? st_.networks[item].connected : true;
+            const bool active = wifi ? st_.networks[item].connected : st_.btPaired[item].connected;
             // Circle: connected = blue #678EF6 with a white glyph; otherwise a faint disc with a grey glyph.
             brush_->SetColor(active ? D2D1::ColorF(0.404f, 0.557f, 0.965f, a) : Ink(0.10f * a));
             dc_->FillEllipse(D2D1::Ellipse(circle, 13, 13), brush_.Get());
@@ -1211,8 +1584,23 @@ void Panel::Render() {
                 Text(name, menuRow_.Get(), label, a, ink(0.92f));
                 if (n.secured) Glyph(0xE72E, 12.0f, D2D1::Point2F(R - 20.0f, cy), a, ink(0.45f));
             } else {
-                DrawBluetooth(circle, 13.0f, glyph, a);
-                Text(st_.btDevices[item], menuRow_.Get(), label, a, ink(0.92f));
+                const auto& d = st_.btPaired[item];
+                // Device kind glyphs (Segoe Fluent Icons); unknown kinds keep the Bluetooth rune.
+                const wchar_t g = d.kind == ctl::BtKind::Keyboard ? 0xE765 : d.kind == ctl::BtKind::Mouse ? 0xE962 : d.kind == ctl::BtKind::Trackpad ? 0xEFA5
+                                : d.kind == ctl::BtKind::Headphones ? 0xE7F6 : d.kind == ctl::BtKind::Speaker ? 0xE7F5 : d.kind == ctl::BtKind::Gamepad ? 0xE7FC
+                                : d.kind == ctl::BtKind::Phone ? 0xE8EA : 0;
+                if (g) Glyph(g, 13.0f, circle, a, glyph, active); else DrawBluetooth(circle, 13.0f, glyph, a);
+                Text(d.name, menuRow_.Get(), D2D1::RectF(label.left, label.top, R - (d.battery >= 0 ? 86.0f : 14.0f), label.bottom), a, ink(active ? 0.92f : 0.38f));
+                if (d.battery >= 0) {  // "55%" and a small battery, as macOS shows for accessories that report a level
+                    const D2D1_RECT_F body = D2D1::RectF(R - 41.0f, cy - 5.0f, R - 20.0f, cy + 5.0f);
+                    brush_->SetColor(Ink(0.40f * a)); dc_->FillRoundedRectangle(D2D1::RoundedRect(body, 3.0f, 3.0f), brush_.Get());
+                    dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(body.right + 1.0f, cy - 2.0f, body.right + 2.5f, cy + 2.0f), 0.7f, 0.7f), brush_.Get());
+                    brush_->SetColor(Ink(0.85f * a));
+                    dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(body.left, body.top, body.left + (body.right - body.left) * d.battery / 100.0f, body.bottom), 3.0f, 3.0f), brush_.Get());
+                    const auto old = menuRow_->GetTextAlignment(); menuRow_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
+                    Text(std::to_wstring(d.battery) + L"%", menuRow_.Get(), D2D1::RectF(R - 96.0f, r.top, R - 45.0f, r.bottom), a, ink(0.55f));
+                    menuRow_->SetTextAlignment(old);
+                }
             }
         }
         if (otherNetworks_.bottom > otherNetworks_.top) {
@@ -1223,8 +1611,6 @@ void Panel::Render() {
         Text(wifi ? L"Wi-Fi Settings…" : L"Bluetooth Settings…", menuRow_.Get(),
              D2D1::RectF(L + kMenuInset + 0.5f, settingsRow_.top, R - kMenuInset, settingsRow_.bottom), a, ink(0.92f));
     }
-    // No footer caption (macOS Control Center has none). Describe() and status_ are kept for a future
-    // accessibility/tooltip path but are no longer drawn.
     if (kbFocus_ != Hit::None) {  // keyboard focus ring (accent blue, macOS style)
         D2D1_RECT_F fr{};
         if (FocusRect(kbFocus_, kbRow_, fr)) {
@@ -1296,7 +1682,15 @@ Hit Panel::HitTest(float x, float y, int* row) {
     auto in = [&](const D2D1_RECT_F& r) { return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom; };
     if(soundOnly_){
         if(in(settingsRow_))return Hit::Settings;
-        for(size_t i=0;i<outputs_.size()&&i<rows_.size();++i)if(in(rows_[i])){if(row)*row=static_cast<int>(i);return Hit::Row;}
+        if (in(manageOutputsRow_)) return Hit::ManageOutputs;
+        if (in(outputViewport_)) {
+            const float offset = static_cast<float>(std::clamp(outputScroll_.Value(), 0.0, OutputScrollMax()));
+            const auto index = static_cast<size_t>((y - outputViewport_.top + offset) / kOutputRowHeight);
+            if (y < outputViewport_.bottom && index < outputs_.size()) {
+                if (row) *row = static_cast<int>(index);
+                return Hit::Row;
+            }
+        }
         if(st_.audio && in(muteBtn_))return Hit::Mute;
         if(st_.audio && in(sound_.r) && y>=soundTrack_.top-12 && y<=soundTrack_.bottom+12)return Hit::SoundSlider;
         return Hit::None;
@@ -1307,6 +1701,7 @@ Hit Panel::HitTest(float x, float y, int* row) {
         if (in(prevBtn_)) return Hit::MediaPrev;
         if (in(playBtn_)) return Hit::MediaPlay;
         if (in(nextBtn_)) return Hit::MediaNext;
+        if (in(D2D1::RectF(media_.r.left + 10, media_.r.top + 10, media_.r.left + 58, media_.r.top + 58))) return Hit::MediaCover;
         if (in(media_.r)) return Hit::Media;
         if (in(airplane_.r)) return Hit::Airplane;
         if (in(focus_.r)) return Hit::Focus;
@@ -1336,7 +1731,8 @@ std::vector<std::pair<Hit, int>> Panel::FocusOrder() const {
     std::vector<std::pair<Hit, int>> o;
     if (soundOnly_) {
         if (st_.audio) { o.push_back({Hit::SoundSlider, -1}); o.push_back({Hit::Mute, -1}); }
-        for(size_t i=0;i<outputs_.size()&&i<rows_.size();++i)o.push_back({Hit::Row,static_cast<int>(i)});
+        o.push_back({Hit::ManageOutputs, -1});
+        for (size_t i = 0; i < outputs_.size(); ++i) o.push_back({Hit::Row, static_cast<int>(i)});
         o.push_back({Hit::Settings, -1});
         return o;
     }
@@ -1378,7 +1774,16 @@ bool Panel::FocusRect(Hit h, int row, D2D1_RECT_F& r) const {
     case Hit::PageSwitch: r = grow(switch_, 4); return true;
     case Hit::OtherNetworks: r = otherNetworks_; return true;
     case Hit::Settings: r = settingsRow_; return true;
-    case Hit::Row: if (row >= 0 && static_cast<size_t>(row) < rows_.size()) { r = rows_[row]; return true; } return false;
+    case Hit::ManageOutputs: r = manageOutputsRow_; return true;
+    case Hit::Row:
+        if (soundOnly_) {
+            if (row < 0 || static_cast<size_t>(row) >= outputs_.size()) return false;
+            r = OutputRow(static_cast<size_t>(row));
+            r.top = std::max(r.top, outputViewport_.top);
+            r.bottom = std::min(r.bottom, outputViewport_.bottom);
+            return r.top < r.bottom;
+        }
+        if (row >= 0 && static_cast<size_t>(row) < rows_.size()) { r = rows_[row]; return true; } return false;
     default: return false;
     }
 }
@@ -1475,6 +1880,11 @@ void Panel::Click(Hit h, int row) {
     case Hit::Focus: settings(L"ms-settings:notifications", L"focus"); return;
     case Hit::Battery: settings(L"ms-settings:batterysaver", L"battery"); return;
     case Hit::DisplayTitle: settings(L"ms-settings:display", L"display"); return;
+    case Hit::ManageOutputs:
+        managingOutputs_ = !managingOutputs_;
+        outputScroll_.SnapTo(0.0);
+        RefreshOutputs();
+        return;
     case Hit::SoundTitle: settings(L"ms-settings:sound", L"sound"); return;
     case Hit::OtherNetworks: ctl::OpenUri(L"ms-availablenetworks:"); Close(L"windows network flow"); return;
     case Hit::Settings: settings(soundOnly_ ? L"ms-settings:sound" : page_ == Page::Wifi ? L"ms-settings:network-wifi" : L"ms-settings:bluetooth", soundOnly_ ? L"sound" : L"detail"); return;
@@ -1485,6 +1895,22 @@ void Panel::Click(Hit h, int row) {
         DLOG(L"cc: mute -> %d", m);
         NotifyBar();
         break;
+    }
+    case Hit::Media: {
+        // The media card brings the playing app forward (as on macOS); its artwork opens full-screen Now Playing.
+        const std::wstring app = st_.source;
+        const bool ok = !app.empty() && ActivateMediaApp(app);
+        DLOG(L"cc: open media app %ls %ls", app.c_str(), ok ? L"ok" : L"failed");
+        Close(L"media app");
+        return;
+    }
+    case Hit::MediaCover: {
+        // The artwork opens the full-screen Now Playing view (docky-now-playing.exe beside this program).
+        wchar_t self[MAX_PATH]{};GetModuleFileNameW(nullptr,self,MAX_PATH);std::wstring exe=self;exe=exe.substr(0,exe.find_last_of(L'\\'))+L"\\docky-now-playing.exe";
+        const auto r=reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr,L"open",exe.c_str(),nullptr,nullptr,SW_SHOWNORMAL));
+        DLOG(L"cc: now playing %ls",r>32?L"opened":L"failed");
+        Close(L"now playing");
+        return;
     }
     case Hit::MediaPrev:
     case Hit::MediaPlay:
@@ -1499,10 +1925,17 @@ void Panel::Click(Hit h, int row) {
         break;
     }
     case Hit::Row:
-        if(soundOnly_&&row>=0&&outputOffset_+static_cast<size_t>(row)<outputs_.size()){
-            const auto device=outputs_[outputOffset_+row];if(device.selected)break;HWND target=hwnd;
+        if(soundOnly_ && row >= 0 && static_cast<size_t>(row) < outputs_.size()){
+            if (managingOutputs_) { EditOutput(static_cast<size_t>(row)); return; }
+            const auto device=outputs_[row];if(device.selected)break;HWND target=hwnd;
             worker_->Post([device,target]{if(!SelectOutput(device.id))PostMessageW(target,kMsgActionFailed,4,0);});
-            worker_->RequestQuery(false);status_=L"Switching output…";statusUntil_=Now()+4.;SetTimer(hwnd,kTimerStatus,4000,nullptr);break;
+            worker_->RequestQuery(false);
+            break;
+        }
+        if (page_ == Page::Bluetooth && row >= 0 && row < static_cast<int>(rowItem_.size()) && rowItem_[row] >= 0) {
+            ctl::OpenUri(L"ms-settings:bluetooth");
+            Close(L"bluetooth device settings");
+            return;
         }
         if (page_ == Page::Wifi && row >= 0 && row < static_cast<int>(rowItem_.size()) && rowItem_[row] >= 0 &&
             rowItem_[row] < static_cast<int>(st_.networks.size())) {
@@ -1653,11 +2086,21 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_MOUSEWHEEL:
-        if(soundOnly_&&outputs_.size()>rows_.size()){
-            const size_t maxOffset=outputs_.size()-rows_.size();
-            if(GET_WHEEL_DELTA_WPARAM(w)<0)outputOffset_=std::min(maxOffset,outputOffset_+1);
-            else if(outputOffset_>0)--outputOffset_;
-            hover_=Hit::None;hoverRow_=-1;kbFocus_=Hit::None;kbRow_=-1;needsFrame_=true;return 0;
+        if (soundOnly_ && OutputScrollMax() > 0.0) {
+            POINT cursor{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+            ScreenToClient(hwnd, &cursor);
+            const float x = cursor.x / scale_, y = cursor.y / scale_;
+            if (x < outputViewport_.left || x >= outputViewport_.right ||
+                y < outputViewport_.top || y >= outputViewport_.bottom) break;
+            const double delta = GET_WHEEL_DELTA_WPARAM(w) / static_cast<double>(WHEEL_DELTA);
+            const double target = std::clamp(outputScroll_.Target() - delta * kOutputRowHeight, 0.0, OutputScrollMax());
+            if (reducedMotion_) outputScroll_.SnapTo(target);
+            else outputScroll_.SetTarget(target);
+            if (pressed_ == Hit::Row) pressed_ = Hit::None;
+            hover_ = Hit::None; hoverRow_ = -1;
+            kbFocus_ = Hit::None; kbRow_ = -1;
+            needsFrame_ = true;
+            return 0;
         }
         break;
     case WM_KEYDOWN:
@@ -1669,6 +2112,13 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
                 const int n = static_cast<int>(order.size()), step = (GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1;
                 at = at < 0 ? (step > 0 ? 0 : n - 1) : (at + step + n) % n;
                 kbFocus_ = order[at].first; kbRow_ = order[at].second;
+                if (soundOnly_ && kbFocus_ == Hit::Row) {
+                    const double top = kbRow_ * kOutputRowHeight;
+                    const double height = outputViewport_.bottom - outputViewport_.top;
+                    const double offset = std::clamp(outputScroll_.Value(), 0.0, OutputScrollMax());
+                    outputScroll_.SnapTo(std::clamp(offset, std::max(0.0, top + kOutputRowHeight - height),
+                                                  std::min(top, OutputScrollMax())));
+                }
                 DLOG(L"cc: keyboard focus %d row %d", static_cast<int>(kbFocus_), kbRow_);
                 needsFrame_ = true;
             }
@@ -1700,8 +2150,18 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE && Now() - openedAt_ > 0.3) Close(L"clicked outside");
+        if (LOWORD(w) == WA_INACTIVE)
+            PostMessageW(hwnd, liquid::popup::DismissWatch::FocusMessage, 0, 0);
         return 0;
+    case liquid::popup::DismissWatch::FocusMessage:
+        if (!outputEditorOpen_ && dismissal_.LostFocus()) Close(L"lost focus");
+        return 0;
+    case liquid::popup::DismissWatch::ClickMessage: {
+        RECT rect{};
+        const POINT point{static_cast<LONG>(w), static_cast<LONG>(l)};
+        if (!outputEditorOpen_ && GetWindowRect(hwnd, &rect) && !PtInRect(&rect, point)) Close(L"clicked outside");
+        return 0;
+    }
     case kMsgState: {
         ctl::State s = worker_->Latest();
         // While (or just after) the user drags a slider, keep the local value to avoid jitter.
@@ -1709,17 +2169,28 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
         else dragVolume_ = -1;
         if (dragging_ || Now() - lastUserBrightness_ < 1.5) { s.brightnessPercent = dragBrightness_ >= 0 ? dragBrightness_ : s.brightnessPercent; }
         else dragBrightness_ = -1;
-        auto outputs=soundOnly_?worker_->LatestOutputs():std::vector<OutputDevice>{};
         const bool layoutChange = !haveState_ || s.brightness != st_.brightness || s.networks.size() != st_.networks.size() ||
-                                  s.btDevices.size() != st_.btDevices.size() || (soundOnly_&&outputs.size()!=outputs_.size());
+                                  s.btDevices.size() != st_.btDevices.size();
         if (!haveState_)
             DLOG(L"cc: state wifi=%d/%d bt=%d/%d audio=%d vol=%d muted=%d brightness=%d/%d battery=%d/%d media=%d",
                  static_cast<int>(s.wifiRadio), s.wifiSwitchable, static_cast<int>(s.btRadio), s.btSwitchable, s.audio, s.volume, s.muted,
                  s.brightness, s.brightnessPercent, s.battery, s.batteryPercent, s.media);
         if (haveState_ && (s.volume != st_.volume || s.muted != st_.muted || s.wifiRadio != st_.wifiRadio || s.btRadio != st_.btRadio))
             DLOG(L"cc: state sync wifi=%d bt=%d vol=%d muted=%d", static_cast<int>(s.wifiRadio), static_cast<int>(s.btRadio), s.volume, s.muted);
+        // Explicit isolated visual tests only: exercise artwork and both transport states.
+        wchar_t mediaFixture[16]{};
+        if(g_visualCaptureTest && !snapshotDir_.empty() && GetEnvironmentVariableW(L"LIQUID_CC_DEV_MEDIA",mediaFixture,16)) {
+            s.media=true;s.playing=!_wcsicmp(mediaFixture,L"playing");s.canPlayPause=s.canNext=s.canPrevious=true;
+            s.title=L"Your Fault";s.artist=L"Excision, SLANDER";
+            auto pixels=std::make_shared<std::vector<uint32_t>>(256*256);
+            for(unsigned y=0;y<256;++y)for(unsigned x=0;x<256;++x)(*pixels)[y*256+x]=0xff000000u|((20+x/3)<<16)|((32+y/2)<<8)|(80+x/2);
+            s.artwork=pixels;s.artworkWidth=s.artworkHeight=256;s.artworkHash=1;
+        }
         st_ = std::move(s);
-        if(soundOnly_)outputs_=std::move(outputs);
+        if (soundOnly_) {
+            activeOutputs_ = worker_->LatestOutputs();
+            RefreshOutputs();
+        }
         haveState_ = true;
         if (layoutChange) {
             Layout();
@@ -1740,7 +2211,17 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
     case kMsgAnchor:
         {std::lock_guard<std::mutex> lock(g_anchorMutex);anchor_=g_anchor;}
         Place();needsFrame_=true;return 0;
+    case WM_CLOSE:
     case kMsgClose:
+        if (outputEditorOpen_) {
+            closeAfterOutputEditor_ = true;
+            const HWND dialog = GetLastActivePopup(hwnd);
+            if (dialog && dialog != hwnd && GetWindow(dialog, GW_OWNER) == hwnd)
+                PostMessageW(dialog, WM_CLOSE, 0, 0);
+            EndMenu();
+            return 0;
+        }
+        if (m == WM_CLOSE) break;
         Close(L"toggle");
         return 0;
     case dock::kMsgCaptureAvailable:
@@ -1785,6 +2266,7 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_DESTROY:
+        dismissal_.Stop();
         PostQuitMessage(0);
         hwnd = nullptr;
         return 0;
@@ -1817,7 +2299,9 @@ void Panel::Frame() {
     if (!closing_ && openT_ == 1.f && !tAnimDone_) { tAnimDone_ = Ms(); DLOG(L"cc: opening animation complete ms=%.1f", tAnimDone_); }
     const bool switchMoving = page_ != Page::Main && UpdateSwitchMotion(dt);
     const bool sliderMoving = page_ == Page::Main && UpdateSliderMotion(dt);
-    animating_ = waitingForGlass || switchMoving || sliderMoving || openT_ != openTarget_ || (lastGlass_ && glassFade_ < 1.f);
+    if (reducedMotion_) outputScroll_.SnapTo(outputScroll_.Target());
+    else outputScroll_.Step(dt);
+    animating_ = !outputScroll_.AtRest() || waitingForGlass || switchMoving || sliderMoving || openT_ != openTarget_ || (lastGlass_ && glassFade_ < 1.f);
     if (closing_ && openT_ <= 0.02f) {
         const bool restore=GetForegroundWindow()==hwnd;
         DestroyWindow(hwnd);
@@ -1826,12 +2310,19 @@ void Panel::Frame() {
     }
     Render();
     needsFrame_ = false;
+    if (!volumeStarted_) { volumeStarted_ = true; volumeWatch_.Start(hwnd, kMsgVolume); }  // after the first frame (see Run)
 }
 
 int Panel::Run(RECT anchor, HWND notify, UINT notifyMessage, bool soundOnly, Page initialPage) {
     soundOnly_=soundOnly;page_=initialPage;directDetail_=initialPage!=Page::Main;RefreshTheme();
+    if (soundOnly_) {
+        outputSettingsPath_ = g_settingsPath.empty() ? liquid::settings::DefaultPath() : g_settingsPath;
+        outputPreferences_ = liquid::settings::Load(outputSettingsPath_).value.controlCenter.audioOutputs;
+        outputScroll_.SetSpec(docky::motion::tokens::Scroll);
+        outputScroll_.SetRest(0.12, 1.0);
+    }
     BOOL animations=TRUE;if(SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0))reducedMotion_=!animations;
-    {std::lock_guard<std::mutex> lock(g_anchorMutex);anchor_=g_anchor;}
+    {std::lock_guard<std::mutex> lock(g_anchorMutex);anchor_=g_anchor;above_=g_openAbove;}
     notify_ = notify;
     notifyMessage_ = notifyMessage;
     previous_ = GetForegroundWindow();
@@ -1859,14 +2350,16 @@ int Panel::Run(RECT anchor, HWND notify, UINT notifyMessage, bool soundOnly, Pag
         DestroyWindow(hwnd);
         return 1;
     }
-    volumeWatch_.Start(hwnd, kMsgVolume);
+    // The volume watcher (an audio endpoint callback, ~20 ms to register) starts after the first frame (Frame); the
+    // worker's first status query already brings the current volume.
     if(g_visualCaptureTest && !SetWindowDisplayAffinity(hwnd,WDA_NONE)){DestroyWindow(hwnd);return 2;}
     ShowWindow(hwnd, SW_SHOW);
     tShown_ = Ms();
     SetForegroundWindow(hwnd);  // keyboard (Esc) and outside-click via deactivation; restored on close
+    dismissal_.Start(hwnd);
     SetTimer(hwnd, kTimerRefresh, 1500, nullptr);  // state polling only; animation uses the frame clock
     SetTimer(hwnd, kTimerHealth, 1000, nullptr);
-    SetTimer(hwnd, kTimerWgcStart, 80, nullptr);
+    if (!wgcStarted_) SetTimer(hwnd, kTimerWgcStart, 80, nullptr);
     if (!snapshotDir_.empty()) SetTimer(hwnd, kTimerSnapshot, 900, nullptr);
     {   // Development: LIQUID_CC_DEV_PRESS=sound|display shows that slider pressed (no value is changed) for the snapshot.
         wchar_t press[16] = {};
@@ -1875,7 +2368,7 @@ int Panel::Run(RECT anchor, HWND notify, UINT notifyMessage, bool soundOnly, Pag
             needsFrame_ = true;
         }
     }
-    openedAt_ = lastT_ = transitionAt_ = Now();
+    lastT_ = transitionAt_ = Now();
     transitionFrom_ = 0.f;
     DLOG(L"cc: opening animation start ms=%.1f", Ms());
     DLOG(L"cc: open at (%ld,%ld) %ux%u px, icon font %ls, glass %ls", windowRect_.left, windowRect_.top, pxW_, pxH_, iconFamily_.c_str(),
@@ -1926,7 +2419,10 @@ int Panel::Run(RECT anchor, HWND notify, UINT notifyMessage, bool soundOnly, Pag
     volumeWatch_.Stop();
     backdrop_.Request(false, nullptr);
     backdrop_.SetDevice(nullptr);
-    worker_.reset();
+    // A Wi-Fi scan or Bluetooth lookup in progress can take tens of seconds (measured 36 s, 2026-11-21). Joining it here
+    // kept the panel thread alive after its window was gone, and every click on Wi-Fi, sound or Control Center was
+    // ignored meanwhile (g_running). The worker owns everything it touches, so it finishes on its own thread.
+    if (worker_) std::thread([w = std::move(worker_)]() mutable { w.reset(); }).detach();
     if (glass_) glass_->ReleaseGpuResources();
     if (ctx_) { ctx_->ClearState(); ctx_->Flush(); }  // shared device: leave no bindings for the next opening
     if (waitable_) CloseHandle(waitable_);
@@ -1979,6 +2475,8 @@ void TogglePanel(const RECT& anchor, HWND notify, UINT notifyMessage, bool sound
 void Toggle(const RECT& anchor, HWND notify, UINT notifyMessage) { TogglePanel(anchor,notify,notifyMessage,false,Page::Main); }
 void ToggleSound(const RECT& anchor, HWND notify, UINT notifyMessage) { TogglePanel(anchor,notify,notifyMessage,true,Page::Main); }
 void ToggleWifi(const RECT& anchor, HWND notify, UINT notifyMessage) { TogglePanel(anchor,notify,notifyMessage,false,Page::Wifi); }
+void ToggleBluetooth(const RECT& anchor, HWND notify, UINT notifyMessage) { TogglePanel(anchor,notify,notifyMessage,false,Page::Bluetooth); }
+void SetOpenAbove(bool above) { std::lock_guard<std::mutex> lock(g_anchorMutex); g_openAbove = above; }
 void UpdateAnchor(const RECT& anchor) {
     {std::lock_guard<std::mutex> lock(g_anchorMutex);if(EqualRect(&g_anchor,&anchor))return;g_anchor=anchor;}
     if(HWND h=FindWindowW(kClass,L"DockOver Control Center")){DWORD pid=0;GetWindowThreadProcessId(h,&pid);if(pid==GetCurrentProcessId())PostMessageW(h,kMsgAnchor,0,0);}

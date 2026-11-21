@@ -9,7 +9,7 @@ This inventory records local references; it does not grant permission to use or 
 | `official-dock-v3/` | Finder and Apps @4x PNG; `dock.finder`, `dock.launchpad`, plus menu mappings | No release authorization established |
 | `official-dock-v4/` | Empty/full Trash @4x PNG plus v3 mappings | No release authorization established |
 | `user-downloads/` and `apple-menu-bar-local-01.dockypack` | User-provided PNGs; cropped Wi-Fi and Control Center mappings | Provenance recorded locally; rights not established; no release authorization |
-| Wi-Fi alternate states, volume, battery | No corresponding official assets confirmed in this local inventory | docky defaults used where a mapping is absent; no official pack prepared |
+| Wi-Fi alternate states, volume, battery | No corresponding official assets confirmed in this local inventory | DockOver defaults used where a mapping is absent; no official pack prepared |
 | SF Symbols and San Francisco fonts | Apple resources with separate terms | Not bundled or newly downloaded in this work; applicable rights not evaluated |
 
 The four existing Apple-reference `.dockypack` files remain local; none is designated a releasable package. An earlier handoff recorded local activation of v4; current user configuration was not modified or assumed. Workshop's current archive parser accepts PNG entries, while separate custom Dock icons support a Direct2D SVG subset. PNG fallback and old packs must remain compatible if archive SVG support is added.

@@ -38,7 +38,7 @@ std::vector<ExtWidget> LoadWidgetManifests(const std::wstring& root);
 
 struct Kind { std::wstring id, name; Size defaultSize; std::wstring group; };  // group: the gallery sidebar entry
 std::vector<Kind> BuiltinKinds();  // clock (digital), clock.analog, calendar, battery, system
-bool LightPlate(const std::wstring& kind);
+PlateTone PlateToneOf(const std::wstring& kind);  // the digital Clock: white, or black (Prefs::clockDark)
 IDWriteTextFormat* IconFont(float size);  // Segoe Fluent Icons / MDL2 Assets glyphs  // solid style: drawn on a light plate (the digital clock)
 
 // Paints one widget body (glass is painted by the caller) into `r` (DIP).
@@ -47,6 +47,11 @@ void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D
 int ListRowAt(const ExtWidget& ext, Size size, D2D1_RECT_F r, D2D1_POINT_2F p);
 UINT RefreshMs(const std::wstring& kind);
 void SampleSystem();  // CPU / memory sampler for the System widget (call every ~2 s)
+// Scrolling built-in widgets (Calendar, Weather). The host sets `offset` (DIP, 0 = the normal view) before PaintWidget;
+// the painter clamps to and reports the range it can scroll (`min` .. `max`) for the wheel and the spring.
+struct WidgetScroll { float offset = 0, min = 0, max = 0; };
+WidgetScroll& PaintScroll();
+bool Scrollable(const std::wstring& kind);
 // What a click on a built-in widget opens (Clock app, Calendar, battery settings, Task Manager).
 void OpenBuiltin(const std::wstring& kind);
 

@@ -113,8 +113,8 @@
 | 运行中应用与固定项的匹配顺序 | 无二进制证据 | 低（推断） |
 | Ghidra 函数级调用链 | 分析超时，未获得 | — |
 
-## 5. Liquid Desktop 当前能力对照
-| 能力 | Liquid Desktop 现状 | MyDockFinder | 差距 |
+## 5. DockOver 当前能力对照
+| 能力 | DockOver 现状 | MyDockFinder | 差距 |
 |---|---|---|---|
 | 单项自定义图标 | 已有：custom_icons.h 的 CustomIconStore（id→路径，存于 %LOCALAPPDATA%\LiquidDock\custom-icons.json），Dock 右键 Change Icon / Reset Icon，按 IconFileStamp 检测文件变化并刷新，WIC 解码（PNG、ICO、JPG 等，保持宽高比、预乘 alpha） | icopath 写在 ico.ini 的项目段 | Liquid 的独立覆盖表更好（不耦合 Dock 顺序，固定或运行都能复用）。缺少缩放、偏移、遮罩、阴影的单项编辑参数 |
 | 稳定 ID | ApplicationItemId(target, args)；运行中匹配用 exePath / exeBase（shell_items） | appname + realpath + virtualpath(AUMID) | Liquid 缺少 AUMID 作为身份（UWP / 打包应用）；运行中的临时项是否用同一个 ID 取覆盖需要核对 |

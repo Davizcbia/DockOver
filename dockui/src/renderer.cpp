@@ -186,13 +186,14 @@ void Renderer::Shutdown() {
     if (dcompTarget_) dcompTarget_->SetRoot(nullptr);
     if (dcomp_) dcomp_->Commit();
     if (dc_) dc_->SetTarget(nullptr);
+    uiBitmap_.Reset(); uiValid_ = false; uiW_ = uiH_ = 0;
     if (material_) material_->ReleaseDeviceResources();
     material_.reset();
     if (liquid_) liquid_->ReleaseGpuResources();
     liquid_.reset();
     timer_.Release();
     rtv_.Reset();
-    localScene_.Reset();localSceneW_=localSceneH_=0;
+    for(auto& cache:localGlassCaches_){if(cache.material)cache.material->ReleaseGpuResources();cache.material.reset();cache.scene.Reset();cache.width=cache.height=0;}
     brush_.Reset();
     diagFormat_.Reset();
     menuRowFormat_.Reset();
@@ -239,6 +240,7 @@ HRESULT Renderer::CreateTarget() {
 
 HRESULT Renderer::Resize(UINT pxW, UINT pxH, float dpi) {
     dpi_ = dpi;
+    uiValid_ = false;  // the cached UI layer is rebuilt at the new size
     dc_->SetTarget(nullptr);
     target_.Reset();
     rtv_.Reset();
@@ -305,6 +307,14 @@ HRESULT Renderer::QueryFrameStats(UINT& presentCount, UINT& presentRefreshCount,
         syncRefreshCount = stats.SyncRefreshCount;
     }
     return hr;
+}
+
+bool Renderer::PresentTiming(UINT& lastPresentCount, UINT& shownPresentCount, LONGLONG& shownQpc) {
+    if (!swapChain_ || FAILED(swapChain_->GetLastPresentCount(&lastPresentCount))) return false;
+    DXGI_FRAME_STATISTICS stats{};
+    if (swapChain_->GetFrameStatistics(&stats) != S_OK) return false;
+    shownPresentCount = stats.PresentCount; shownQpc = stats.SyncQPCTime.QuadPart;
+    return true;
 }
 
 // One-shot diagnostic export of this renderer's DComp backbuffer, not the desktop composite.
@@ -407,6 +417,8 @@ void Renderer::SaveSnapshot() {
 
 bool Renderer::RenderLocalGlass(const LocalGlassOverlay& overlay) {
     if (!overlay.active || !liquid_ || !ctx_ || !rtv_ || !swapChain_ || !d3d_) return false;
+    auto& cache=localGlassCaches_[std::clamp(overlay.cacheKey,0,static_cast<int>(localGlassCaches_.size())-1)];
+    if(!cache.material){cache.material=CreateLiquidGlassMaterial();if(FAILED(cache.material->CreateGpuResources(d3d_.Get()))){cache.material.reset();return false;}}
     ComPtr<ID3D11Texture2D> source;
     if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&source)))) return false;
     D3D11_TEXTURE2D_DESC desc{}; source->GetDesc(&desc);
@@ -418,16 +430,16 @@ bool Renderer::RenderLocalGlass(const LocalGlassOverlay& overlay) {
     const int y1=std::min(static_cast<int>(desc.Height),static_cast<int>(std::ceil(overlay.sampleBounds.bottom*scale))+margin);
     if(x1<=x0||y1<=y0)return false;
     const UINT width=static_cast<UINT>(x1-x0),height=static_cast<UINT>(y1-y0);
-    if(!localScene_||localSceneW_!=width||localSceneH_!=height){
+    if(!cache.scene||cache.width!=width||cache.height!=height){
         D3D11_TEXTURE2D_DESC copy{};copy.Width=width;copy.Height=height;copy.MipLevels=1;copy.ArraySize=1;
         copy.Format=desc.Format;copy.SampleDesc.Count=1;copy.Usage=D3D11_USAGE_DEFAULT;copy.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         ComPtr<ID3D11Texture2D> next;if(FAILED(d3d_->CreateTexture2D(&copy,nullptr,&next)))return false;
-        localScene_=next;localSceneW_=width;localSceneH_=height;
+        cache.scene=next;cache.width=width;cache.height=height;
     }
     ctx_->OMSetRenderTargets(0,nullptr,nullptr);
     const D3D11_BOX box{static_cast<UINT>(x0),static_cast<UINT>(y0),0,static_cast<UINT>(x1),static_cast<UINT>(y1),1};
-    ctx_->CopySubresourceRegion(localScene_.Get(),0,0,0,0,source.Get(),0,&box);
-    BackdropFrame frame;frame.texture=localScene_.Get();frame.screenRect=RECT{x0,y0,x1,y1};frame.frameId=++localSceneFrame_;
+    ctx_->CopySubresourceRegion(cache.scene.Get(),0,0,0,0,source.Get(),0,&box);
+    BackdropFrame frame;frame.texture=cache.scene.Get();frame.screenRect=RECT{x0,y0,x1,y1};frame.frameId=++localSceneFrame_;
     GpuPaint paint;paint.context=ctx_.Get();paint.target=rtv_.Get();paint.targetWidth=targetW_;paint.targetHeight=targetH_;
     paint.windowScreenRect=RECT{0,0,static_cast<LONG>(targetW_),static_cast<LONG>(targetH_)};
     // The Lab draws a 116x50 control then scales it to 40%. Map that
@@ -439,16 +451,88 @@ bool Renderer::RenderLocalGlass(const LocalGlassOverlay& overlay) {
                                overlay.plate.right/controlScale,overlay.plate.bottom/controlScale);
     GlassParameters localParams=overlay.params;localParams.radius/=controlScale;
     paint.backdrop=&frame;paint.params=&localParams;
-    paint.pointerX=overlay.pointerX;paint.pointerY=overlay.pointerY;paint.press=1.f;
-    return liquid_->RenderGpu(paint);
+    paint.pointerX=overlay.pointerX;paint.pointerY=overlay.pointerY;paint.press=overlay.press;
+    return cache.material->RenderGpu(paint);
 }
 
 HRESULT Renderer::Render(const Scene& scene) {
     const double t0 = NowMs();
     timer_.Begin(ctx_.Get());
+    uiValid_ = false;  // this frame draws the UI straight into the back buffer; the cached layer may be out of date
     // GPU material first (it writes the whole back buffer), then D2D content on top. If the GPU
     // material is unavailable this frame (no backdrop yet, Smoked selected, failure) the D2D smoke
     // fallback draws the plate instead.
+    RenderGlassLayers(scene);
+    timer_.Mark(ctx_.Get());
+    dc_->BeginDraw();
+    dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+    if (!lastUsedGpu_) dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+    if (scene.customDraw) scene.customDraw(dc_.Get(), lastUsedGpu_);
+    else DrawScene(scene, !lastUsedGpu_);
+    HRESULT hr = dc_->EndDraw();
+    return FinishFrame(scene, hr, t0);
+}
+
+// ---- Low-latency layering (opt-in, the Dock) -----------------------------------------------------------------------
+// The UI (icons, labels' text, indicators, diagnostics) is drawn by D2D into a cached layer before the newest desktop
+// frame is taken; when that frame arrives only the GPU glass is drawn and the cached layer is laid over it. Drawing the
+// UI cost 1-8 ms per frame, longer than the ~1 ms DWM leaves between handing out a desktop frame and composing the next
+// one, so it had to move out of that window (experiments/hostbackdrop-lab/REPORT-dxgi-latency.md).
+bool Renderer::CanCompose(const Scene& scene) const {
+    return liquid_ && rtv_ && dc_ && scene.glass && scene.glass->material == MaterialKind::Liquid && !scene.customDraw &&
+           !scene.localGlass && !scene.chromeGlass && !scene.menuMode && !scene.opaqueFallback && scene.frame;
+}
+
+HRESULT Renderer::PrepareUi(const Scene& scene) {
+    if (!CanCompose(scene)) { uiValid_ = false; return S_FALSE; }
+    const double t0 = NowMs();
+    if (!uiBitmap_ || uiW_ != targetW_ || uiH_ != targetH_ || uiDpi_ != dpi_) {
+        uiDpi_ = dpi_;
+        uiBitmap_.Reset();
+        const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi_, dpi_);
+        HRESULT hr = dc_->CreateBitmap(D2D1::SizeU(std::max<UINT>(1, targetW_), std::max<UINT>(1, targetH_)), nullptr, 0, props, &uiBitmap_);
+        if (FAILED(hr)) { uiValid_ = false; return hr; }
+        uiW_ = targetW_; uiH_ = targetH_;
+    }
+    dc_->SetTarget(uiBitmap_.Get());
+    dc_->BeginDraw();
+    dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+    dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
+    labelUsedGpu_ = true;  // Compose draws the label plate on the GPU; if it cannot, the caller renders the full path
+    DrawScene(scene, false);
+    const HRESULT hr = dc_->EndDraw();
+    dc_->SetTarget(target_.Get());
+    uiValid_ = SUCCEEDED(hr);
+    lastUiMs_ = static_cast<float>(NowMs() - t0);
+    return hr;
+}
+
+HRESULT Renderer::Compose(const Scene& scene) {
+    if (!uiValid_ || !CanCompose(scene) || !scene.backdrop) return S_FALSE;
+    const double t0 = NowMs();
+    timer_.Begin(ctx_.Get());
+    RenderGlassLayers(scene);
+    const bool wantsLabel = scene.labelIndex >= 0 && scene.labelIndex < static_cast<int>(scene.frame->items.size()) &&
+                            scene.labelAlpha > 0.01f && !scene.label.empty();
+    if (!lastUsedGpu_ || (wantsLabel && !labelUsedGpu_)) { timer_.Mark(ctx_.Get()); timer_.End(ctx_.Get()); return S_FALSE; }
+    timer_.Mark(ctx_.Get());
+    dc_->BeginDraw();
+    dc_->SetTransform(D2D1::Matrix3x2F::Identity());
+    dc_->DrawBitmap(uiBitmap_.Get(), nullptr, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+    const HRESULT hr = dc_->EndDraw();
+    ++composedFrames_;
+    return FinishFrame(scene, hr, t0);
+}
+
+HRESULT Renderer::FinishFrame(const Scene& scene, HRESULT hr, double t0) {
+    timer_.End(ctx_.Get());
+    lastCpuMs_ = static_cast<float>(NowMs() - t0);
+    if (FAILED(hr)) return hr;
+    return PresentFrame(scene);
+}
+
+void Renderer::RenderGlassLayers(const Scene& scene) {
     lastUsedGpu_ = false;
     labelUsedGpu_ = false;
     const GlassParameters* glass = scene.glass;
@@ -485,16 +569,10 @@ HRESULT Renderer::Render(const Scene& scene) {
             }
         }
     }
-    timer_.Mark(ctx_.Get());
-    dc_->BeginDraw();
-    dc_->SetTransform(D2D1::Matrix3x2F::Identity());
-    if (!lastUsedGpu_) dc_->Clear(D2D1::ColorF(0, 0, 0, 0));
-    if (scene.customDraw) scene.customDraw(dc_.Get(), lastUsedGpu_);
-    else DrawScene(scene, !lastUsedGpu_);
-    HRESULT hr = dc_->EndDraw();
-    timer_.End(ctx_.Get());
-    lastCpuMs_ = static_cast<float>(NowMs() - t0);
-    if (FAILED(hr)) return hr;
+}
+
+HRESULT Renderer::PresentFrame(const Scene& scene) {
+    HRESULT hr = S_OK;
     if (scene.localGlass && scene.localGlass->active) {
         const bool rendered=RenderLocalGlass(*scene.localGlass);
         static bool logged=false,last=false;if(!logged||last!=rendered){DLOG(L"settings local glass: rendered=%d",rendered);logged=true;last=rendered;}
@@ -503,8 +581,15 @@ HRESULT Renderer::Render(const Scene& scene) {
             hr=dc_->EndDraw();if(FAILED(hr))return hr;}
 
     }
+    if(scene.chromeGlass) for(const auto& overlay:*scene.chromeGlass) {
+        if(!overlay.active)continue;
+        const bool rendered=RenderLocalGlass(overlay);
+        const auto& finish=rendered?overlay.after:overlay.fallback;
+        if(finish){dc_->BeginDraw();dc_->SetTransform(D2D1::Matrix3x2F::Identity());finish(dc_.Get());
+            hr=dc_->EndDraw();if(FAILED(hr))return hr;}
+    }
     if (pngSnapshotRequested_) SavePngSnapshot();
-    if (lastUsedGpu_ && !snapshotPath_.empty()) {
+    if (!snapshotPath_.empty()) {
         SaveSnapshot();
         snapshotPath_.clear();
     }
@@ -613,6 +698,51 @@ void Renderer::DrawScene(const Scene& s, bool drawPlate) {
 
     if(s.menuMode){
         labelFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        if(s.menuGridColumns>0){
+            // Grid (the Dock's Hidden Icons): app icons in square cells, a soft highlight on the hovered one, a dot under
+            // icons kept in the Dock (checked), and the hovered app's name in the footer.
+            const COLORREF fg=s.opaqueForeground;const auto ink=D2D1::ColorF(GetRValue(fg)/255.f,GetGValue(fg)/255.f,GetBValue(fg)/255.f,1.f);
+            auto inkAt=[&](float a){return s.opaqueFallback?D2D1::ColorF(ink.r,ink.g,ink.b,a):D2D1::ColorF(1,1,1,a);};
+            IDWriteTextFormat* format=menuRowFormat_?menuRowFormat_.Get():labelFormat_.Get();
+            const auto align=format->GetTextAlignment();format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            const int cols=s.menuGridColumns;const float cell=kMenuGridCell,left=(s.windowW-cell*static_cast<float>(cols))*.5f;
+            for(size_t i=0;i<s.menuRows.size();++i){const auto& row=s.menuRows[i];if(row.separator)continue;
+                const float x=left+cell*static_cast<float>(i%static_cast<size_t>(cols)),y=kMenuGridPad+cell*static_cast<float>(i/static_cast<size_t>(cols));
+                const D2D1_POINT_2F c=D2D1::Point2F(x+cell*.5f,y+cell*.5f);
+                if(row.hover&&row.enabled){brush_->SetColor(inkAt(s.opaqueFallback?0.14f:0.20f));dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x+2,y+2,x+cell-2,y+cell-2),10,10),brush_.Get());}
+                brush_->SetColor(inkAt(row.enabled?0.96f:0.42f));
+                ID2D1Bitmap1* bitmap=nullptr;
+                if(row.icon&&row.icon->w&&row.icon->h&&row.icon->pixels.size()==static_cast<size_t>(row.icon->w)*row.icon->h){
+                    auto found=menuIcons_.find(row.icon.get());
+                    if(found==menuIcons_.end()){
+                        if(menuIcons_.size()>96)menuIcons_.clear();
+                        ComPtr<ID2D1Bitmap1> made;const D2D1_BITMAP_PROPERTIES1 props=D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,D2D1_ALPHA_MODE_PREMULTIPLIED),96.f,96.f);
+                        if(SUCCEEDED(dc_->CreateBitmap(D2D1::SizeU(row.icon->w,row.icon->h),row.icon->pixels.data(),row.icon->w*4,&props,&made)))found=menuIcons_.emplace(row.icon.get(),std::make_pair(row.icon,made)).first;
+                    }
+                    if(found!=menuIcons_.end())bitmap=found->second.second.Get();
+                }
+                if(bitmap){
+                    const float side=kMenuGridIcon,iw=static_cast<float>(row.icon->w),ih=static_cast<float>(row.icon->h),k=side/(std::max)(iw,ih);
+                    const float w=std::round(iw*k),h=std::round(ih*k),ix=std::round(c.x-w*.5f),iy=std::round(c.y-h*.5f);
+                    const D2D1_RECT_F dest=D2D1::RectF(ix,iy,ix+w,iy+h);
+                    if(row.icon->templ){const auto mode=dc_->GetAntialiasMode();dc_->SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);dc_->FillOpacityMask(bitmap,brush_.Get(),&dest,nullptr);dc_->SetAntialiasMode(mode);}
+                    else dc_->DrawBitmap(bitmap,dest,row.enabled?1.f:.5f,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,nullptr,nullptr);
+                }else{  // no artwork: the name's first letter in a rounded outline
+                    const float h=kMenuGridIcon*.5f;const D2D1_RECT_F box=D2D1::RectF(c.x-h,c.y-h,c.x+h,c.y+h);
+                    dc_->DrawRoundedRectangle(D2D1::RoundedRect(box,6,6),brush_.Get(),1.5f);
+                    const std::wstring letter=row.text.empty()?L"?":std::wstring(1,static_cast<wchar_t>(towupper(row.text[0])));
+                    dc_->DrawTextW(letter.c_str(),static_cast<UINT32>(letter.size()),format,box,brush_.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                }
+                if(row.checked){brush_->SetColor(inkAt(0.85f));dc_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(c.x,y+cell-4.5f),2.f,2.f),brush_.Get());}
+            }
+            if(!s.menuFooter.empty()){
+                brush_->SetColor(inkAt(0.82f));
+                const float top=s.windowH-kMenuGridFooter;
+                dc_->DrawTextW(s.menuFooter.c_str(),static_cast<UINT32>(s.menuFooter.size()),format,D2D1::RectF(kMenuGridPad,top,s.windowW-kMenuGridPad,s.windowH-6),brush_.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            format->SetTextAlignment(align);
+            return;
+        }
         for(size_t i=0;i<s.menuRows.size();++i){const auto& row=s.menuRows[i];const float top=6.0f+24.0f*static_cast<float>(i);
             const COLORREF fg=s.opaqueForeground;const auto ink=D2D1::ColorF(GetRValue(fg)/255.f,GetGValue(fg)/255.f,GetBValue(fg)/255.f,1.f);
             if(row.separator){brush_->SetColor(s.opaqueFallback?D2D1::ColorF(ink.r,ink.g,ink.b,0.35f):D2D1::ColorF(1,1,1,0.19f));dc_->FillRectangle(D2D1::RectF(14,top+11,s.windowW-14,top+12),brush_.Get());continue;}
@@ -674,7 +804,12 @@ void Renderer::DrawScene(const Scene& s, bool drawPlate) {
         const ItemGeom& g = f.items[i];
         const IconVisual& v = s.icons[i];
         if (g.separator) continue;
-        const D2D1_RECT_F dest = D2D1::RectF(g.left, g.top, g.left + g.size, g.top + g.size);
+        const float bodyW = g.width > 0.0f ? g.width : g.size;  // wider than tall only for the status group
+        const D2D1_RECT_F dest = D2D1::RectF(g.left, g.top, g.left + bodyW, g.top + g.size);
+        if (v.statusCells && v.statusState) {
+            dock::statusgroup::Draw(dc_.Get(), dwrite_.Get(), dest, *v.statusCells, *v.statusState, v.statusHover, v.opacity);
+            continue;
+        }
         if (v.shadow) {
             const float pad = v.shadowPadRatio * g.size;
             const float dy = g.size * 0.04f;
@@ -711,7 +846,7 @@ void Renderer::DrawScene(const Scene& s, bool drawPlate) {
         brush_->SetColor(D2D1::ColorF(1, 0.9f, 0.2f, 0.8f));
         for (const ItemGeom& g : f.items) {
             if (g.separator) continue;
-            dc_->DrawRectangle(D2D1::RectF(g.left, g.top, g.left + g.size, g.top + g.size), brush_.Get(), 1.0f);
+            dc_->DrawRectangle(D2D1::RectF(g.left, g.top, g.left + (g.width > 0.0f ? g.width : g.size), g.top + g.size), brush_.Get(), 1.0f);
         }
     }
 

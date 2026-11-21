@@ -4,6 +4,7 @@
 #include "vblank.h"
 #include "roi_compare_cs.h"
 #include "desktop/duplication.h"
+#include "capture_visible.h"
 #include <windows.graphics.capture.interop.h>
 #include <windows.graphics.directx.direct3d11.interop.h>
 #include <winrt/Windows.Foundation.h>
@@ -34,7 +35,7 @@ void BeginBorderlessRequest(){
     auto& shared=Borderless();int expected=-1;
     if(!shared.status.compare_exchange_strong(expected,0))return;
     UINT32 length=0;const LONG identity=GetCurrentPackageFullName(&length,nullptr);
-    if(identity!=ERROR_INSUFFICIENT_BUFFER){shared.status.store(3);DLOG(L"wgc borderless: no package identity; retaining border");return;}
+    if(identity!=ERROR_INSUFFICIENT_BUFFER){shared.status.store(3);DLOG(L"wgc borderless: no package identity; borderless WGC unavailable");return;}
     try {
         DLOG(L"wgc borderless: requesting consent on capture window apartment");
         shared.operation=GraphicsCaptureAccess::RequestAccessAsync(GraphicsCaptureAccessKind::Borderless);
@@ -56,6 +57,17 @@ void BeginBorderlessRequest(){
 bool DuplicationAllowed(){wchar_t v[16]{};return !(GetEnvironmentVariableW(L"DOCKY_CAPTURE",v,16)&&_wcsicmp(v,L"wgc")==0);}
 void PrewarmBorderlessCapture(){BeginBorderlessRequest();}
 bool BorderlessCaptureGranted(){return BorderlessState().load()==1;}
+bool PrepareCleanCaptureSession(const GraphicsCaptureSession& session){
+    if(!BorderlessCaptureGranted())return false;
+    try {
+        using winrt::Windows::Foundation::Metadata::ApiInformation;
+        if(!ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",L"IsBorderRequired") ||
+           !ApiInformation::IsPropertyPresent(L"Windows.Graphics.Capture.GraphicsCaptureSession",L"IsCursorCaptureEnabled"))return false;
+        session.IsBorderRequired(false);session.IsCursorCaptureEnabled(false);
+        if(session.IsBorderRequired()||session.IsCursorCaptureEnabled())return false;
+        DLOG(L"wgc: clean session verified (border=0 cursor=0)");return true;
+    } catch(const winrt::hresult_error& e){DLOG(L"wgc: clean session refused 0x%08X",static_cast<unsigned>(e.code().value));return false;}
+}
 WgcBackdropSource::~WgcBackdropSource() { Stop(); if (gpuEvent_) CloseHandle(gpuEvent_); if (retryTimer_) CloseHandle(retryTimer_); }
 
 void WgcBackdropSource::SetDevice(ID3D11Device* device) {
@@ -77,17 +89,7 @@ void WgcBackdropSource::Request(bool enabled, HMONITOR monitor) {
     if (monitor == monitor_) return;
     Stop();
     monitor_ = monitor;
-    if (!sourceWindow_ && DuplicationAllowed()) {  // duplication needs no consent: start now (WGC fallback inside Start)
-        state_ = Start(monitor) ? 1 : 3;
-        if (state_ == 3) failedAt_ = std::chrono::steady_clock::now();
-        return;
-    }
-    // Never start with the border while the consent answer is still pending (it arrived ~1 s later and the capture
-    // restarted, so the yellow frame flashed). CheckHealth starts the capture once the answer is in.
-    BeginBorderlessRequest();
-    if (BorderlessState().load() == 0) { state_ = 4; consentWaitSince_ = std::chrono::steady_clock::now(); return; }
-    state_ = Start(monitor) ? 1 : 3;
-    if (state_ == 3) failedAt_ = std::chrono::steady_clock::now();
+    StartOrWait(monitor);
 }
 
 void WgcBackdropSource::Fail(const wchar_t* reason) {
@@ -101,38 +103,49 @@ bool WgcBackdropSource::CheckHealth() {
     const auto now = std::chrono::steady_clock::now();
     if (state_ == 4 && monitor_) {
         if (BorderlessState().load() == 0 && now - consentWaitSince_ < std::chrono::seconds(3)) return false;
-        state_ = Start(monitor_) ? 1 : 3;
+        state_ = Start(monitor_, false) ? 1 : 3;
         if (state_ == 3) failedAt_ = now;
         return true;
     }
     if ((state_ == 1 || state_ == 2) && monitor_ && !dxgi_ && startedCap_ != docky::vblank::CaptureCap()) {  // capture cap changed
         DLOG(L"wgc: capture cap %d -> %d fps; restarting capture", startedCap_, docky::vblank::CaptureCap());
-        const auto monitor = monitor_; Stop(); state_ = Start(monitor) ? 1 : 3;
+        const auto monitor = monitor_; Stop(); state_ = Start(monitor, false) ? 1 : 3;
         if (state_ == 3) failedAt_ = now;
         return true;
     }
-    if((state_==1 || state_==2) && monitor_ && !dxgi_ && BorderlessState().load()==1 && !borderlessTried_){
-        DLOG(L"wgc borderless: permission granted; restarting capture");
-        const auto monitor=monitor_;Stop();state_=Start(monitor)?1:3;
-        if(state_==3)failedAt_=now;return true;
-    }
     if (state_ == 1 && now - startedAt_ > std::chrono::seconds(3)) {
-        Fail(L"first frame timeout");
+        if (dxgi_) {
+            const auto monitor = monitor_;
+            DLOG(L"capture: DXGI first frame timeout; trying borderless WGC");
+            Stop();
+            StartOrWait(monitor, false);
+        } else Fail(L"first frame timeout");
         return true;
     }
     if (state_ == 3 && monitor_ && device_ && now - failedAt_ > std::chrono::seconds(5)) {
         DLOG(L"wgc: retry after failure");
-        state_ = Start(monitor_) ? 1 : 3;
-        if (state_ == 3) failedAt_ = now;
+        StartOrWait(monitor_);
         return true;
     }
     return false;
 }
 
+int WgcBackdropSource::ProbeOffset() {
+    static const int offset = [] {
+        wchar_t v[16]{};
+        if (!wcsstr(GetCommandLineW(), L"--dev-isolated") || !GetEnvironmentVariableW(L"DOCKY_LATENCY_PROBE_OFFSET", v, 16)) return 0;
+        const int px = _wtoi(v);
+        if (px) DLOG(L"capture: latency probe mode, sampling %d px to the left, window visible to capture (dev only)", px);
+        return px;
+    }();
+    return offset;
+}
+
 bool WgcBackdropSource::StartDuplication(HMONITOR monitor) {
     // The requesting window must not see itself: duplication honours WDA_EXCLUDEFROMCAPTURE like WGC.
     DWORD affinity = 0;
-    if (!SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE) || !GetWindowDisplayAffinity(hwnd_, &affinity) || affinity != WDA_EXCLUDEFROMCAPTURE) {
+    if (ProbeOffset()) SetWindowDisplayAffinity(hwnd_, WDA_NONE);  // dev probe: samples elsewhere, so it never sees itself
+    else if (!SetWindowDisplayAffinity(hwnd_, WDA_EXCLUDEFROMCAPTURE) || !GetWindowDisplayAffinity(hwnd_, &affinity) || affinity != WDA_EXCLUDEFROMCAPTURE) {
         DLOG(L"capture: window exclusion failed; no desktop duplication");
         return false;
     }
@@ -157,12 +170,27 @@ bool WgcBackdropSource::StartDuplication(HMONITOR monitor) {
     return true;
 }
 
-bool WgcBackdropSource::Start(HMONITOR monitor) {
+void WgcBackdropSource::StartOrWait(HMONITOR monitor, bool tryDuplication) {
+    if (Start(monitor, tryDuplication)) {
+        state_ = 1;
+    } else if (BorderlessState().load() == 0) {
+        state_ = 4;
+        consentWaitSince_ = std::chrono::steady_clock::now();
+    } else {
+        state_ = 3;
+        failedAt_ = std::chrono::steady_clock::now();
+    }
+}
+
+bool WgcBackdropSource::Start(HMONITOR monitor, bool tryDuplication) {
     if (!hwnd_ || !device_ || !monitor) return false;
-    if (!sourceWindow_ && DuplicationAllowed() && StartDuplication(monitor)) return true;
+    if (tryDuplication && !sourceWindow_ && DuplicationAllowed() && StartDuplication(monitor)) return true;
     // WGC draws Windows' yellow frame around the screen or window unless borderless capture is granted (package identity
     // and the user's consent). Never show it: without the grant there is no live capture.
-    if (BorderlessState().load() != 1) {
+    BeginBorderlessRequest();
+    const int borderless = BorderlessState().load();
+    if (borderless == 0) return false;
+    if (borderless != 1) {
         if (!wgcRefusedLogged_) DLOG(L"wgc: borderless capture not granted; live capture off (no yellow frame)");
         wgcRefusedLogged_ = true;
         return false;
@@ -258,17 +286,7 @@ bool WgcBackdropSource::Start(HMONITOR monitor) {
             }
         });
         session_ = pool_.CreateCaptureSession(item_);
-        BeginBorderlessRequest();
-        borderlessTried_=BorderlessState().load()==1;
-        if(borderlessTried_){
-            try {
-                if(winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
-                    L"Windows.Graphics.Capture.GraphicsCaptureSession",L"IsBorderRequired")){
-                    session_.IsBorderRequired(false);
-                    DLOG(L"wgc borderless: requested without border");
-                } else DLOG(L"wgc borderless: property unavailable; retaining border");
-            } catch(const winrt::hresult_error& e){DLOG(L"wgc borderless: setting failed 0x%08X; retaining border",static_cast<unsigned>(e.code().value));}
-        }
+        if(!PrepareCleanCaptureSession(session_))throw hresult_error(E_ACCESSDENIED,L"Cursorless borderless session unavailable");
         // V0.16: ask the OS for dirty rectangles (Windows 11 24H2+) so unrelated screen updates do not wake the Dock.
         wchar_t skipEnv[8]{};  // LIQUID_WGC_DIRTY_SKIP=0 restores the pre-V0.16 behaviour (A/B measurement, fallback)
         const bool skipAllowed = !(GetEnvironmentVariableW(L"LIQUID_WGC_DIRTY_SKIP", skipEnv, 8) && skipEnv[0] == L'0');
@@ -296,8 +314,6 @@ bool WgcBackdropSource::Start(HMONITOR monitor) {
                      std::chrono::duration<double, std::milli>(session_.MinUpdateInterval()).count());
             } catch (const winrt::hresult_error& e) { DLOG(L"wgc: MinUpdateInterval unavailable 0x%08X", static_cast<unsigned>(e.code().value)); }
         } else DLOG(L"wgc: MinUpdateInterval not supported on this Windows build");
-        session_.IsCursorCaptureEnabled(false);
-        if (session_.IsCursorCaptureEnabled()) throw hresult_error(E_FAIL);
         session_.StartCapture();
         startedAt_ = std::chrono::steady_clock::now();
         DLOG(sourceWindow_ ? L"wgc: started window (%ld,%ld)-(%ld,%ld), cursor disabled" : L"wgc: started monitor (%ld,%ld)-(%ld,%ld), cursor disabled",
@@ -466,8 +482,9 @@ void WgcBackdropSource::SubmitCompare(UINT width, UINT height) {
     context_->Flush();
 }
 
-bool WgcBackdropSource::ProcessDuplication(const RECT& wanted) {
+bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
     if (!device_ || !context_) return false;
+    RECT wanted = wantedIn; OffsetRect(&wanted, -ProbeOffset(), 0);  // dev probe only (0 otherwise)
     if (Log::Get().Enabled(LogLevel::Debug)) { LARGE_INTEGER t{}, f{}; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
         if (const int64_t q = dxgi_->FrameQpc()) DLOG_DEBUG(L"capture wake %.2f ms after the frame", (t.QuadPart - q) * 1000.0 / f.QuadPart); }
     if (FAILED(device_->GetDeviceRemovedReason())) { Fail(L"device lost"); return true; }
@@ -481,7 +498,16 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wanted) {
     GetWindowRect(hwnd_, &own);
     const bool hasRoi = IntersectRect(&roi, &e, &monitorRect_) != FALSE;
     d.Listen(this, hwnd_, kMsgCaptureAvailable, hasRoi ? roi : RECT{}, own);  // re-arm the wake-up for this area
-    if (!hasRoi || inFlight_ || !d.Valid()) return false;
+    // A real change behind the window (kind 2) while a GPU comparison of an own-window redraw is in flight: drop the
+    // comparison (it only decided whether the older image was worth publishing) and take the newer frame now. Waiting
+    // for it delayed live wallpaper frames by ~2 ms on average, up to ~50 ms (measured 2026-11-20). Only changes outside
+    // the window can cut in, so the window's own redraws still cannot drive each other.
+    if (inFlight_ && hasRoi && d.Valid() && d.ChangedKind(roi, dxgiSeen_, own) == 2) {
+        inFlight_ = false; retryMap_ = false; candidate_.Reset();
+        if (retryTimer_) CancelWaitableTimer(retryTimer_);
+        if (gpuEvent_) ResetEvent(gpuEvent_);
+    }
+    if (!hasRoi || inFlight_ || !d.Valid() || !d.Fresh(roi)) return false;  // Fresh: wait for the full copy (SharedDesktop)
     if (!dxgiView_ || dxgiGeneration_ != d.Generation()) {
         dxgiView_.Reset();
         const HANDLE shared = d.SharedHandle();
@@ -491,7 +517,8 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wanted) {
     }
     const bool moved = !texture_ || !EqualRect(&roi, &copiedRect_);
     const uint64_t serial = d.Serial();  // before the copy: a change during it is caught next time
-    const int kind = moved ? 2 : d.ChangedKind(roi, dxgiSeen_, own);
+    int kind = moved ? 2 : d.ChangedKind(roi, dxgiSeen_, own);
+    if (kind && ProbeOffset()) kind = 2;  // dev probe: the window is not excluded, so "own window" changes are real
     dxgiSeen_ = serial;
     if (kind == 0) return false;
     try {
@@ -507,17 +534,20 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wanted) {
         candidateRect_ = roi; candidateId_ = serial;
         const int64_t frameQpc = d.FrameQpc();  // when the newest desktop frame was taken
         candidateTime_ = static_cast<double>(frameQpc ? frameQpc : now.QuadPart) / freq.QuadPart;
+        candidateLp_ = d.LastPresentQpc();
         // New area or a real change: publish now. A change only inside windows excluded from capture (this one or another
         // docky window: Windows reports their redraws although the image behind them is the same) is compared on the GPU
         // first and published only when the pixels changed; publishing those directly made two docky windows redraw each
         // other at the display rate (measured 2026-11-13).
-        // Only inside excluded windows, but this window has not drawn for about 2.5 display frames: it is not its own redraw
-        // (which Windows reports within a frame or two of the Present), so it is content behind it (or another docky window,
-        // which then compares). 2.5 frames + 4 ms: 14 ms at 240 Hz, 35 ms (the cap) at 60 Hz.
+        // Only inside this window, but it has not drawn for about 2.5 display frames: it is not its own redraw (which
+        // Windows reports within a frame or two of the Present), so it is content behind it. 2.5 frames + 4 ms: 14 ms at
+        // 240 Hz, 35 ms (the cap) at 60 Hz. Kind 3 (inside another excluded window, e.g. the animating Dock under Control
+        // Center) always compares: publishing it unchecked redrew Control Center ~64 times a second while the Dock animated,
+        // and that panel's separate GPU work cost the Dock about a quarter of its frames (measured 2026-11-18).
         const double ownWindow = (std::min)(0.035, 2.5 * docky::vblank::FramePeriod().load() + 0.004);
         const bool drewRecently = lastDrawQpc_ && static_cast<double>(now.QuadPart - lastDrawQpc_) < ownWindow * freq.QuadPart;
         if (moved || kind == 2 || (kind == 1 && !drewRecently) || !compareShader_ || !context4_ || !fence_) {
-            texture_ = candidate_; candidate_.Reset(); copiedRect_ = roi; copiedId_ = candidateId_; publishedTime_ = candidateTime_;
+            texture_ = candidate_; candidate_.Reset(); copiedRect_ = roi; copiedId_ = candidateId_; publishedTime_ = candidateTime_; publishedLp_ = candidateLp_;
             ++contentVersion_; ++publishedCount_; state_ = 2; NotePublished();
             DLOG_DEBUG(L"capture: duplication publish content=%llu roi=(%ld,%ld)-(%ld,%ld)", static_cast<unsigned long long>(contentVersion_), roi.left, roi.top, roi.right, roi.bottom);
             return true;
@@ -528,8 +558,12 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wanted) {
 }
 
 bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
-    if (dxgi_) return ProcessDuplication(wanted);
+    if (dxgi_) return ProcessDuplication(wanted);  // frozen screenshots: SharedDesktop holds its frames
     if (!pending_ || !device_ || !context_) return false;
+    if (docky::capture_visible::Frozen()) {  // glass visible to a screenshot: drop frames that may contain it
+        std::lock_guard<std::mutex> lock(pending_->mutex); pending_->frame = nullptr; pending_->posted = false;
+        return false;
+    }
     if (pending_->closed || FAILED(device_->GetDeviceRemovedReason())) { Fail(L"capture closed or device lost"); return true; }
     {
         std::unique_lock<std::mutex> lock(pending_->mutex, std::try_to_lock);
@@ -569,7 +603,7 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
         // rectangles inside the ROI the content is known to have changed, so publish this frame immediately;
         // the compare only remains for frames without usable dirty data.
         if (!texture_ || !EqualRect(&roi,&copiedRect_) || !compareShader_ || !context4_ || !fence_ || currentDirtyHit_) {
-            texture_=candidate_; candidate_.Reset(); copiedRect_=roi; copiedId_=candidateId_; publishedTime_=candidateTime_;
+            texture_=candidate_; candidate_.Reset(); copiedRect_=roi; copiedId_=candidateId_; publishedTime_=candidateTime_; publishedLp_=candidateLp_;
             ++contentVersion_; ++publishedCount_; state_=2; NotePublished();
             if (diagnostics_) CompareRoi();
             // Per frame, so debug only (it was ~240 lines/s with a video wallpaper: 564 MB of log).
@@ -608,15 +642,17 @@ bool WgcBackdropSource::CompleteCompare(const RECT& wanted) {
         if (exactChanged != changed) DLOG(L"ERROR gpu comparison disagrees with exact diagnostic GPU=%d exact=%d", changed, exactChanged);
     }
     if (changed && valid) { texture_=candidate_; copiedRect_=candidateRect_; copiedId_=candidateId_;
-        publishedTime_=candidateTime_; ++contentVersion_; ++publishedCount_; published=true; NotePublished(); DLOG_DEBUG(L"wgc: content publish capture=%llu content=%llu", static_cast<unsigned long long>(copiedId_), static_cast<unsigned long long>(contentVersion_)); }
+        publishedTime_=candidateTime_; publishedLp_=candidateLp_; ++contentVersion_; ++publishedCount_; published=true; NotePublished(); DLOG_DEBUG(L"wgc: content publish capture=%llu content=%llu", static_cast<unsigned long long>(copiedId_), static_cast<unsigned long long>(contentVersion_)); }
     candidate_.Reset();
     if (!valid) candidateId_=0;
     PostMessageW(hwnd_,kMsgCaptureAvailable,0,0);
     return published;
 }
 
-bool WgcBackdropSource::Latest(const RECT& wanted, BackdropFrame& out) {
+bool WgcBackdropSource::Latest(const RECT& wantedIn, BackdropFrame& out) {
     { LARGE_INTEGER t{}; QueryPerformanceCounter(&t); lastDrawQpc_ = t.QuadPart; }  // the caller is drawing a frame now
+    const int probe = dxgi_ ? ProbeOffset() : 0;
+    RECT wanted = wantedIn; OffsetRect(&wanted, -probe, 0);
     if ((!pending_ && !dxgi_) || !texture_) return false;
     LONG margin=static_cast<LONG>(std::ceil(96.0*GetDpiForWindow(hwnd_)/96.0));
     RECT expanded{wanted.left-margin,wanted.top-margin,wanted.right+margin,wanted.bottom+margin}, roi{};
@@ -629,6 +665,7 @@ bool WgcBackdropSource::Latest(const RECT& wanted, BackdropFrame& out) {
         RECT common{};const auto area=[](const RECT& r){return static_cast<long long>(r.right-r.left)*(r.bottom-r.top);};
         if (!IntersectRect(&common,&roi,&copiedRect_) || area(common)*2 < area(roi)) return false;  // a different place: wait
     }
-    out.texture=texture_.Get(); out.screenRect=copiedRect_; out.frameId=contentVersion_; out.captureTimeSeconds=publishedTime_; return true;
+    out.texture=texture_.Get(); out.screenRect=copiedRect_; OffsetRect(&out.screenRect, probe, 0);  // probe: shown shifted
+    out.frameId=contentVersion_; out.captureTimeSeconds=publishedTime_; return true;
 }
 }

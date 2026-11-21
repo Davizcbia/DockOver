@@ -119,6 +119,7 @@ GlassParameters RoleGlass(GlassRole role, const GlassParameters& base) {
         break;
     case GlassRole::ControlModule:
     case GlassRole::PopupModule:
+    case GlassRole::Notification:
         p.bevelWidth = 12.0f;
         p.refraction = 0.7f;
         p.dispersion = 0.03f;
@@ -174,7 +175,10 @@ const wchar_t* GlassSurfaceName(GlassSurface s) {
     case GlassSurface::Menus: return L"Menus (all right-click menus, menu bar menus)";
     case GlassSurface::MenuBarPanels: return L"Menu bar popups & widget panels (Wi-Fi, Bluetooth, sound, battery; Edit Widgets, Widgets & Stacks settings, Stacks panel)";
     case GlassSurface::ControlCenter: return L"Control Center";
+    case GlassSurface::SettingsSearch: return L"Settings: search field";
+    case GlassSurface::SettingsNavigation: return L"Settings: back & forward buttons";
     case GlassSurface::Controls: return L"Sliders & switches (pressed thumb lens: Control Center, Settings, widget settings)";
+    case GlassSurface::Notifications: return L"Notifications (Notification Center cards, notification banners)";
     default: return L"Dock";
     }
 }
@@ -185,6 +189,9 @@ const char* GlassSurfaceKey(GlassSurface s) {
     case GlassSurface::MenuBarPanels: return "menuBarPanels";
     case GlassSurface::ControlCenter: return "controlCenter";
     case GlassSurface::Controls: return "controls";
+    case GlassSurface::SettingsSearch: return "settingsSearch";
+    case GlassSurface::SettingsNavigation: return "settingsNavigation";
+    case GlassSurface::Notifications: return "notifications";
     default: return "dock";
     }
 }
@@ -229,6 +236,19 @@ GlassParameters GlassSurfaceDefault(GlassSurface s) {
         p.density = 0.32f; p.highlightDim = 0.0f; p.backdropBlur = 0.0f;
         return p;
     }
+    case GlassSurface::Notifications: {  // Control Center glass, fully frosted (cards over the blurred column), corner 20
+        GlassParameters p = GlassSurfaceDefault(GlassSurface::ControlCenter);
+        p.radius = 20.0f; p.frost = 1.0f;
+        return p;
+    }
+    case GlassSurface::SettingsSearch:
+    case GlassSurface::SettingsNavigation: {
+        GlassParameters p=TunedBase();
+        p.radius=s==GlassSurface::SettingsSearch?16.f:21.f;
+        p.bevelWidth=5.f;p.blurSpread=.22f;p.frost=.2f;p.refraction=.65f;
+        p.glare=.4f;p.density=.12f;p.shadowAmount=.1f;p.backdropBlur=0;
+        return p;
+    }
     case GlassSurface::Controls: {  // the Control Center switch lens (Glass Lab refractionDirection -1, references 2026-11-10)
         GlassParameters p;
         p.radius = 14.0f; p.bevelWidth = 9.0f; p.refraction = -1.7f; p.refractiveIndex = 1.45f; p.magnification = 1.0f;
@@ -245,10 +265,11 @@ GlassParameters GlassSurfaceDefault(GlassSurface s) {
 
 GlassParameters RoleGlass(GlassRole role) {
     GlassSettingsStore& store = GlassSettingsStore::Get();
-    if (role == GlassRole::ControlModule || role == GlassRole::PopupModule || role == GlassRole::Menu) {
+    if (role == GlassRole::ControlModule || role == GlassRole::PopupModule || role == GlassRole::Menu || role == GlassRole::Notification) {
         store.ReloadIfChanged();  // no-op in the process that owns the file
         const GlassSurface s = role == GlassRole::ControlModule ? GlassSurface::ControlCenter
                              : role == GlassRole::PopupModule   ? GlassSurface::MenuBarPanels
+                             : role == GlassRole::Notification  ? GlassSurface::Notifications
                                                                 : GlassSurface::Menus;
         GlassParameters p = store.Surface(s);
         // Invariants the surfaces rely on, whatever was tuned: always the GPU material, light ink on dark glass,
@@ -275,7 +296,13 @@ GlassParameters GlassSettingsStore::Surface(GlassSurface s) const {
     if (s == GlassSurface::Dock) return Current();
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = surfaces_.find(static_cast<int>(s));
-    return it != surfaces_.end() ? it->second : GlassSurfaceDefault(s);
+    if (it != surfaces_.end()) return it->second;
+    if (s == GlassSurface::Notifications) {
+        // Not tuned yet: the user's Control Center glass, fully frosted, corner 20 (the look before this category existed).
+        auto cc = surfaces_.find(static_cast<int>(GlassSurface::ControlCenter));
+        if (cc != surfaces_.end()) { GlassParameters p = cc->second; p.radius = 20.0f; p.frost = 1.0f; return p; }
+    }
+    return GlassSurfaceDefault(s);
 }
 
 void GlassSettingsStore::SetSurface(GlassSurface s, const GlassParameters& p) {

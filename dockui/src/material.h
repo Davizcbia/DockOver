@@ -15,6 +15,10 @@
 
 namespace dock {
 
+// The GPU SDF and Applications outline share this corner profile.
+inline constexpr float kGlassCornerExtent = 1.18f;
+inline constexpr float kGlassCornerExponent = 2.3f;
+
 struct PlatePaint {
     ID2D1Geometry* shape = nullptr;       // continuous-corner plate outline, DIPs
     ID2D1Geometry* rimShape = nullptr;    // outline inset by half a stroke, for the hairline rim

@@ -1,9 +1,8 @@
 #pragma once
 // A desktop-level window drawn with docky's Liquid Glass material (dock::Renderer, the same GPU material as the
-// Dock, menus and Control Center). Its backdrop is composed by ComposeBackdrop (wallpaper + docky Desktop's own
-// windows) instead of screen capture, so no capture border appears and nothing needs a package identity.
+// Dock, menus and Control Center). Desktop widgets can use a composed backdrop, while the popups use live capture.
 #include "canvas.h"
-#include "duplication.h"
+#include "../backdrop_wgc.h"
 #include "../renderer.h"
 #include <functional>
 #include <memory>
@@ -40,8 +39,7 @@ public:
     // with this window excluded from capture). Desktop-level panels keep the composed wallpaper backdrop.
     void SetLiveBackdrop(bool live);
     // Live panels: true when what is behind the panel changed (then Redraw). Cheap enough to call every frame: it uses
-    // DXGI desktop duplication (GPU only, changed regions reported by Windows; the panel is excluded from it) and falls
-    // back to a GDI screen copy at most 5 times per second when duplication is unavailable.
+    // the shared borderless WGC/DXGI pipeline, with a GDI screen-copy fallback at up to 5 frames per second.
     bool RefreshLiveBackdrop();
     // True when the Glass Studio tuning of these panels changed since the last Render (repaint then).
     bool GlassChanged();
@@ -60,10 +58,11 @@ private:
     // Content cache (Redraw) and the last Render's placement.
     Microsoft::WRL::ComPtr<ID2D1Bitmap1> content_; bool contentGpu_ = false; UINT contentW_ = 0, contentH_ = 0;
     RECT lastScreen_{}; HWND lastInsert_ = nullptr; D2D1_RECT_F lastPlate_{}; float lastRadius_ = 0; bool rendered_ = false;
-    // Desktop duplication of the output under the panel (duplication.h).
-    DesktopDuplication dup_; ULONGLONG gdiAt_ = 0;
-    bool StartDuplication(const RECT& around);
-    bool PollDuplication(const RECT& area, UINT timeoutMs);  // true: a frame touching `area` arrived
+    dock::WgcBackdropSource liveCapture_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> liveTexture_;
+    ULONGLONG gdiAt_ = 0, healthAt_ = 0;
+    bool PollLiveCapture(bool& changed);
+    bool CaptureExcludedScreen(const RECT& screen, std::vector<std::uint32_t>& pixels);
     // Background blur halo (menu bar popups' look), a second, click-through window below the panel.
     static constexpr float kHaloReach = 28.f, kHaloFeather = 34.f;
     std::unique_ptr<GlassWindow> haloWin_; bool halo_ = false; float haloSpread_ = 0; GlassWindow* deviceSource_ = nullptr;

@@ -39,6 +39,15 @@ int wmain(int argc, wchar_t** argv) {
       Network b=a; b.profile=L"second"; b.signal=70; Network c=a; c.signal=80; c.connected=true;
       Network d=a; d.adapter.Data1=2; std::vector<Network> list; MergeNetwork(list,a);MergeNetwork(list,b);MergeNetwork(list,c);MergeNetwork(list,d);
       CHECK(list.size()==3 && list[0].profile==L"first" && list[0].signal==80 && list[0].connected && list[1].profile==L"second" && list[2].adapter.Data1==2); }
+    // Bluetooth device kinds: Class of Device first (major 5 peripheral: keyboard 0x40, pointing 0x80, gamepad 0x08;
+    // major 4 audio: headphones 0x18, loudspeaker 0x14), then the name.
+    CHECK(BtKindOf(0x0540, L"Wave Keys") == BtKind::Keyboard);
+    CHECK(BtKindOf(0x0580, L"M720 Triathlon") == BtKind::Mouse);
+    CHECK(BtKindOf(0x0580, L"David's Magic Trackpad") == BtKind::Trackpad);
+    CHECK(BtKindOf(0x0508, L"Wireless Controller") == BtKind::Gamepad);
+    CHECK(BtKindOf(0x0418, L"Buds") == BtKind::Headphones && BtKindOf(0x0414, L"ULT FIELD 1") == BtKind::Speaker);
+    CHECK(BtKindOf(0, L"JBuds Ergo Mouse") == BtKind::Mouse && BtKindOf(0, L"AULA-F75 5.0 KB") == BtKind::Keyboard);
+    CHECK(BtKindOf(0, L"SMK-37 Pro_BLE") == BtKind::Other && BtKindOf(0, L"PlayStation® 5 Pro") == BtKind::Gamepad);
     if (g_fail) return 1;
     // Helper modes for verify_control_center.ps1: --read prints volume/mute; --set-volume N / --set-mute 0|1 / --set-brightness N write them.
     if (argc >= 2 && std::wstring(argv[1]) == L"--read") {

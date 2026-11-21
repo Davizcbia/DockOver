@@ -246,4 +246,26 @@ inline double Rubberband(double overshoot, double dimension, double constant = 0
     return overshoot < 0.0 ? -r : r;
 }
 
+// ---------------------------------------------------------------------------------------------
+// DockOver motion tokens (1.0). Every popup, menu, panel and control uses these instead of its own numbers, so the
+// whole app moves alike. Apple-style: critically damped (no bounce) for things that appear, disappear or follow the
+// pointer; a small bounce only where macOS / iOS show one (switch knobs, banners, rows settling). Closing is faster
+// than opening. Durations are the spring's perceptual duration (SwiftUI Spring(duration:bounce:)).
+namespace tokens {
+inline const SpringSpec PopoverOpen  = SpringSpec::FromDuration(0.24, 0.0);   // Control Center, Wi-Fi, sound, stacks
+inline const SpringSpec PopoverClose = SpringSpec::FromDuration(0.18, 0.0);
+inline const SpringSpec MenuOpen     = SpringSpec::FromDuration(0.20, 0.0);   // context menus, status menus
+inline const SpringSpec MenuClose    = SpringSpec::FromDuration(0.14, 0.0);
+inline const SpringSpec PanelOpen    = SpringSpec::FromDuration(0.34, 0.06);  // Notification Center sliding in
+inline const SpringSpec PanelClose   = SpringSpec::FromDuration(0.24, 0.0);
+inline const SpringSpec BannerIn     = SpringSpec::FromDuration(0.44, 0.14);  // notification banner from the edge
+inline const SpringSpec BannerOut    = SpringSpec::FromDuration(0.30, 0.0);
+inline const SpringSpec Press        = SpringSpec::FromDuration(0.18, 0.0);   // pressed state of buttons, sliders
+inline const SpringSpec Toggle       = SpringSpec::FromDuration(0.38, 0.24);  // switch knob
+inline const SpringSpec Tint         = SpringSpec::FromDuration(0.26, 0.0);   // colour changes
+inline const SpringSpec Scroll       = SpringSpec::FromDuration(0.26, 0.0);   // programmatic scrolling
+inline const SpringSpec Reflow       = SpringSpec::FromDuration(0.32, 0.10);  // rows moving to new places
+inline const SpringSpec Appear       = SpringSpec::FromDuration(0.30, 0.0);   // new rows fading in
+}  // namespace tokens
+
 }  // namespace docky::motion

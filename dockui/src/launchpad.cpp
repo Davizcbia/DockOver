@@ -34,6 +34,7 @@
 #include "launchpad_density.h"
 #include "desktop_settings.h"
 #include "log.h"
+#include "motion.h"
 #include "material.h"
 #include "shell_items.h"
 #include "custom_icons.h"
@@ -43,11 +44,13 @@ using Microsoft::WRL::ComPtr;
 namespace dock::launchpad {
 namespace {
 
+std::wstring visualSnapshotPath;
 constexpr UINT kMsgClose = WM_APP + 90;
 constexpr UINT kMsgIcons = WM_APP + 91;
 constexpr UINT kMsgApps = WM_APP + 92;
 constexpr UINT kMsgOpenApp = WM_APP + 93;     // lParam: new std::string (app id), deleted by the handler
 constexpr UINT kMsgMenuClosed = WM_APP + 94;  // the Dock's app menu closed
+constexpr UINT kMsgRenameFolder = WM_APP + 95;
 constexpr UINT_PTR kDensityTimer = 42;
 constexpr wchar_t kClass[] = L"LiquidLaunchpad";
 
@@ -220,6 +223,10 @@ public:
         if (dropped) DLOG(L"launchpad: custom icon changed, %zu cached icon(s) dropped", dropped);
     }
 
+    std::wstring Label(const std::wstring& target){
+        std::lock_guard<std::mutex> lock(m_);
+        return iconStore_.Label(ApplicationItemId(target,L""));
+    }
     void SetNotify(HWND h) { notify_.store(h); iconPosted_.store(false); }
     void IconsConsumed() { iconPosted_.store(false); }
 
@@ -268,7 +275,8 @@ private:
 
     void Worker() {
         const HRESULT co = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        // Background mode: low CPU, I/O and memory priority, so loading hundreds of icons never competes with the UI.
+        if (!SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN)) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
         for (;;) {
             std::pair<std::string, std::wstring> job;
             {
@@ -381,7 +389,7 @@ private:
     void DrawGrid(float alpha);
     void DrawIcon(const Item& it, D2D1_RECT_F r, float opacity, bool highlight);
     void DrawAppIcon(const std::string& appId, D2D1_RECT_F r, float opacity);
-    void DrawLabel(const std::string& key, const std::wstring& text, D2D1_RECT_F icon, float opacity);
+    void DrawLabel(const std::string& key, const std::wstring& text, D2D1_RECT_F icon, float opacity, bool inFolder=false);
     bool DrawGlass(D2D1_RECT_F r, float radius, float appear, float dim = 1.0f);
     void DrawFolderContents(float alpha);
     D2D1_RECT_F SlotRect(int slot) const;              // virtual coordinates (page 0 origin)
@@ -408,7 +416,7 @@ private:
 
     HWND dock_ = nullptr;
     std::wstring layoutPath_, settingsPath_;
-    bool maskIcons_ = false, hideLabels_ = false;
+    bool maskIcons_ = false, hideLabels_ = false, visualSaved_=false;
     bool showWindows_ = false;  // Settings > Launchpad > Show windows behind Launchpad (off: wallpaper only, live)  // Settings > Dock > macOS icon mask: the same rounded-square tiles as the Dock (reference look)
     liquid::settings::Revision settingsRevision_;
     DensityConfig density_;
@@ -486,12 +494,16 @@ private:
     std::unordered_map<std::string, D2D1_POINT_2F> pos_;  // eased virtual positions
 
     // Geometry
-    float icon_ = 96, cellW_ = 180, cellH_ = 180, gridLeft_ = 0, gridTop_ = 0, labelH_ = 18;
+    float icon_ = 96, cellW_ = 180, cellH_ = 180, gridLeft_ = 0, gridTop_ = 0, labelH_ = 36;
 
     // State
     float openT_ = 0, openTarget_ = 1;
     bool closing_ = false, reducedMotion_ = false;
     float page_ = 0;
+    // Springs (motion.h tokens): open/close, page snapping (takes the swipe's release velocity) and the folder.
+    docky::motion::Spring openSpring_, pageSpring_, folderSpring_;
+    float swipeVelocity_ = 0, swipeLastPage_ = 0;
+    bool swipeWas_ = false;
     int pageTarget_ = 0, pageCount_ = 1;
     std::wstring query_;
     int folder_ = -1;          // layout index of the open (or closing) folder
@@ -540,6 +552,7 @@ HWND WallpaperWindow() {
 }
 
 bool Launchpad::CaptureDesktop() {
+    if(!visualSnapshotPath.empty()){snapshot_.assign(static_cast<size_t>(pxW_)*pxH_,0xFF202127u);return false;}
     // Snapshot of the monitor before Launchpad appears. GDI capture honours WDA_EXCLUDEFROMCAPTURE,
     // so the Dock and Menu Bar are not part of it; the image is blurred once and stays static while
     // Launchpad is open (as on macOS).
@@ -643,6 +656,8 @@ HRESULT Launchpad::InitGraphics() {
         f->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
+    labelFmt_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+    labelFmt_->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,18.f,14.f);
     searchFmt_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     searchFmt_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
     infoFmt_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
@@ -701,6 +716,7 @@ HRESULT Launchpad::BuildBackground() {
 }
 
 void Launchpad::StartLiveBackground() {
+    if(!visualSnapshotPath.empty())return;
     live_.SetDevice(d3d_.Get());
     live_.SetExcludedWindow(hwnd);  // Launchpad itself is never in the image; capture messages come here
     HWND source = showWindows_ ? nullptr : WallpaperWindow();
@@ -752,18 +768,10 @@ bool Launchpad::RebuildLiveBackground() {
 }
 
 void Launchpad::ComputeGeometry() {
-    gridTop_ = H_ * 0.13f; labelH_ = 18.0f;
-    if(density_.preset==DensityPreset::Default){
-        // macOS 27 Launchpad reference (2026-11-10): icons 4.0% of the width, columns 9.83% of the width apart, rows 17.6%
-        // of the height apart, first row's icon centre at 16.1% of the height; 7 x 5.
-        cols_=7;rows_=5;icon_=std::clamp(std::min(W_*.040f,H_*.071f),56.f,120.f);
-        cellW_=std::max(icon_*1.3f,W_*.0983f);cellH_=std::max(icon_+labelH_+16.f,H_*.176f);gridLeft_=(W_-cellW_*cols_)*.5f;
-        gridTop_=H_*.161f-icon_*.5f-(cellH_-icon_-labelH_-8.0f)*.5f;
-    }else{
-        const auto grid=PlanDensity(W_,H_,density_);cols_=grid.columns;rows_=grid.rows;
-        icon_=grid.icon;cellW_=grid.pitchX;cellH_=grid.pitchY;gridLeft_=(W_-grid.width)*.5f;
-        gridTop_=H_*.513f-grid.height*.5f;  // same vertical centre as the default layout (search pill above, dots below)
-    }
+    labelH_=36.f;
+    const auto grid=PlanDensity(W_,H_,density_);cols_=grid.columns;rows_=grid.rows;
+    icon_=grid.icon;cellW_=grid.pitchX;cellH_=grid.pitchY;gridLeft_=(W_-grid.width)*.5f;
+    gridTop_=H_*.513f-grid.height*.5f+(labelH_+8.f)*.5f;
     perPage_=cols_*rows_;
     // Diagnostic geometry (DIP, window-relative) so tests can target real cells without guessing.
     DLOG(L"launchpad: grid %dx%d cell %.1fx%.1f origin %.1f,%.1f icon %.1f label %.1f", cols_, rows_, cellW_, cellH_, gridLeft_, gridTop_, icon_, labelH_);
@@ -862,7 +870,13 @@ std::wstring Launchpad::FolderName(int node) const {
 void Launchpad::ApplyApps() {
     bool known = false;
     apps_ = Shared::Get().Apps(&known);
+    if(!visualSnapshotPath.empty()){
+        known=true;apps_.clear();wchar_t system[MAX_PATH]{};GetSystemDirectoryW(system,MAX_PATH);
+        const wchar_t* names[]={L"Calendar",L"A long application name that needs two lines",L"Professional engineering design workspace",L"ExtraordinarilyLongUnbrokenApplicationNameForClipping",L"Music",L"Development Tools and Utilities",L"A second long title beside another application"};
+        for(int i=0;i<60;++i){apps::AppEntry app;app.id="app:visual:"+std::to_string(i);app.name=names[i%7];app.extraFile=true;app.parsingName=std::wstring(system)+L"\\notepad.exe";apps_.push_back(std::move(app));}
+    }
     appsKnown_ = known;
+    for(auto& app:apps_){const auto alias=Shared::Get().Label(app.Target());if(!alias.empty())app.name=alias;}
     appIndex_.clear();
     std::vector<std::string> ids;
     for (size_t i = 0; i < apps_.size(); ++i) {
@@ -1014,6 +1028,7 @@ void Launchpad::SetPage(int page) {
 void Launchpad::UpdateSearch() {
     pageTarget_ = 0;
     page_ = 0;
+    pageSpring_.SnapTo(0);
     RebuildItems();
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
         const D2D1_RECT_F r = SlotRect(i);
@@ -1040,6 +1055,7 @@ void Launchpad::Launch(const std::string& appId) {
 void Launchpad::ShowAppMenu(float x, float y) {
     if (closing_ || !dock_) return;
     std::string appId;
+    int renameFolder=-1;
     if (folderOpen_) {
         const int slot = FolderSlotAt(x, y);
         if (folder_ >= 0 && folder_ < static_cast<int>(layout_.nodes.size()) && slot >= 0 &&
@@ -1047,19 +1063,24 @@ void Launchpad::ShowAppMenu(float x, float y) {
             appId = layout_.nodes[folder_].apps[slot];
     } else {
         const int index = ItemAt(x, y);
-        if (index >= 0 && index < static_cast<int>(items_.size()) && !items_[index].folder) appId = items_[index].appId;
+        if (index >= 0 && index < static_cast<int>(items_.size())){
+            if(items_[index].folder)renameFolder=items_[index].node;
+            else appId=items_[index].appId;
+        }
     }
     const auto it = appIndex_.find(appId);
-    if (appId.empty() || it == appIndex_.end()) return;
+    if (renameFolder<0 && (appId.empty() || it == appIndex_.end())) return;
     auto request = std::make_unique<AppMenuRequest>();
     request->appId = appId;
-    request->target = apps_[it->second].Target();
-    request->name = apps_[it->second].name;
+    request->owner = hwnd;
+    request->folder=renameFolder;
+    if(renameFolder>=0)request->name=FolderName(renameFolder);
+    else{request->target=apps_[it->second].Target();request->name=NameOf(appId);}
     GetCursorPos(&request->screen);
     if (PostMessageW(dock_, kMsgLaunchpadAppMenu, 0, reinterpret_cast<LPARAM>(request.get()))) {
         request.release();
         menuOpen_ = true;
-        DLOG(L"launchpad: app menu for '%ls'", apps_[it->second].name.c_str());
+        DLOG(L"launchpad: icon context menu");
     }
 }
 
@@ -1073,7 +1094,6 @@ void Launchpad::Activate(int itemIndex) {
 void Launchpad::Close(const wchar_t* reason) {
     if (closing_) return;
     if (renaming_) CommitRename();
-    if (!closing_) PostMessageW(dock_, kMsgLaunchpadCovers, 0, 0);  // the Dock resumes its capture during the fade-out
     closing_ = true;
     openTarget_ = 0;
     animating_ = true;
@@ -1148,6 +1168,7 @@ void Launchpad::UpdateDrag() {
         MoveOutOfFolder(layout_, folder_, dragFolderSlot_, insertAt);
         folderOpen_ = false;
         folderT_ = 0;
+        folderSpring_.SnapTo(0);
         folder_ = -1;
         dragFromFolder_ = false;
         RebuildItems();
@@ -1239,17 +1260,39 @@ void Launchpad::EndDrag() {
 // ---------------------------------------------------------------------------------------------
 bool Launchpad::Tick(double dt) {
     bool moving = false;
-    openT_ = reducedMotion_ ? openTarget_ : Ease(openT_, openTarget_, dt, closing_ ? 0.055 : 0.075);
+    // Apple-style springs instead of exponential easing: critically damped open/close, a page that settles with the
+    // swipe's own velocity, and a folder that opens with a slight bounce (iOS / macOS Launchpad).
+    openSpring_.SetSpec(closing_ ? docky::motion::tokens::PopoverClose : docky::motion::SpringSpec::FromDuration(0.30, 0.0));
+    openSpring_.SetRest(0.002, 0.02);
+    openSpring_.SetTarget(openTarget_);
+    if (reducedMotion_) openSpring_.SnapTo(openTarget_); else openSpring_.Step(dt);
+    openT_ = openSpring_.AtRest() ? openTarget_ : openSpring_.F();
     moving |= openT_ != openTarget_;
     if (closing_ && openT_ <= 0.02f) {
         DestroyWindow(hwnd);
         return false;
     }
-    if (!swipe_) {
-        page_ = reducedMotion_ ? static_cast<float>(pageTarget_) : Ease(page_, static_cast<float>(pageTarget_), dt, 0.085);
+    pageSpring_.SetSpec(docky::motion::SpringSpec::FromDuration(0.36, 0.0));
+    pageSpring_.SetRest(0.001, 0.01);
+    if (swipe_) {  // the finger leads; remember its speed (pages/s, smoothed) for the hand-off
+        if (dt > 0) swipeVelocity_ = 0.6f * swipeVelocity_ + 0.4f * static_cast<float>((page_ - swipeLastPage_) / dt);
+        swipeLastPage_ = page_;
+        pageSpring_.SnapTo(page_);
+    } else {
+        if (swipeWas_) pageSpring_.SetTarget(static_cast<float>(pageTarget_), std::clamp(swipeVelocity_, -8.f, 8.f));
+        else pageSpring_.SetTarget(static_cast<float>(pageTarget_));
+        if (reducedMotion_) pageSpring_.SnapTo(pageTarget_); else pageSpring_.Step(dt);
+        page_ = pageSpring_.AtRest() ? static_cast<float>(pageTarget_) : pageSpring_.F();
         moving |= page_ != static_cast<float>(pageTarget_);
+        swipeVelocity_ = 0;
     }
-    folderT_ = reducedMotion_ ? (folderOpen_ ? 1.0f : 0.0f) : Ease(folderT_, folderOpen_ ? 1.0f : 0.0f, dt, 0.06);
+    if (swipe_ && !swipeWas_) { swipeLastPage_ = page_; swipeVelocity_ = 0; }
+    swipeWas_ = swipe_;
+    folderSpring_.SetSpec(folderOpen_ ? docky::motion::SpringSpec::FromDuration(0.34, 0.08) : docky::motion::tokens::PopoverClose);
+    folderSpring_.SetRest(0.002, 0.02);
+    folderSpring_.SetTarget(folderOpen_ ? 1.0 : 0.0);
+    if (reducedMotion_) folderSpring_.SnapTo(folderOpen_ ? 1.0 : 0.0); else folderSpring_.Step(dt);
+    folderT_ = folderSpring_.AtRest() ? (folderOpen_ ? 1.0f : 0.0f) : std::clamp(folderSpring_.F(), 0.0f, 1.04f);
     moving |= folderT_ != (folderOpen_ ? 1.0f : 0.0f);
     if (!folderOpen_ && folderT_ == 0.0f && !dragFromFolder_) folder_ = -1;
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
@@ -1340,22 +1383,23 @@ void Launchpad::DrawAppIcon(const std::string& appId, D2D1_RECT_F r, float opaci
     dc_->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), brush_.Get());
 }
 
-void Launchpad::DrawLabel(const std::string& key, const std::wstring& text, D2D1_RECT_F icon, float opacity) {
+void Launchpad::DrawLabel(const std::string& key, const std::wstring& text, D2D1_RECT_F icon, float opacity, bool inFolder) {
     if (hideLabels_ || text.empty() || opacity <= 0.01f) return;  // Settings > Launchpad > Hide app names
-    const float w = cellW_ - 8.0f;
-    const std::string cacheKey = key + "|" + std::to_string(text.size()) + "|" + std::to_string(static_cast<int>(w));
+    const float w = std::max(1.f,cellW_*(inFolder?.92f:1.f) - 24.0f);
+    const std::string cacheKey = key + "|" + dock::json::ToUtf8(text) + "|" + std::to_string(static_cast<int>(w));
     auto it = labels_.find(cacheKey);
     if (it == labels_.end()) {
         ComPtr<IDWriteTextLayout> layout;
         if (FAILED(dwrite_->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), labelFmt_.Get(), w, labelH_, &layout))) return;
+        if(text.find(L' ')==std::wstring::npos)layout->SetWordWrapping(DWRITE_WORD_WRAPPING_CHARACTER);
         it = labels_.emplace(cacheKey, layout).first;
     }
     const float cx = (icon.left + icon.right) * 0.5f;
     const D2D1_POINT_2F o = D2D1::Point2F(cx - w * 0.5f, icon.bottom + 7.0f);
     brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.45f * opacity));
-    dc_->DrawTextLayout(D2D1::Point2F(o.x, o.y + 1.0f), it->second.Get(), brush_.Get());
+    dc_->DrawTextLayout(D2D1::Point2F(o.x, o.y + 1.0f), it->second.Get(), brush_.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
     brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.96f * opacity));
-    dc_->DrawTextLayout(o, it->second.Get(), brush_.Get());
+    dc_->DrawTextLayout(o, it->second.Get(), brush_.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 // The macOS app-icon outline (measured from the official macOS 27 exports, icon_mask.h), which folders share on macOS; a
@@ -1486,7 +1530,7 @@ void Launchpad::DrawFolderContents(float alpha) {
         if (dragActive_ && dragFromFolder_ && apps[i] == dragKey_) continue;
         const D2D1_RECT_F r = FolderSlotRect(i);
         DrawAppIcon(apps[i], r, alpha);
-        DrawLabel(apps[i], NameOf(apps[i]), r, alpha);
+        DrawLabel(apps[i], NameOf(apps[i]), r, alpha,true);
     }
 }
 
@@ -1561,6 +1605,17 @@ void Launchpad::Render() {
     lap(4);
     // Paced by the frame-latency waitable in the loop: Present(1) waited for a vblank as well, so every frame took two
     // (120 fps on a 240 Hz display, measured 2026-11-12).
+    if(!visualSnapshotPath.empty()&&!visualSaved_&&Now()-openedAt_>.7&&a>.98f){
+        visualSaved_=true;ComPtr<ID3D11Texture2D> source,staging;
+        if(SUCCEEDED(swap_->GetBuffer(0,IID_PPV_ARGS(&source)))){D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;desc.MiscFlags=0;
+         if(SUCCEEDED(d3d_->CreateTexture2D(&desc,nullptr,&staging))){ctx_->CopyResource(staging.Get(),source.Get());D3D11_MAPPED_SUBRESOURCE map{};
+          if(SUCCEEDED(ctx_->Map(staging.Get(),0,D3D11_MAP_READ,0,&map))){HANDLE file=CreateFileW(visualSnapshotPath.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+           if(file!=INVALID_HANDLE_VALUE){BITMAPFILEHEADER header{};BITMAPINFOHEADER info{};header.bfType=0x4D42;header.bfOffBits=sizeof(header)+sizeof(info);header.bfSize=header.bfOffBits+desc.Width*desc.Height*4;info.biSize=sizeof(info);info.biWidth=desc.Width;info.biHeight=-static_cast<LONG>(desc.Height);info.biPlanes=1;info.biBitCount=32;info.biCompression=BI_RGB;DWORD written=0;WriteFile(file,&header,sizeof(header),&written,nullptr);WriteFile(file,&info,sizeof(info),&written,nullptr);for(UINT y=0;y<desc.Height;++y)WriteFile(file,static_cast<const BYTE*>(map.pData)+y*map.RowPitch,desc.Width*4,&written,nullptr);CloseHandle(file);DLOG(L"launchpad: isolated visual snapshot saved");}
+           ctx_->Unmap(staging.Get(),0);
+          }
+         }
+        }
+    }
     swap_->Present(0, 0);
     lap(5);
 }
@@ -1847,6 +1902,13 @@ LRESULT Launchpad::Handle(UINT m, WPARAM w, LPARAM l) {
         if (id) Launch(*id);
         return 0;
     }
+    case kMsgRenameFolder:{
+        const int index=static_cast<int>(w);
+        if(!closing_&&index>=0&&index<static_cast<int>(layout_.nodes.size())&&layout_.nodes[index].folder){
+            OpenFolder(index);renaming_=true;renameText_=FolderName(index);needsFrame_=true;
+        }
+        return 0;
+    }
     case kMsgMenuClosed:
         if (menuOpen_) menuClosedAt_ = Now();
         menuOpen_ = false;
@@ -2031,7 +2093,10 @@ void OpenApp(const std::string& appId) {
     if (PostMessageW(h, kMsgOpenApp, 0, reinterpret_cast<LPARAM>(id.get()))) id.release();
 }
 void Dismiss() { if (HWND h = OwnWindow()) PostMessageW(h, kMsgClose, 0, 0); }
+void RenameFolderFromMenu(HWND owner,int folder){if(owner==OwnWindow())PostMessageW(owner,kMsgRenameFolder,folder,0);}
 void MenuClosed() { if (HWND h = OwnWindow()) PostMessageW(h, kMsgMenuClosed, 0, 0); }
+void ConfigureVisualTest(const std::wstring& snapshot){visualSnapshotPath=snapshot;}
+void RefreshApps(){Shared::Get().RefreshAppsAsync();}
 void SetCustomIconPath(const std::wstring& path) { Shared::Get().SetCustomIconPath(path); }
 void InvalidateIcon(const std::string& stableId) { Shared::Get().InvalidateIcon(stableId); }
 

@@ -14,14 +14,20 @@ float Falloff(float d) {
 }  // namespace
 
 DockModel::DockModel() {
+    edgeShift_.SetSpec(docky::motion::SpringSpec::FromResponse(0.18, 1.0));
+    edgeShift_.SetRest(0.02, 0.1);
     hover_.SetSpec(dockmotion::HoverOut);
     hover_.SetRest(0.001, 0.01);        // normalised 0..1
     cursor_.SetSpec(dockmotion::Cursor);
     cursor_.SetRest(0.05, 1.0);         // DIP, DIP/s
 }
 
-void DockModel::SetTiles(const std::vector<bool>& separators) {
+void DockModel::SetTiles(const std::vector<bool>& separators) { SetTiles(separators, std::vector<float>(separators.size(), 1.0f)); }
+
+void DockModel::SetTiles(const std::vector<bool>& separators, const std::vector<float>& widths) {
     sep_ = separators;
+    width_.assign(sep_.size(), 1.0f);
+    for (size_t i = 0; i < sep_.size() && i < widths.size(); ++i) width_[i] = std::clamp(widths[i], 0.25f, 16.0f);
     bounce_.assign(sep_.size(), docky::motion::Bounce{});
     baseCenter_.resize(sep_.size());
     float edge = m.padX;
@@ -40,10 +46,29 @@ void DockModel::SetTiles(const std::vector<bool>& separators) {
     }
 }
 
+void DockModel::SetIconSize(float size) {
+    if (size <= 0.0f || m.icon <= 0.0f) return;
+    const float ratio = size / m.icon;
+    m.SetIconSize(size);
+    for (auto& center : baseCenter_) center *= ratio;
+    maxExtra_ *= ratio;
+}
+
+void DockModel::ResetHover() {
+    hover_.SnapTo(0.0);
+    edgeShift_.SnapTo(0.0);
+}
+
 float DockModel::BaseWidth() const {
     float w = 2.0f * m.padX;
     for (int i = 0; i < Count(); ++i) w += TileBase(i);
     return Count() == 0 ? w + m.pitch : w;
+}
+
+int DockModel::MaxIconSizeForWidth(float width) const {
+    const float unitWidth = BaseWidth() / m.icon;
+    if (unitWidth <= 0.0f || width <= 0.0f) return 1;
+    return std::clamp(static_cast<int>(std::floor(width / unitWidth)), 1, 65535);
 }
 
 float DockModel::DesiredWindowWidth() const { return BaseWidth() + 2.0f * maxExtra_ + 2.0f * m.sideMargin; }
@@ -150,15 +175,23 @@ bool DockModel::Update(double dt, double now) {
     if (reducedMotion_) {
         hover_.SnapTo(hover_.Target());
         cursor_.SnapTo(cursor_.Target());
+        DockFrame target; float correction = 0;
+        ComputeLayout(target, now, &correction);
+        edgeShift_.SnapTo(correction);
         return false;
     }
     hover_.Step(dt);
     cursor_.Step(dt);
+    DockFrame target; float correction = 0;
+    ComputeLayout(target, now, &correction);
+    edgeShift_.SetTarget(correction);
+    edgeShift_.Step(dt);
     for (auto& b : bounce_) b.Step(dt);
     return IsAnimating(now);
 }
 
 bool DockModel::IsAnimating(double /*now*/) const {
+    if (edgeShift_.Animating()) return true;
     if (hover_.Animating()) return true;
     if (hover_.Value() > 0.0 && cursor_.Animating()) return true;
     for (const auto& b : bounce_) if (b.Active()) return true;
@@ -170,10 +203,16 @@ float DockModel::BounceLift(int i, double /*now*/) const {
 }
 
 void DockModel::Compute(DockFrame& out, double now) const {
+    ComputeLayout(out, now, nullptr);
+}
+
+void DockModel::ComputeLayout(DockFrame& out, double now, float* targetCorrection) const {
     const int n = Count();
     std::vector<float> s;
     const float cursor = cursor_.F(), hover = hover_.F();
     Scales(cursor, hover, s);
+    const float base = BaseWidth();
+    const float minLeft = std::min(m.sideMargin * 0.25f, std::max(0.0f, (winW_ - base) * 0.5f));
     std::vector<float> magCenter(static_cast<size_t>(n)), magLeft(static_cast<size_t>(n));
     float edge = m.padX;
     for (int i = 0; i < n; ++i) {
@@ -182,7 +221,6 @@ void DockModel::Compute(DockFrame& out, double now) const {
         magCenter[i] = edge + w * 0.5f;
         edge += w;
     }
-    const float base = BaseWidth();
     const float width = MagWidth(s);
 
     // Map the pointer's resting position into the magnified layout (piecewise linear between tile
@@ -228,8 +266,31 @@ void DockModel::Compute(DockFrame& out, double now) const {
         }
     }
     float left = BaseLeft() + (cursor - mapped);
-    const float minLeft = m.sideMargin * 0.25f;
-    left = std::clamp(left, minLeft, std::max(minLeft, winW_ - minLeft - width));
+    if (width <= winW_ - 2.0f * minLeft) {
+        left = std::clamp(left, minLeft, winW_ - minLeft - width);
+    } else {
+        // The enlarged strip can be wider than the screen. Keep it under the pointer,
+        // then shift the entire strip to keep the focused icon inside the screen.
+        left = std::clamp(left, winW_ - width, 0.0f);
+        int first = -1, last = -1;
+        for (int i = 0; i < n; ++i) if (!sep_[i]) {
+            if (first < 0) first = i;
+            last = i;
+        }
+        if (first >= 0 && last > first) {
+            // Introduce edge alignment over the entire half of the Dock, rather than
+            // switching it on in the end tile. Smoothstep has zero slope at centre and end.
+            const float centre = (baseCenter_[first] + baseCenter_[last]) * 0.5f;
+            const float halfSpan = (baseCenter_[last] - baseCenter_[first]) * 0.5f;
+            const float progress = std::clamp(std::fabs(cursor - centre) / halfSpan, 0.0f, 1.0f);
+            const float weight = progress * progress * (3.0f - 2.0f * progress);
+            const float edgeLeft = cursor < centre ? 0.0f : winW_ - width;
+            left += (edgeLeft - left) * weight;
+        }
+    }
+
+    if (targetCorrection) *targetCorrection = left - BaseLeft();
+    else if (!reducedMotion_) left = BaseLeft() + edgeShift_.F();
 
     out.dockLeft = left;
     out.dockRight = left + width;
@@ -254,7 +315,8 @@ void DockModel::Compute(DockFrame& out, double now) const {
             continue;
         }
         g.size = m.icon * s[i];
-        g.left = g.cx - g.size * 0.5f;
+        g.width = g.size * Factor(i);
+        g.left = g.cx - g.width * 0.5f;
         // macOS icon canvases carry ~10% bottom margin that scales with magnification; Windows icons
         // are trimmed to their body, so the equivalent rise is applied explicitly.
         const float lift = (s[i] - 1.0f) * m.liftFactor * m.icon;

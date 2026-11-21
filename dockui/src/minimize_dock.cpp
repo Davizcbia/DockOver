@@ -7,6 +7,7 @@
 #include <map>
 #include <vector>
 
+#include "capture_visible.h"
 #include "genie_gpu.h"
 #include "log.h"
 
@@ -21,6 +22,7 @@ constexpr wchar_t kClass[] = L"DockyMinimizeOverlay";
 
 struct Entry {
     HWND window = nullptr;
+    bool thumbnailVisible = false;
     HTHUMBNAIL tile = nullptr;             // live thumbnail shown in the Dock tile
     std::vector<HTHUMBNAIL> bands;         // Genie bands while animating
     SIZE source{};                         // thumbnail source size
@@ -30,6 +32,7 @@ struct Entry {
     bool pendingGenie = false;             // minimize Genie waits for the first tile rectangle
     bool gpu = false;                      // animating on the GPU (genie_gpu); otherwise thumbnail bands
     LARGE_INTEGER start{};
+    ULONGLONG addedAt=0;
 };
 
 HWND g_dock = nullptr, g_overlay = nullptr;
@@ -71,13 +74,27 @@ bool Eligible(HWND w) {
     return GetWindowTextLengthW(w) > 0;
 }
 
-void Show(HTHUMBNAIL t, const RECT& dest, const RECT* source, BYTE opacity, bool visible) {
-    if (!t) return;
+bool Cloaked(HWND w) { DWORD c = 0; return SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &c, sizeof(c))) && c != 0; }
+// Windows that get a Dock tile when minimized: the taskbar's rule (top-level, visible, not a tool window, unowned unless
+// WS_EX_APPWINDOW). Eligible (caption with a minimize button) only decides about Genie snapshots: requiring it here left
+// windows without a standard caption (frameless apps minimized with Win+Down) with no tile, and with the taskbar hidden
+// they could not be found again.
+bool Dockable(HWND w) {
+    if (!w || GetAncestor(w, GA_ROOT) != w || !IsWindow(w) || !IsWindowVisible(w)) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId()) return false;
+    const LONG ex = GetWindowLongW(w, GWL_EXSTYLE);
+    if (ex & WS_EX_APPWINDOW) return true;
+    return !(ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) && !GetWindow(w, GW_OWNER);
+}
+
+bool Show(HTHUMBNAIL t, const RECT& dest, const RECT* source, BYTE opacity, bool visible) {
+    if (!t) return false;
     DWM_THUMBNAIL_PROPERTIES p{};
     p.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY | (source ? DWM_TNP_RECTSOURCE : 0);
     p.rcDestination = ToOverlay(dest); if (source) p.rcSource = *source;
     p.fVisible = visible && !Empty(dest); p.opacity = opacity;
-    DwmUpdateThumbnailProperties(t, &p);
+    return SUCCEEDED(DwmUpdateThumbnailProperties(t, &p));
 }
 
 RECT FitTile(const Entry& e) { return gpu::FitTile(e.tileRect, e.source); }
@@ -117,7 +134,7 @@ void Finish(HWND w) {
     auto it = g_entries.find(w); if (it == g_entries.end()) return;
     Entry& e = it->second; DropBands(e);
     const int direction = e.direction; e.direction = 0; e.gpu = false;
-    if (direction > 0) { Show(e.tile, FitTile(e), nullptr, 255, true); Raise(); return; }
+    if (direction > 0) { e.thumbnailVisible=Show(e.tile, FitTile(e), nullptr, 255, true); Raise(); return; }
     ShowWindow(w, SW_RESTORE); SetForegroundWindow(w);
     DLOG(L"minimize: restored from the Dock");
     Remove(w, true);
@@ -205,24 +222,29 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// A minimized window gets its Dock tile (`animate`: play the Genie once the tile has a place).
+void Add(HWND w, bool animate) {
+    if (g_entries.count(w) || !Dockable(w)) return;
+    if (!g_covered&&!g_gameMode&&!IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);  // hidden in game mode
+    Entry e; e.window = w; e.normal = NormalRect(w);e.addedAt=GetTickCount64();
+    if(SUCCEEDED(DwmRegisterThumbnail(g_overlay,w,&e.tile)))DwmQueryThumbnailSourceSize(e.tile,&e.source);
+    else DLOG(L"minimize: thumbnail unavailable, retaining Dock tile");
+    BOOL animations = FALSE; ANIMATIONINFO ai{sizeof(ai)};
+    if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0)) animations = ai.iMinAnimate != 0;
+    e.pendingGenie = animate && e.tile && !g_covered && !g_gameMode && g_genie && !animations;
+    g_entries[w] = e;
+    wchar_t cls[64]{}; GetClassNameW(w, cls, 64);
+    DLOG(L"minimize: window to the Dock class=%ls genie=%d%ls", cls, e.pendingGenie ? 1 : 0, animate ? L"" : L" (already minimized at start)");
+    if (g_changed) g_changed(w, true);
+}
+
 void CALLBACK OnEvent(HWINEVENTHOOK, DWORD event, HWND w, LONG object, LONG child, DWORD, DWORD) {
     if (object != OBJID_WINDOW || child != CHILDID_SELF || !g_overlay) return;
     if (event == EVENT_SYSTEM_MINIMIZESTART) {
-        if (g_entries.count(w) || !Eligible(w)) return;
-        if (!IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);  // hidden in game mode
-        Entry e; e.window = w; e.normal = NormalRect(w);
-        if (FAILED(DwmRegisterThumbnail(g_overlay, w, &e.tile))) { DLOG(L"minimize: thumbnail unavailable"); return; }
-        DwmQueryThumbnailSourceSize(e.tile, &e.source);
-        BOOL animations = FALSE; ANIMATIONINFO ai{sizeof(ai)};
-        if (SystemParametersInfoW(SPI_GETANIMATION, sizeof(ai), &ai, 0)) animations = ai.iMinAnimate != 0;
-        e.pendingGenie = g_genie && !animations;
-        g_entries[w] = e;
-        wchar_t cls[64]{}; GetClassNameW(w, cls, 64);
-        DLOG(L"minimize: window to the Dock class=%ls genie=%d", cls, e.pendingGenie ? 1 : 0);
-        if (g_changed) g_changed(w, true);
+        Add(w, true);
     } else if (event == EVENT_SYSTEM_MINIMIZEEND) {
         auto it = g_entries.find(w);
-        if (it != g_entries.end() && it->second.direction >= 0) Remove(w, true);  // restored elsewhere (taskbar, Alt+Tab)
+        if (it != g_entries.end() && it->second.direction >= 0) { DLOG(L"minimize: restored elsewhere"); Remove(w, true); }  // taskbar, Alt+Tab
     }
 }
 
@@ -246,6 +268,9 @@ bool Init(HWND dock, std::function<void(HWND, bool)> changed) {
     g_hook = SetWinEventHook(EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND, nullptr, OnEvent, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnForeground, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
+    docky::capture_visible::Watch(); docky::capture_visible::Trigger::Install();
+    // Windows minimized before the Dock started (a Dock restart lost their tiles; with the taskbar hidden they were gone).
+    EnumWindows([](HWND w, LPARAM) -> BOOL { if (IsIconic(w) && !Cloaked(w)) Add(w, false); return TRUE; }, 0);
     return g_hook != nullptr;
 }
 
@@ -253,6 +278,7 @@ void Shutdown() {
     if (g_hook) { UnhookWinEvent(g_hook); g_hook = nullptr; }
     if (g_foregroundHook) { UnhookWinEvent(g_foregroundHook); g_foregroundHook = nullptr; }
     if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+    docky::capture_visible::Trigger::Remove();
     gpu::Stop();
     std::vector<HWND> all; for (auto& [w, e] : g_entries) all.push_back(w);
     for (HWND w : all) Remove(w, false);
@@ -269,7 +295,17 @@ void SetTileRect(HWND window, const RECT& screen) {
         e.pendingGenie = false;
         if (Begin(e, 1)) return;
     }
-    if (!e.direction && changed) { Show(e.tile, FitTile(e), nullptr, 255, true); Raise(); }
+    if (!e.direction && (changed || !e.thumbnailVisible)) {
+        e.thumbnailVisible=e.source.cx>0&&e.source.cy>0&&!Empty(screen)&&Show(e.tile,FitTile(e),nullptr,255,true);
+        if(e.thumbnailVisible)Raise();
+    }
+}
+
+bool SuppressFallbackTile(HWND window){
+    const auto it=g_entries.find(window);
+    // The overlay draws the tile only while it is shown (hidden in game mode and under Launchpad): otherwise the Dock
+    // draws its own plate, so the tile never turns into an empty gap.
+    return it!=g_entries.end()&&g_overlay&&IsWindowVisible(g_overlay)&&(it->second.thumbnailVisible||it->second.direction!=0);
 }
 
 void Restore(HWND window) {
@@ -285,15 +321,40 @@ void Restore(HWND window) {
 
 void Prune() {
     std::vector<HWND> gone;
-    for (auto& [w, e] : g_entries) if (!e.direction && (!IsWindow(w) || !IsIconic(w))) gone.push_back(w);
+    for (auto& [w, e] : g_entries) {
+        if (e.direction) continue;
+        const wchar_t* why = !IsWindow(w) ? L"closed" : (!IsIconic(w) && GetTickCount64() - e.addedAt > 1200) ? L"no longer minimized"
+                           : !IsWindowVisible(w) ? L"hidden by its app (tray)" : nullptr;
+        if (why) { DLOG(L"minimize: tile removed, window %ls", why); gone.push_back(w); }
+    }
     for (HWND w : gone) Remove(w, true);
+    KeepAbove();
+}
+
+// The overlay must stay right above the Dock. Activating the Dock (a click) or laying it out again (SetWindowPos
+// HWND_TOPMOST) puts the Dock on top of every always-on-top window, over the overlay: the minimized windows' tiles then
+// vanished behind the Dock until something moved them. Placed directly above the Dock, not on top of everything, so
+// menus and popups opened from the Dock stay above the tiles.
+void KeepAbove() {
+    if (!g_overlay || !g_dock || !IsWindowVisible(g_overlay)) return;
+    bool any = false;
+    for (auto& [w, e] : g_entries) if (e.thumbnailVisible || e.direction) { any = true; break; }
+    if (!any) return;
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 100) return;
+    last = now;
+    for (HWND h = GetWindow(g_dock, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) if (h == g_overlay) return;
+    const HWND above = GetWindow(g_dock, GW_HWNDPREV);
+    SetWindowPos(g_overlay, above ? above : HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    DLOG(L"minimize: tiles were under the Dock; overlay placed above it again");
 }
 
 void SetGenie(bool enabled) { g_genie = enabled; }
 void SetCovered(bool covered) {
     if (covered == g_covered || !g_overlay) return;
     g_covered = covered;
-    if (covered) { if (!Animating()) ShowWindow(g_overlay, SW_HIDE); }
+    if (covered) ShowWindow(g_overlay, SW_HIDE);
     else if (!g_gameMode) { ShowWindow(g_overlay, SW_SHOWNOACTIVATE); Raise(); }
     DLOG(L"minimize: previews %ls", covered ? L"hidden under Launchpad" : L"shown");
 }
@@ -302,10 +363,12 @@ void SetGameMode(bool on) {
     g_gameMode = on;
     if (on) {
         if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
+        docky::capture_visible::Trigger::Remove();  // no keyboard hook while a game runs
         g_active = nullptr; KillTimer(g_overlay, kSnapshotTimer);
         if (!Animating()) ShowWindow(g_overlay, SW_HIDE);
     } else {
         if (!g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, GetModuleHandleW(nullptr), 0);
+        docky::capture_visible::Trigger::Install();
         if (!g_covered) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
     }
     DLOG(L"minimize: game mode %ls", on ? L"on (mouse hook, snapshots and overlay off)" : L"off");

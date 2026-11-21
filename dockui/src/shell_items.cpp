@@ -350,12 +350,12 @@ bool LoadPinnedConfig(const std::wstring& path, std::vector<PinnedItem>& out) {
 
 bool SavePinnedConfig(const std::wstring& path, const std::vector<PinnedItem>& items) {
     std::wstring text =
-        L"# Liquid Dock pinned items. One per line: target | arguments | label (arguments and label optional).\r\n"
+        L"# DockOver pinned items. One per line: target | arguments | label (arguments and label optional).\r\n"
         L"# target may be an .exe, a .lnk shortcut, or a shell parsing name such as shell:AppsFolder\\<AppUserModelID>.\r\n"
         L"# A line containing only --- inserts a separator.\r\n"
         L"# Drag files onto the Dock to pin them; right-click an icon to unpin. Press F3 in the Dock to reload.\r\n";
     for (const PinnedItem& item : items) {
-        if (item.isDownloads || item.isRecycleBin || item.isTransient || item.isMinimized) continue; // running-only/system Downloads are never saved
+        if (item.isDownloads || item.isRecycleBin || item.isTransient || item.isMinimized || item.isStatusGroup) continue; // running-only/system Downloads are never saved
         if (item.isLaunchpad) { text += L"# liquid-desktop:launchpad:v1\r\n"; continue; }
         if (item.isSeparator) {
             if (item.isSystemSeparator) continue;  // section boundaries are rebuilt on load
@@ -628,7 +628,7 @@ bool RefreshRunningState(std::vector<PinnedItem>& items, HWND self, bool* scanSu
     bool changed = false;
     for (PinnedItem& item : items) {
         HWND window = nullptr;
-        if (item.isSeparator || item.isDownloads || item.isRecycleBin || item.isLaunchpad || item.isMinimized) continue;
+        if (item.isSeparator || item.isDownloads || item.isRecycleBin || item.isLaunchpad || item.isMinimized || item.isStatusGroup) continue;
         if (item.isExplorer) {
             window = scan.explorerWindow;
         } else if (!item.aumid.empty()) {

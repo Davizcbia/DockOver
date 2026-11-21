@@ -15,16 +15,17 @@ namespace docky::desk { class SharedDesktop; }
 
 namespace dock {
 constexpr UINT kMsgCaptureAvailable = WM_APP + 71;
-// Live glass backdrops (2026-11-13): a whole monitor is read with DXGI desktop duplication (desktop/duplication.h, one
-// per monitor and process, shared by every backdrop), which never shows Windows' yellow capture frame and needs no
-// package identity. Windows Graphics Capture remains for a single window (Launchpad's wallpaper layer) and as the
-// fallback when duplication is unavailable, and it starts only when borderless capture is granted: without the grant
-// there is no live capture (the caller keeps its static picture or tinted material) rather than a yellow frame.
-// DOCKY_CAPTURE=wgc in the environment turns duplication off (comparison, diagnosis).
+// Live monitor backdrops prefer DXGI desktop duplication. Window capture and monitor fallback use
+// cursor-disabled borderless WGC.
+// WGC sessions start only after permission and border/cursor properties have been checked; otherwise
+// the requesting surface retains its static/tinted fallback rather than starting a bordered capture.
+// DOCKY_CAPTURE=wgc forces WGC and never falls back to duplication.
 // Borderless capture consent (package identity). Ask early (process start, on the UI thread) so the first capture never
 // starts with the yellow border while the asynchronous answer is pending. Granted: Windows allows IsBorderRequired(false).
 void PrewarmBorderlessCapture();
 bool BorderlessCaptureGranted();
+// Configure every WGC session before StartCapture; never continue with cursor or border enabled.
+bool PrepareCleanCaptureSession(const winrt::Windows::Graphics::Capture::GraphicsCaptureSession& session);
 class WgcBackdropSource final : public IBackdropSource {
 public:
     ~WgcBackdropSource() override;
@@ -39,6 +40,14 @@ public:
     void SetExcludedWindow(HWND hwnd) override { hwnd_ = hwnd; }
     const wchar_t* Name() const override { return dxgi_ ? L"Live desktop (DXGI duplication)" : L"Live desktop (WGC)"; }
     bool UsingDuplication() const { return dxgi_ != nullptr; }
+    // The shared monitor duplication this source reads (null with WGC or when off): the low-latency Dock owns it.
+    docky::desk::SharedDesktop* Duplication() const { return dxgi_; }
+    // QueryPerformanceCounter of the published image's LastPresentTime (when DWM showed it); 0 unknown. For the
+    // capture-to-screen latency counter.
+    int64_t PublishedLastPresentQpc() const { return publishedLp_; }
+    // Dev measurement only (--dev-isolated + DOCKY_LATENCY_PROBE_OFFSET=px): the window stays visible to capture and
+    // samples the area `px` to the left, so an external probe can compare its glass with the source in one screenshot.
+    static int ProbeOffset();
     int State() const { return state_; }
     HANDLE CompletionEvent() const { return inFlight_ ? (retryMap_ ? retryTimer_ : gpuEvent_) : nullptr; }
     bool ProcessCapture(const RECT& wanted);
@@ -65,7 +74,8 @@ private:
     void InitCompare();
     void SubmitCompare(UINT width, UINT height);
     void Fail(const wchar_t* reason);
-    bool Start(HMONITOR monitor);
+    void StartOrWait(HMONITOR monitor, bool tryDuplication = true);
+    bool Start(HMONITOR monitor, bool tryDuplication);
     bool StartDuplication(HMONITOR monitor);
     bool ProcessDuplication(const RECT& wanted);
     void Stop();
@@ -76,6 +86,7 @@ private:
     bool wgcRefusedLogged_ = false;
     // Capture latency: from the moment Windows produced the frame to its publication (both paths), for the log.
     double latencySum_ = 0, latencyMax_ = 0; uint64_t latencyCount_ = 0;
+    int64_t candidateLp_ = 0, publishedLp_ = 0;  // LastPresentTime (QPC) of the candidate / published duplication image
     int64_t lastDrawQpc_ = 0;  // QueryPerformanceCounter of the caller's last frame (Latest)
     void NotePublished();
     HWND hwnd_ = nullptr;
@@ -114,7 +125,6 @@ private:
     uint64_t currentId_ = 0, copiedId_ = 0;
     bool currentDirtyHit_ = false;  // current_ is known to have changed inside the ROI: publish without the GPU compare
     double capturedAt_ = 0, publishedTime_ = 0;
-    bool borderlessTried_ = false;
     bool diagnostics_ = false;
     uint64_t diagnosticSamples_ = 0, diagnosticChanges_ = 0;
     std::vector<unsigned char> previousPixels_;

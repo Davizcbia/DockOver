@@ -1,4 +1,5 @@
 #include "calendar_feed.h"
+#include "calendar_config.h"
 #include "canvas.h"
 #include <urlmon.h>
 #include <algorithm>
@@ -79,13 +80,13 @@ std::vector<CalEvent> ParseIcs(const std::string& text, unsigned color, ULONGLON
     }
     if (!cur.empty()) lines.push_back(cur);
     std::vector<CalEvent> out;
-    bool inEvent = false; std::string summary, dtstart, dtend, rrule;
+    bool inEvent = false; std::string summary, location, dtstart, dtend, rrule;
     for (const auto& l : lines) {
-        if (l == "BEGIN:VEVENT") { inEvent = true; summary.clear(); dtstart.clear(); dtend.clear(); rrule.clear(); continue; }
+        if (l == "BEGIN:VEVENT") { inEvent = true; summary.clear(); location.clear(); dtstart.clear(); dtend.clear(); rrule.clear(); continue; }
         if (!inEvent) continue;
         if (l == "END:VEVENT") {
             inEvent = false;
-            CalEvent e; e.color = color; e.title = Wide(Unescape(summary));
+            CalEvent e; e.color = color; e.title = Wide(Unescape(summary)); e.location = Wide(Unescape(location));
             bool allDay = false, endAllDay = false; ULONGLONG start = 0, end = 0;
             if (!ParseWhen(dtstart, allDay, start)) continue;
             e.allDay = allDay;
@@ -129,6 +130,7 @@ std::vector<CalEvent> ParseIcs(const std::string& text, unsigned color, ULONGLON
         if (colon == std::string::npos) continue;
         const std::string name = l.substr(0, l.find_first_of(";:")), value = l.substr(colon + 1);
         if (name == "SUMMARY") summary = value;
+        else if (name == "LOCATION") location = value;
         else if (name == "DTSTART") dtstart = value;
         else if (name == "DTEND") dtend = value;
         else if (name == "RRULE") rrule = value;
@@ -139,10 +141,24 @@ std::vector<CalEvent> ParseIcs(const std::string& text, unsigned color, ULONGLON
 
 namespace {
 struct Shared {
-    mutable std::mutex mutex; std::vector<CalEvent> events; bool configured = false;
-    HWND notify = nullptr; UINT message = 0; HANDLE wake = nullptr; std::atomic<bool> stop{false}; std::thread thread;
+    mutable std::mutex mutex; std::vector<CalEvent> events; std::vector<FeedStatus> feeds; bool configured = false;
+    HWND notify = nullptr; UINT message = 0; HANDLE wake = nullptr; std::atomic<bool> stop{false}, fetching{false}; std::thread thread;
 } g;
-const unsigned kPalette[6] = {0x0A84FF, 0x30D158, 0xBF5AF2, 0xFF9F0A, 0xFF375F, 0x64D2FF};
+// The calendar's display name from its header (X-WR-CALNAME, possibly folded or with parameters).
+std::wstring CalendarName(const std::string& text) {
+    size_t at = text.find("X-WR-CALNAME");
+    if (at == std::string::npos) return {};
+    const size_t colon = text.find(':', at); if (colon == std::string::npos) return {};
+    std::string v; size_t i = colon + 1;
+    while (i < text.size()) {
+        if (text[i] == '\r') { ++i; continue; }
+        if (text[i] == '\n') { if (i + 1 < text.size() && (text[i + 1] == ' ' || text[i + 1] == '\t')) { i += 2; continue; } break; }
+        v += text[i++];
+    }
+    std::wstring w = Wide(Unescape(v));
+    while (!w.empty() && w.back() == L' ') w.pop_back();
+    return w.size() > 80 ? w.substr(0, 80) : w;
+}
 
 std::string ReadFileUtf8(const std::wstring& path) {
     std::ifstream f(path, std::ios::binary); std::ostringstream s; s << f.rdbuf(); std::string out = s.str();
@@ -150,20 +166,24 @@ std::string ReadFileUtf8(const std::wstring& path) {
     return out;
 }
 void Fetch() {
-    std::vector<CalEvent> all; bool configured = false;
+    g.fetching = true;
+    if (g.notify) PostMessageW(g.notify, g.message, 0, 0);  // the settings page shows "Updating…"
+    std::vector<CalEvent> all; std::vector<FeedStatus> feeds; bool configured = false;
     std::wistringstream lines(DevCalendar().empty() ? Wide(ReadFileUtf8(CalendarFeeds::ConfigPath())) : DevCalendar());
     std::wstring line; int index = 0;
     const ULONGLONG today = DayStart(LocalNow()), from = today - kDayTicks, to = today + 32 * kDayTicks;
     while (std::getline(lines, line)) {
         while (!line.empty() && (line.back() == L'\r' || line.back() == L' ')) line.pop_back();
         while (!line.empty() && line.front() == L' ') line.erase(0, 1);
+        if (!line.empty() && line[0] == 0xFEFF) line.erase(0, 1);
         if (line.empty() || line[0] == L'#') continue;
-        unsigned color = kPalette[index++ % 6];
-        if (line.size() > 8 && line[line.size() - 7] == L'#' && line[line.size() - 8] == L' ') {
-            color = static_cast<unsigned>(wcstoul(line.c_str() + line.size() - 6, nullptr, 16)); line.resize(line.size() - 8);
-        }
+        const calconfig::Entry entry = calconfig::ParseLine(line);
+        if (entry.source.empty()) continue;
+        const unsigned color = entry.hasColour ? entry.colour : calconfig::kPalette[index % calconfig::kDefaultColours];
+        ++index;
         configured = true;
-        std::wstring source = line;
+        std::wstring source = entry.source;
+        FeedStatus status; status.source = entry.source;
         if (source.rfind(L"webcal://", 0) == 0) source = L"https://" + source.substr(9);
         std::string text;
         if (source.rfind(L"http://", 0) == 0 || source.rfind(L"https://", 0) == 0) {
@@ -173,10 +193,14 @@ void Fetch() {
             DeleteFileW(file);
         } else text = ReadFileUtf8(source);
         auto events = ParseIcs(text, color, from, to);
+        status.ok = text.find("BEGIN:VCALENDAR") != std::string::npos;
+        status.name = CalendarName(text); status.events = static_cast<int>(events.size());
+        feeds.push_back(std::move(status));
         all.insert(all.end(), events.begin(), events.end());
     }
     std::sort(all.begin(), all.end(), [](const CalEvent& a, const CalEvent& b) { return a.start != b.start ? a.start < b.start : a.allDay > b.allDay; });
-    { std::lock_guard<std::mutex> l(g.mutex); g.events = std::move(all); g.configured = configured; }
+    { std::lock_guard<std::mutex> l(g.mutex); g.events = std::move(all); g.feeds = std::move(feeds); g.configured = configured; }
+    g.fetching = false;
     if (g.notify) PostMessageW(g.notify, g.message, 0, 0);
 }
 }  // namespace
@@ -210,6 +234,8 @@ void CalendarFeeds::Stop() { g.stop = true; if (g.wake) SetEvent(g.wake); if (g.
 void CalendarFeeds::Refresh() { if (g.wake) SetEvent(g.wake); }
 std::vector<CalEvent> CalendarFeeds::Events() const { std::lock_guard<std::mutex> l(g.mutex); return g.events; }
 bool CalendarFeeds::Configured() const { std::lock_guard<std::mutex> l(g.mutex); return g.configured; }
+std::vector<FeedStatus> CalendarFeeds::Feeds() const { std::lock_guard<std::mutex> l(g.mutex); return g.feeds; }
+bool CalendarFeeds::Fetching() const { return g.fetching; }
 CalendarFeeds& Calendars() { static CalendarFeeds c; return c; }
 
 }  // namespace docky::desk

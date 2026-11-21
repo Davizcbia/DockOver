@@ -6,6 +6,11 @@
 #include <shellapi.h>
 #include <wbemidl.h>
 #include <wlanapi.h>
+#include <setupapi.h>
+#include <initguid.h>
+#include <devpkey.h>
+#include <mutex>
+#pragma comment(lib, "setupapi.lib")
 #include <wrl/client.h>
 
 #include <winrt/Windows.Devices.Bluetooth.h>
@@ -14,6 +19,9 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Media.Control.h>
+#include <winrt/Windows.Graphics.Imaging.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <cstring>
 
 #include <algorithm>
 #include <atomic>
@@ -26,6 +34,29 @@
 using Microsoft::WRL::ComPtr;
 
 namespace liquid::controls {
+
+BtKind BtKindOf(unsigned cod, const std::wstring& name) {
+    std::wstring n = name; for (auto& c : n) c = static_cast<wchar_t>(towlower(c));
+    auto has = [&](const wchar_t* w) { return n.find(w) != std::wstring::npos; };
+    if (has(L"trackpad") || has(L"touchpad")) return BtKind::Trackpad;
+    const unsigned major = (cod >> 8) & 0x1F, minor = (cod >> 2) & 0x3F;
+    if (major == 2) return BtKind::Phone;
+    if (major == 4) return minor == 5 || minor == 7 ? BtKind::Speaker : BtKind::Headphones;  // loudspeaker, portable audio
+    if (major == 5) {  // peripheral: upper two minor bits keyboard / pointing, lower four joystick / gamepad
+        if ((minor & 0x0F) == 1 || (minor & 0x0F) == 2) return BtKind::Gamepad;
+        if (minor & 0x10) return BtKind::Keyboard;
+        if (minor & 0x20) return BtKind::Mouse;
+    }
+    if (has(L"keyboard") || has(L"keys") || has(L" kb") || has(L"k380") || has(L"k780")) return BtKind::Keyboard;
+    if (has(L"mouse") || has(L"mx master") || has(L"triathlon")) return BtKind::Mouse;
+    if (has(L"controller") || has(L"gamepad") || has(L"playstation") || has(L"dualsense") || has(L"xbox")) return BtKind::Gamepad;
+    if (has(L"buds") || has(L"pods") || has(L"headphone") || has(L"headset") || has(L"earbud") || has(L"momentum") || has(L"wh-1000") ||
+        has(L"wf-1000") || has(L"quietcomfort") || has(L"beats")) return BtKind::Headphones;
+    if (has(L"speaker") || has(L"soundbar") || has(L"boom")) return BtKind::Speaker;
+    if (has(L"phone")) return BtKind::Phone;
+    return BtKind::Other;
+}
+
 namespace {
 
 ComPtr<IAudioEndpointVolume> Endpoint() {
@@ -184,8 +215,57 @@ void QueryRadios(State& s) {
     }
 }
 
+// Battery levels Windows recorded for present device nodes (the Bluetooth battery property, 0..100), by friendly name.
+std::map<std::wstring, int> BluetoothBatteryLevels() {
+    static const DEVPROPKEY kBatteryLevel{{0x104EA319, 0x6EE2, 0x4701, {0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5}}, 2};
+    std::map<std::wstring, int> out;
+    HDEVINFO set = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (set == INVALID_HANDLE_VALUE) return out;
+    SP_DEVINFO_DATA d{}; d.cbSize = sizeof(d);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(set, i, &d) && i < 20000; ++i) {
+        DEVPROPTYPE type = 0; BYTE level = 0; DWORD size = 0;
+        if (!SetupDiGetDevicePropertyW(set, &d, &kBatteryLevel, &type, &level, sizeof(level), &size, 0) || type != DEVPROP_TYPE_BYTE || level > 100) continue;
+        wchar_t name[512]{};
+        if (!SetupDiGetDevicePropertyW(set, &d, &DEVPKEY_Device_FriendlyName, &type, reinterpret_cast<BYTE*>(name), sizeof(name) - sizeof(wchar_t), &size, 0) || type != DEVPROP_TYPE_STRING) continue;
+        std::wstring n = name; while (!n.empty() && n.back() == L' ') n.pop_back();
+        if (!n.empty()) out[n] = level;
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    return out;
+}
+
 void QueryBluetoothDevices(State& s) {
     using namespace winrt::Windows::Devices;
+    // Kinds come from the device itself (Class of Device / LE appearance) and are cached by device id: one lookup each.
+    static std::mutex kindsMutex; static std::map<std::wstring, BtKind> kinds;
+    auto kindOf = [&](const winrt::hstring& id, const std::wstring& name, bool le) {
+        { std::lock_guard<std::mutex> lock(kindsMutex); auto it = kinds.find(id.c_str()); if (it != kinds.end()) return it->second; }
+        BtKind kind = BtKindOf(0, name);
+        // Some ids from the pairing selector are refused by FromIdAsync (E_INVALIDARG, seen for a paired headset); the
+        // device address at the end of the id ("...-aa:bb:cc:dd:ee:ff") still finds it.
+        auto address = [&]() -> uint64_t {
+            const std::wstring s(id.c_str()); const size_t dash = s.rfind(L'-');
+            if (dash == std::wstring::npos) return 0;
+            uint64_t v = 0; int digits = 0;
+            for (size_t i = dash + 1; i < s.size(); ++i) { const wchar_t c = s[i]; if (c == L':') continue; if (!iswxdigit(c)) return 0; v = v * 16 + (iswdigit(c) ? c - L'0' : (towlower(c) - L'a' + 10)); ++digits; }
+            return digits == 12 ? v : 0;
+        };
+        auto classic = [&]() -> Bluetooth::BluetoothDevice {
+            try { if (auto dev = Bluetooth::BluetoothDevice::FromIdAsync(id).get()) return dev; } catch (const winrt::hresult_error&) {}
+            if (const uint64_t a = address()) return Bluetooth::BluetoothDevice::FromBluetoothAddressAsync(a).get();
+            return nullptr;
+        };
+        try {
+            if (!le) { if (auto dev = classic()) { const unsigned cod = dev.ClassOfDevice().RawValue(); kind = BtKindOf(cod, name); if (kind == BtKind::Other) DLOG(L"controls: bluetooth class of device 0x%06X", cod); } }
+            else if (auto dev = Bluetooth::BluetoothLEDevice::FromIdAsync(id).get()) {
+                const unsigned raw = dev.Appearance().RawValue();  // HID category 0x03C0: 1 keyboard, 2 mouse, 3 joystick, 4 gamepad
+                if ((raw >> 6) == 0x0F) { const unsigned sub = raw & 0x3F; kind = sub == 1 ? BtKind::Keyboard : sub == 2 ? (kind == BtKind::Trackpad ? kind : BtKind::Mouse) : (sub == 3 || sub == 4) ? BtKind::Gamepad : kind; }
+            }
+        } catch (const winrt::hresult_error& e) { DLOG(L"controls: bluetooth kind lookup failed 0x%08X", static_cast<unsigned>(e.code().value)); }
+        if (kind == BtKind::Other) DLOG(L"controls: bluetooth device kind unknown (le=%d)", le ? 1 : 0);
+        std::lock_guard<std::mutex> lock(kindsMutex); kinds[id.c_str()] = kind;
+        return kind;
+    };
     try {
         for (const winrt::hstring& selector :
              {Bluetooth::BluetoothDevice::GetDeviceSelectorFromConnectionStatus(Bluetooth::BluetoothConnectionStatus::Connected),
@@ -196,6 +276,25 @@ void QueryBluetoothDevices(State& s) {
                     s.btDevices.push_back(name);
             }
         }
+        // Every paired device (classic and LE; one accessory may be both: merged by name), connected as found above.
+        const auto levels = BluetoothBatteryLevels();
+        for (int le = 0; le < 2; ++le) {
+            const auto selector = le ? Bluetooth::BluetoothLEDevice::GetDeviceSelectorFromPairingState(true) : Bluetooth::BluetoothDevice::GetDeviceSelectorFromPairingState(true);
+            for (const auto& d : Enumeration::DeviceInformation::FindAllAsync(selector).get()) {
+                std::wstring name(d.Name().c_str());
+                while (!name.empty() && name.back() == L' ') name.pop_back();
+                if (name.empty()) continue;
+                const BtKind kind = kindOf(d.Id(), name, le != 0);
+                auto it = std::find_if(s.btPaired.begin(), s.btPaired.end(), [&](const BtDevice& b) { return b.name == name; });
+                if (it == s.btPaired.end()) { s.btPaired.push_back(BtDevice{name, false, kind, -1}); it = s.btPaired.end() - 1; }
+                else if (it->kind == BtKind::Other) it->kind = kind;
+            }
+        }
+        for (auto& b : s.btPaired) {
+            b.connected = std::find(s.btDevices.begin(), s.btDevices.end(), b.name) != s.btDevices.end();
+            if (auto lv = levels.find(b.name); b.connected && lv != levels.end()) b.battery = lv->second;
+        }
+        std::sort(s.btPaired.begin(), s.btPaired.end(), [](const BtDevice& a, const BtDevice& b) { return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0; });
     } catch (const winrt::hresult_error& e) {
         DLOG(L"controls: bluetooth devices unavailable 0x%08X", static_cast<unsigned>(e.code().value));
     }
@@ -280,6 +379,32 @@ State Query(bool includeNetworks, bool includeBluetoothDevices) {
                 const auto props = session.TryGetMediaPropertiesAsync().get();
                 s.title = props.Title().c_str();
                 s.artist = props.Artist().c_str();
+                try {
+                    using namespace winrt::Windows::Graphics::Imaging;
+                    if (auto thumbnail=props.Thumbnail()) {
+                        auto stream=thumbnail.OpenReadAsync().get();
+                        if (stream.Size() <= 16*1024*1024) {
+                            auto decoder=BitmapDecoder::CreateAsync(stream).get();
+                            const auto w=decoder.PixelWidth(), h=decoder.PixelHeight();
+                            if(w && h) {
+                                const float ratio=256.f/static_cast<float>(std::max(w,h));
+                                BitmapTransform transform;
+                                const uint32_t aw=std::max(1u,static_cast<uint32_t>(w*ratio)), ah=std::max(1u,static_cast<uint32_t>(h*ratio));
+                                transform.ScaledWidth(aw);transform.ScaledHeight(ah);
+                                auto bytes=decoder.GetPixelDataAsync(BitmapPixelFormat::Bgra8,BitmapAlphaMode::Premultiplied,transform,
+                                    ExifOrientationMode::IgnoreExifOrientation,ColorManagementMode::ColorManageToSRgb).get().DetachPixelData();
+                                if(bytes.size()==static_cast<size_t>(aw)*ah*4) {
+                                    auto pixels=std::make_shared<std::vector<uint32_t>>(static_cast<size_t>(aw)*ah);
+                                    std::memcpy(pixels->data(),bytes.data(),bytes.size());
+                                    uint64_t hash=1469598103934665603ull;
+                                    for(auto byte:bytes){hash^=byte;hash*=1099511628211ull;}
+                                    s.artwork=pixels;s.artworkWidth=aw;s.artworkHeight=ah;s.artworkHash=hash;
+                                }
+                            }
+                        }
+                    }
+                } catch (...) { /* Missing or unsupported artwork leaves the glass card usable. */ }
+
             } catch (...) {
             }
         }

@@ -10,19 +10,20 @@ struct DensityGrid { int columns=1,rows=1; float icon=1.f,pitchX=1.f,pitchY=1.f,
 inline float FiniteClamp(float x,float fallback,float lo,float hi){return std::isfinite(x)?std::clamp(x,lo,hi):fallback;}
 inline DensityGrid PlanDensity(float width,float height,DensityConfig cfg){
  width=FiniteClamp(width,1.f,1.f,100000.f);height=FiniteClamp(height,1.f,1.f,100000.f);
- const float aw=(std::max)(1.f,width*.80f),ah=(std::max)(1.f,height*.64f);
- float base=std::clamp((std::min)(width*.042f,height*.075f),56.f,104.f),icon=base,gx=base*1.1f,gy=(std::max)(0.f,ah/5.f-base-26.f);
- if(cfg.preset==DensityPreset::Compact){icon=base*.85f;gx=base*.65f;gy=base*.30f;}
- else if(cfg.preset==DensityPreset::Spacious){icon=base*1.1f;gx=base*1.4f;gy=base*.75f;}
- else if(cfg.preset==DensityPreset::Custom){icon=FiniteClamp(cfg.icon,96.f,32.f,160.f);gx=FiniteClamp(cfg.gapX,80.f,0.f,240.f);gy=FiniteClamp(cfg.gapY,48.f,0.f,240.f);}
- // Fit a single icon even in a very small available area; never report negative sizes.
+ const float aw=(std::max)(1.f,width*.80f),ah=(std::max)(1.f,height*.90f);
+ // Every preset derives from the user's existing 7x5 default proportions.
+ const float base=std::clamp((std::min)(width*.040f,height*.071f),56.f,120.f);
+ float icon=base,colsWanted=7,rowsWanted=5;
+ if(cfg.preset==DensityPreset::Compact){icon=base*.85f;colsWanted=9;rowsWanted=6;}
+ else if(cfg.preset==DensityPreset::Spacious){icon=base*1.1f;colsWanted=6;rowsWanted=4;}
  icon=(std::max)(1.f,(std::min)({icon,aw,ah}));
- float px=icon+gx,py=icon+26.f+gy;
- if(cfg.preset==DensityPreset::Default){px=(std::max)(icon,aw/7.f);py=(std::max)(icon+26.f,ah/5.f);}
- px=(std::max)(1.f,px);py=(std::max)(1.f,py);
- int cols=std::clamp(static_cast<int>((aw+0.001f)/px),1,12),rows=std::clamp(static_cast<int>((ah+0.001f)/py),1,10);
- // For pathological small screens, fit the pitch to the viewport rather than overflow.
- px=(std::min)(px,aw);py=(std::min)(py,ah);icon=(std::min)({icon,px,py});
+ float px=(std::max)(icon+24.f,width*.0983f*7.f/colsWanted),py=(std::max)(icon+60.f,height*(cfg.preset==DensityPreset::Compact?.14f:cfg.preset==DensityPreset::Spacious?.22f:.176f));
+ int cols=static_cast<int>(colsWanted),rows=static_cast<int>(rowsWanted);
+ if(cfg.preset==DensityPreset::Custom){icon=FiniteClamp(cfg.icon,96.f,32.f,160.f);icon=(std::min)({icon,aw,ah});px=icon+FiniteClamp(cfg.gapX,80.f,0.f,240.f)+24.f;py=icon+60.f+FiniteClamp(cfg.gapY,48.f,0.f,240.f);cols=std::clamp(static_cast<int>(aw/px),1,12);rows=std::clamp(static_cast<int>(ah/py),1,10);}
+ // Keep columns/cells inside the display without changing saved logical order.
+ cols=(std::min)(cols,(std::max)(1,static_cast<int>(aw/px)));rows=(std::min)(rows,(std::max)(1,static_cast<int>(ah/py)));
+ px=(std::min)(px,aw);py=(std::min)(py,ah);icon=(std::max)(1.f,(std::min)({icon,px-24.f,py-60.f}));
+
  return {cols,rows,icon,px,py,px*cols,py*rows};
 }
 inline size_t DensityPageCount(size_t items,const DensityGrid& g){const auto cap=g.capacity();return cap?(items/cap+(items%cap!=0)):0;}

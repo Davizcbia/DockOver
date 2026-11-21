@@ -4,7 +4,7 @@
 
 ## 无边框采集版本（本机）
 
-`run_borderless.cmd` 或 `build-borderless\LiquidDesktopManager.exe` 启动带本机包身份的版本。2026-11-09 已为当前 Windows 用户注册身份包，用户已允许无边框采集；Windows 可能仍在其他程序采集同一屏幕时显示边框。先正常退出旧版再启动。`run_borderless.cmd` 在自身窗口中直接运行管理器，运行期间保持该窗口打开，关闭窗口或 Ctrl+C 会正常退出 docky（原先用 `start` 另开控制台会间歇出现 0xc0000142）。该版本依赖固定位置 `build-borderless`，不能直接移动。退出时管理器会正常关闭它启动的 Dock、菜单栏和守护进程；如果组件无响应，不强制结束。构建、授权和证书细节见 `dockui\identity\README.md`。
+`run_borderless.cmd` 或 `build-borderless\LiquidDesktopManager.exe` 启动带本机包身份的版本。2026-11-09 已为当前 Windows 用户注册身份包，用户已允许无边框采集；Windows 可能仍在其他程序采集同一屏幕时显示边框。先正常退出旧版再启动。`run_borderless.cmd` 在自身窗口中直接运行管理器，运行期间保持该窗口打开，关闭窗口或 Ctrl+C 会正常退出 DockOver（原先用 `start` 另开控制台会间歇出现 0xc0000142）。该版本依赖固定位置 `build-borderless`，不能直接移动。退出时管理器会正常关闭它启动的 Dock、菜单栏和守护进程；如果组件无响应，不强制结束。构建、授权和证书细节见 `dockui\identity\README.md`。
 
 ## 当前可运行版本
 
@@ -14,7 +14,7 @@
 
 在 Windows 11 上双击 `build_docky.cmd`，或在终端执行它。需要 Visual Studio 2022 的 Desktop development with C++、MSVC x64、Windows 10/11 SDK（含 fxc），以及 Visual Studio 捆绑的 CMake 和 Ninja。默认输出到本目录 `build`，不自动启动程序、不安装扩展包，也不修改 Windows 任务栏或用户设置。若要指定其他输出目录：`build_docky.cmd -BuildDir "C:\path\to\build"`。
 
-构建完成后统一入口是 `build\LiquidDesktopManager.exe`，设置窗口是 `build\LiquidDesktopSettings.exe`。请先确认其他 docky 实例的状态，避免重复运行。源码目录 README 中部分历史状态可能过时，以 `handoffs` 的最近交接和实际代码为准。
+构建完成后统一入口是 `build\LiquidDesktopManager.exe`，设置窗口是 `build\LiquidDesktopSettings.exe`。请先确认其他 DockOver 实例的状态，避免重复运行。源码目录 README 中部分历史状态可能过时，以 `handoffs` 的最近交接和实际代码为准。
 
 ## 扩展包
 
@@ -24,6 +24,6 @@
 
 最新功能验证和已知限制参见 `handoffs/2026-11-09-codex-settings-continuous-lab-2f60.md`。尤其是 Settings 按下玻璃尚未证明与 Qt Glass Lab 完全一致。
 
-## docky Desktop（桌面小组件与文件叠放，独立程序）
+## DockOver Desktop（桌面小组件与文件叠放，独立程序）
 
-`run_desktop.cmd` 或 `build-desktop\DockyDesktop.exe` 启动。它与 docky（Dock + 菜单栏）分开安装、分开启动和退出，不依赖包身份，也不会被 Desktop Manager 启动。两者同时运行时可以联动：菜单栏 docky 菜单中有 Edit Desktop Widgets…，docky Desktop 的托盘图标显示在菜单栏的隐藏图标里，并跟随 docky 的外观设置。第三方接入（菜单栏状态项、小组件、脚本工具 `docky-ext.exe`、免代码清单）见 `dockui\docs\extensions-v01.md`，示例在 `build-desktop\examples\hello`。
+`run_desktop.cmd` 或 `build-desktop\DockyDesktop.exe` 启动。它与 DockOver（Dock + 菜单栏）分开安装、分开启动和退出，不依赖包身份，也不会被 Desktop Manager 启动。两者同时运行时可以联动：菜单栏 DockOver 菜单中有 Edit Desktop Widgets…，DockOver Desktop 的托盘图标显示在菜单栏的隐藏图标里，并跟随 DockOver 的外观设置。第三方接入（菜单栏状态项、小组件、脚本工具 `docky-ext.exe`、免代码清单）见 `dockui\docs\extensions-v01.md`，示例在 `build-desktop\examples\hello`。

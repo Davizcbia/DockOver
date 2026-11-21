@@ -23,5 +23,6 @@ struct Snapshot {
  int batteryPercent=-1;
  bool operator==(const Snapshot&) const = default;
 };
-Snapshot Query();
+// networks: also list the nearby Wi-Fi networks (the menu bar's Wi-Fi menu); the Dock's tiles need only the connection.
+Snapshot Query(bool networks = true);
 }

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstring>
 #include <cmath>
+#include <cwctype>
 namespace liquid::settings {
 std::wstring DefaultPath() {
     PWSTR p=nullptr;
@@ -44,6 +45,17 @@ Result Load(const std::wstring& path) {
         if(hide->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.dock.autoHide=hide->boolean;
     }
+    if(const auto* section=root.Find("dock")) {
+        // The new key is ignored by older components, whose iconSize reader only accepts 24..80.
+        const auto* iconSize=section->Find("iconSizeV2");
+        if (!iconSize) iconSize=section->Find("iconSize");
+        if(iconSize) {
+            if(iconSize->type!=dock::json::Value::Type::Number || !std::isfinite(iconSize->number) || std::floor(iconSize->number)!=iconSize->number || iconSize->number<1 || iconSize->number>65535){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
+            r.value.dock.iconSize=static_cast<int>(iconSize->number);
+        }
+    }
+    if(const auto* section=root.Find("dock")) if(const auto* mag=section->Find("magnification");mag&&mag->type==dock::json::Value::Type::Number&&std::isfinite(mag->number))
+        r.value.dock.magnification=std::clamp(static_cast<int>(std::lround(mag->number)),0,150);
     if(const auto* section=root.Find("dock")) if(const auto* count=section->Find("downloadsCount")){
         if(count->type!=dock::json::Value::Type::Number){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.dock.downloadsCount=std::clamp(static_cast<int>(count->number),3,10);
@@ -68,9 +80,47 @@ Result Load(const std::wstring& path) {
         if(snap->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.dock.hideSnapLayouts=snap->boolean;
     }
+    if(const auto* section=root.Find("dock")) if(const auto* game=section->Find("gameCompatibility")){
+        if(game->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
+        r.value.dock.gameCompatibility=game->boolean;
+    }
+    if(const auto* section=root.Find("dock")) if(const auto* low=section->Find("lowLatencyGlass")){  // tolerant: a bad value keeps the default (off)
+        if(low->type==dock::json::Value::Type::Bool)r.value.dock.lowLatencyGlass=low->boolean;
+    }
     if(const auto* section=root.Find("dock")) if(const auto* mask=section->Find("useMacIconMask")){
         if(mask->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.dock.useMacIconMask=mask->boolean;
+    }
+    if(const auto* section=root.Find("dock")) if(const auto* cells=section->Find("statusCells")){  // tolerant: bad entries are dropped
+        if(cells->type==dock::json::Value::Type::Array){r.value.dock.statusCells.clear();
+            for(const auto& c:cells->array){if(c.type!=dock::json::Value::Type::String)continue;const std::wstring id=dock::json::FromUtf8(c.string);
+                if(ValidStatusCell(id)&&r.value.dock.statusCells.size()<16&&std::find(r.value.dock.statusCells.begin(),r.value.dock.statusCells.end(),id)==r.value.dock.statusCells.end())r.value.dock.statusCells.push_back(id);}}
+    }
+    if(const auto* section=root.Find("dock")) if(const auto* v=section->Find("statusTileStyle")){if(v->type==dock::json::Value::Type::Number&&(v->number==0||v->number==1||v->number==2))r.value.dock.statusTileStyle=static_cast<int>(v->number);}
+    if(const auto* section=root.Find("dock")) if(const auto* pct=section->Find("statusBatteryPercent")){if(pct->type==dock::json::Value::Type::Bool)r.value.dock.statusBatteryPercent=pct->boolean;}
+    if(const auto* section=root.Find("dock")){  // removable Dock items (tolerant: a wrong type keeps the default)
+        if(const auto* v=section->Find("showDownloads"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showDownloads=v->boolean;
+        if(const auto* v=section->Find("showTrash"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showTrash=v->boolean;
+        if(const auto* v=section->Find("showDivider"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showDivider=v->boolean;
+        if(const auto* v=section->Find("tailOrder"))if(v->type==dock::json::Value::Type::Array)
+            for(const auto& k:v->array){if(k.type!=dock::json::Value::Type::String)continue;const std::wstring key=dock::json::FromUtf8(k.string);auto& order=r.value.dock.tailOrder;
+                if(ValidTailKey(key)&&order.size()<8&&std::find(order.begin(),order.end(),key)==order.end())order.push_back(key);}
+    }
+    if(const auto* section=root.Find("menuBar")) if(const auto* on=section->Find("enabled")){if(on->type==dock::json::Value::Type::Bool)r.value.menuBar.enabled=on->boolean;}
+    if (const auto* section = root.Find("menuBar"))
+        if (const auto* gradient = section->Find("themeGradient"); gradient && gradient->type == dock::json::Value::Type::Bool)
+            r.value.menuBar.themeGradient = gradient->boolean;
+    if(const auto* section=root.Find("menuBar")) if(const auto* on=section->Find("captureNotifications")){if(on->type==dock::json::Value::Type::Bool)r.value.menuBar.captureNotifications=on->boolean;}
+    if(const auto* section=root.Find("menuBar")){  // a value out of range is ignored (default), never invalidates the file
+        auto integer=[&](const char* key,int lo,int hi,int& out){if(const auto* v=section->Find(key);v&&v->type==dock::json::Value::Type::Number&&std::isfinite(v->number)&&v->number>=lo&&v->number<=hi)out=static_cast<int>(v->number);};
+        integer("gradientOpacity",0,100,r.value.menuBar.gradientOpacity);
+        integer("gradientLength",40,100,r.value.menuBar.gradientLength);
+        integer("notificationBlur",0,100,r.value.menuBar.notificationBlur);integer("notificationBlurFade",40,400,r.value.menuBar.notificationBlurFade);integer("notificationShade",0,100,r.value.menuBar.notificationShade);
+    }
+    if(const auto* section=root.Find("menuBar")) if(const auto* on=section->Find("hideSystemNotifications")){if(on->type==dock::json::Value::Type::Bool)r.value.menuBar.hideSystemNotifications=on->boolean;}
+    if(const auto* section=root.Find("menuBar")) if(const auto* value=section->Find("scalePercent")){
+        if(value->type!=dock::json::Value::Type::Number||!std::isfinite(value->number)||std::floor(value->number)!=value->number||value->number<80||value->number>160){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
+        r.value.menuBar.scalePercent=static_cast<int>(value->number);
     }
     if(const auto* section=root.Find("launchpad")){
         auto integer=[&](const char* key,int lo,int hi,int& out){const auto* v=section->Find(key);if(!v)return true;
@@ -90,9 +140,70 @@ Result Load(const std::wstring& path) {
         auto flag=[&](const char* key,bool& out){if(const auto* v=section->Find(key);v&&v->type==dock::json::Value::Type::Bool)out=v->boolean;};
         flag("autoCheck",r.value.updates.autoCheck);flag("autoInstall",r.value.updates.autoInstall);
     }
+    if(const auto* section=root.Find("controlCenter")) if(const auto* artwork=section->Find("mediaArtworkBackground")) {
+        if(artwork->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
+        r.value.controlCenter.mediaArtworkBackground=artwork->boolean;
+    }
+    if(const auto* section=root.Find("controlCenter")) if(const auto* v=section->Find("musicWallpaper");v&&v->type==dock::json::Value::Type::Bool)
+        r.value.controlCenter.musicWallpaper=v->boolean;  // wrong type: default (off), never invalidates the file
+    if(const auto* section=root.Find("controlCenter")) if(const auto* v=section->Find("wallpaperAvoidBars");v&&v->type==dock::json::Value::Type::Bool)
+        r.value.controlCenter.wallpaperAvoidBars=v->boolean;  // wrong type: default (on)
+    if(const auto* section=root.Find("controlCenter")) if(const auto* v=section->Find("wallpaperLyrics");v&&v->type==dock::json::Value::Type::Bool)
+        r.value.controlCenter.wallpaperLyrics=v->boolean;
+    if(const auto* section=root.Find("controlCenter")) if(const auto* v=section->Find("lyricsFullArtwork");v&&v->type==dock::json::Value::Type::Bool)
+        r.value.controlCenter.lyricsFullArtwork=v->boolean;
+    if(const auto* section=root.Find("controlCenter")) if(const auto* v=section->Find("lyricsAutoReturn");v&&v->type==dock::json::Value::Type::Bool)
+        r.value.controlCenter.lyricsAutoReturn=v->boolean;
+    if(const auto* section=root.Find("controlCenter")){
+        auto shortcut=[&](const char* key,int& out){if(const auto* v=section->Find(key);v&&v->type==dock::json::Value::Type::Number&&v->number>=0&&v->number<=0x7FF)out=static_cast<int>(v->number);};
+        shortcut("shortcutLyrics",r.value.controlCenter.shortcutLyrics);shortcut("shortcutArtwork",r.value.controlCenter.shortcutArtwork);
+        shortcut("shortcutDesktop",r.value.controlCenter.shortcutDesktop);shortcut("shortcutNowPlaying",r.value.controlCenter.shortcutNowPlaying);
+        if (const auto* v = section->Find("animatedArtwork"); v && v->type == dock::json::Value::Type::Bool)
+            r.value.controlCenter.animatedArtwork = v->boolean;
+        if (const auto* v = section->Find("lyricsDoubleClickSeek"); v && v->type == dock::json::Value::Type::Bool)
+            r.value.controlCenter.lyricsDoubleClickSeek = v->boolean;
+        if (const auto* v = section->Find("keepArtworkWhenPaused"); v && v->type == dock::json::Value::Type::Bool)
+            r.value.controlCenter.keepArtworkWhenPaused = v->boolean;
+        if (const auto* v = section->Find("localMusicTags"); v && v->type == dock::json::Value::Type::Bool)
+            r.value.controlCenter.localMusicTags = v->boolean;
+        if (const auto* v = section->Find("hideDesktopIconsWithWidgets"); v && v->type == dock::json::Value::Type::Bool)
+            r.value.controlCenter.hideDesktopIconsWithWidgets = v->boolean;
+        using Json = dock::json::Value;
+        if (const auto* entries = section->Find("audioOutputs"); entries && entries->type == Json::Type::Array) {
+            auto& outputs = r.value.controlCenter.audioOutputs;
+            for (const auto& entry : entries->array) {
+                const auto* id = entry.Find("id");
+                if (!id || id->type != Json::Type::String || id->string.empty()) continue;
+                AudioOutputPreference output;
+                output.id = dock::json::FromUtf8(id->string);
+                if (output.id.empty() || std::any_of(outputs.begin(), outputs.end(),
+                    [&](const auto& existing) { return existing.id == output.id; })) continue;
+                if (const auto* name = entry.Find("name"); name && name->type == Json::Type::String)
+                    output.name = dock::json::FromUtf8(name->string);
+                if (const auto* icon = entry.Find("icon"); icon && icon->type == Json::Type::String)
+                    output.icon = icon->string;
+                if (const auto* hidden = entry.Find("hidden"); hidden && hidden->type == Json::Type::Bool)
+                    output.hidden = hidden->boolean;
+                outputs.push_back(std::move(output));
+            }
+        }
+        if(const auto* v=section->Find("lyricsBeat");v&&v->type==dock::json::Value::Type::Bool)r.value.controlCenter.lyricsBeat=v->boolean;
+        if(const auto* v=section->Find("musicFps");v&&v->type==dock::json::Value::Type::Number){const int f=static_cast<int>(v->number);if(f==0||f==30||f==60||f==120||f==240)r.value.controlCenter.musicFps=f;}
+        if(const auto* v=section->Find("lyricsOffsetMs");v&&v->type==dock::json::Value::Type::Number&&v->number>=-3000&&v->number<=3000)r.value.controlCenter.lyricsOffsetMs=static_cast<int>(v->number);
+    }
     if(const auto* section=root.Find("controlCenter")) if(const auto* blur=section->Find("backdropBlur")){
         if(blur->type!=dock::json::Value::Type::Number||!std::isfinite(blur->number)||std::floor(blur->number)!=blur->number||blur->number<0||blur->number>100){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.controlCenter.backdropBlur=static_cast<int>(blur->number);
+    }
+    if(const auto* section=root.Find("appearance")){
+        if(const auto* lang=section->Find("language");lang&&lang->type==dock::json::Value::Type::String&&lang->string=="en")r.value.appearance.language="en";
+        if(const auto* order=section->Find("applicationsSort");order&&order->type==dock::json::Value::Type::Number&&(order->number==1||order->number==2))
+            r.value.appearance.applicationsSort=static_cast<int>(order->number);
+        for(const auto* key:{"settingsScalePercent","applicationsScalePercent"})if(const auto* v=section->Find(key)){
+            const bool settings=std::strcmp(key,"settingsScalePercent")==0;const int lo=settings?75:60,hi=settings?125:120;
+            if(v->type!=dock::json::Value::Type::Number||!std::isfinite(v->number)||std::floor(v->number)!=v->number||v->number<lo||v->number>hi){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
+            (settings?r.value.appearance.settingsScalePercent:r.value.appearance.applicationsScalePercent)=static_cast<int>(v->number);
+        }
     }
     if(const auto* section=root.Find("appearance")) if(const auto* mode=section->Find("mode")){
         if(mode->type!=dock::json::Value::Type::Number || !std::isfinite(mode->number) || std::floor(mode->number)!=mode->number || mode->number<0 || mode->number>2){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
@@ -163,7 +274,9 @@ bool ReadBytes(const std::wstring& path,std::string& bytes,bool& missing) {
 bool Category(const std::string& s){for(const char* c:{"dock","menuBar","launchpad","controlCenter","appearance","taskbar","performance","updates"})if(s==c)return true;return false;}
 std::string Encode(const std::string& s){return dock::json::Write(dock::json::Value::MakeString(s));}
 }
-static SaveStatus WriteScalar(const std::wstring& path,const std::string& section,const std::string& key,const std::string& value,bool boolean) {
+// kind: 0 number, 1 boolean, 2 any JSON value (an existing value of a different kind is still refused for 0 / 1).
+static SaveStatus WriteScalar(const std::wstring& path,const std::string& section,const std::string& key,const std::string& value,int kind) {
+    const bool boolean=kind==1;
     if(path.empty()||!Category(section)||key.empty()||key=="schemaVersion")return SaveStatus::Invalid;
     size_t slash=path.find_last_of(L"\\/");
     if(slash==std::wstring::npos)return SaveStatus::Unavailable;
@@ -189,7 +302,7 @@ static SaveStatus WriteScalar(const std::wstring& path,const std::string& sectio
         if(existing){
             const auto old=bytes.substr(existing->begin,existing->end-existing->begin);
             if(boolean){if(old!="true"&&old!="false")return SaveStatus::Invalid;}
-            else {dock::json::Value parsed;std::string err;if(!dock::json::Parse(old,parsed,err)||parsed.type!=dock::json::Value::Type::Number)return SaveStatus::Invalid;}
+            else if(kind==0){dock::json::Value parsed;std::string err;if(!dock::json::Parse(old,parsed,err)||parsed.type!=dock::json::Value::Type::Number)return SaveStatus::Invalid;}
             if(old==value)return SaveStatus::Saved;
             bytes.replace(existing->begin,existing->end-existing->begin,value);
         }else bytes.insert(found->end-1,(members.empty()?"":",")+insert);
@@ -216,17 +329,77 @@ SaveStatus WritePerformanceInt(const std::wstring& path,const std::string& key,i
  return valid?WriteScalar(path,"performance",key,std::to_string(value),false):SaveStatus::Invalid;
 }
 SaveStatus WriteDockInt(const std::wstring& path,const std::string& key,int value){
- const bool valid=key=="downloadsCount"&&value>=3&&value<=10;
+ const bool valid=(key=="downloadsCount"&&value>=3&&value<=10)||(key=="magnification"&&value>=0&&value<=150)||(key=="iconSizeV2"&&value>=1&&value<=65535)||(key=="statusTileStyle"&&value>=0&&value<=2);
  return valid?WriteScalar(path,"dock",key,std::to_string(value),false):SaveStatus::Invalid;
+}
+bool ValidStatusCell(const std::wstring& id){
+ for(const wchar_t* k:{L"combo",L"analog",L"date",L"digital",L"control",L"wifi",L"bluetooth",L"sound",L"battery",L"input",L"clock",L"tray"})if(id==k)return true;
+ if(id.rfind(L"tray:",0)==0){  // a tray icon kept in the Dock: its tray key "tray:<exe name>#<uid or guid>" (tray_host.h)
+  const size_t hash=id.find(L'#');if(id.size()>200||hash==std::wstring::npos||hash<6||hash+1>=id.size())return false;
+  for(size_t i=5;i<id.size();++i){const wchar_t c=id[i];if(c<0x20||c==L'"'||c==L'\\'||c==L'/'||c==0x7f)return false;}
+  return true;}
+ if(id.rfind(L"ext:",0)!=0||id.size()<5||id.size()>132)return false;
+ for(size_t i=4;i<id.size();++i){const wchar_t c=id[i];if(!(iswalnum(c)||c==L'.'||c==L'-'||c==L'_'))return false;}
+ return true;
+}
+SaveStatus WriteStatusCells(const std::wstring& path,const std::vector<std::wstring>& cells){
+ if(cells.size()>16)return SaveStatus::Invalid;
+ dock::json::Value list;list.type=dock::json::Value::Type::Array;
+ for(size_t i=0;i<cells.size();++i){if(!ValidStatusCell(cells[i])||std::find(cells.begin(),cells.begin()+static_cast<std::ptrdiff_t>(i),cells[i])!=cells.begin()+static_cast<std::ptrdiff_t>(i))return SaveStatus::Invalid;
+  list.array.push_back(dock::json::Value::MakeString(dock::json::ToUtf8(cells[i])));}
+ return WriteScalar(path,"dock","statusCells",dock::json::Write(list,0),2);
+}
+bool ValidTailKey(const std::wstring& key){
+ for(const wchar_t* k:{L"status",L"status:combo",L"status:analog",L"status:date",L"status:digital",L"status:tray",L"downloads",L"trash"})if(key==k)return true;
+ return false;
+}
+SaveStatus WriteTailOrder(const std::wstring& path,const std::vector<std::wstring>& keys){
+ if(keys.size()>8)return SaveStatus::Invalid;
+ dock::json::Value list;list.type=dock::json::Value::Type::Array;
+ for(size_t i=0;i<keys.size();++i){if(!ValidTailKey(keys[i])||std::find(keys.begin(),keys.begin()+static_cast<std::ptrdiff_t>(i),keys[i])!=keys.begin()+static_cast<std::ptrdiff_t>(i))return SaveStatus::Invalid;
+  list.array.push_back(dock::json::Value::MakeString(dock::json::ToUtf8(keys[i])));}
+ return WriteScalar(path,"dock","tailOrder",dock::json::Write(list,0),2);
 }
 SaveStatus WriteDensityInt(const std::wstring& path,const std::string& key,int value){
  const bool valid=(key=="densityPreset"&&value>=0&&value<=3)||(key=="iconSize"&&value>=32&&value<=160)||
                   ((key=="gapX"||key=="gapY")&&value>=0&&value<=240);
  return valid?WriteScalar(path,"launchpad",key,std::to_string(value),false):SaveStatus::Invalid;
 }
+SaveStatus WriteMenuBarScale(const std::wstring& path,int percent){
+ return percent>=80&&percent<=160?WriteScalar(path,"menuBar","scalePercent",std::to_string(percent),false):SaveStatus::Invalid;
+}
+SaveStatus WriteMenuBarInt(const std::wstring& path,const std::string& key,int value){
+ const bool valid=(key=="gradientOpacity"&&value>=0&&value<=100)||(key=="gradientLength"&&value>=40&&value<=100)||(key=="notificationBlur"&&value>=0&&value<=100)||(key=="notificationBlurFade"&&value>=40&&value<=400)||(key=="notificationShade"&&value>=0&&value<=100);
+ return valid?WriteScalar(path,"menuBar",key,std::to_string(value),false):SaveStatus::Invalid;
+}
+SaveStatus WriteAudioOutputs(const std::wstring& path, const std::vector<AudioOutputPreference>& outputs) {
+    using Json = dock::json::Value;
+    Json list;
+    list.type = Json::Type::Array;
+    for (const auto& output : outputs) {
+        auto entry = Json::MakeObject();
+        entry.object.emplace_back("id", Json::MakeString(dock::json::ToUtf8(output.id)));
+        if (!output.name.empty()) entry.object.emplace_back("name", Json::MakeString(dock::json::ToUtf8(output.name)));
+        if (!output.icon.empty()) entry.object.emplace_back("icon", Json::MakeString(output.icon));
+        if (output.hidden) entry.object.emplace_back("hidden", Json::MakeBool(true));
+        list.array.push_back(std::move(entry));
+    }
+    return WriteScalar(path, "controlCenter", "audioOutputs", dock::json::Write(list, 0), 2);
+}
 SaveStatus WriteControlCenterInt(const std::wstring& path,const std::string& key,int value){
- const bool valid=key=="backdropBlur"&&value>=0&&value<=100;
+ const bool shortcut=key=="shortcutLyrics"||key=="shortcutArtwork"||key=="shortcutDesktop"||key=="shortcutNowPlaying";
+ const bool valid=(key=="backdropBlur"&&value>=0&&value<=100)||(shortcut&&value>=0&&value<=0x7FF)||(key=="lyricsOffsetMs"&&value>=-3000&&value<=3000)||(key=="musicFps"&&(value==0||value==30||value==60||value==120||value==240));
  return valid?WriteScalar(path,"controlCenter",key,std::to_string(value),false):SaveStatus::Invalid;
+}
+SaveStatus WriteApplicationsSort(const std::wstring& path,int order){
+ return order>=0&&order<=2?WriteScalar(path,"appearance","applicationsSort",std::to_string(order),false):SaveStatus::Invalid;
+}
+SaveStatus WriteLanguage(const std::wstring& path,const std::string& language){
+ return language=="en"?WriteScalar(path,"appearance","language",Encode(language),false):SaveStatus::Invalid;
+}
+SaveStatus WriteUiScale(const std::wstring& path,const std::string& key,int percent){
+ const bool valid=(key=="settingsScalePercent"&&percent>=75&&percent<=125)||(key=="applicationsScalePercent"&&percent>=60&&percent<=120);
+ return valid?WriteScalar(path,"appearance",key,std::to_string(percent),false):SaveStatus::Invalid;
 }
 SaveStatus WriteTaskbarInt(const std::wstring& path,const std::string& key,int value){
  const bool valid=(key=="hotkeyModifiers"&&value>=0&&value<=7)||(key=="hotkeyKey"&&value>=0&&value<=254);

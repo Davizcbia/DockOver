@@ -2,11 +2,14 @@
 // A separate program from docky (Dock + Menu Bar): installed, started and quit on its own. The two only meet through
 // the extension protocol windows (ext_protocol.h): the Menu Bar's docky menu can open this app's widget gallery,
 // this app's tray icon shows in the Menu Bar's Hidden Icons, and both follow docky's Appearance setting when present.
+#include "../game_compat.h"
+#include "../capture_visible.h"
 #include "canvas.h"
 #include "widgets.h"
 #include "stacks.h"
 #include "glass_window.h"
 #include "calendar_feed.h"
+#include "calendar_config.h"
 #include "devices.h"
 #include "weather.h"
 #include "../ext_protocol.h"
@@ -16,15 +19,20 @@
 #include "../theme_state.h"
 #include "../menu_surface.h"
 #include "../glass_params.h"
+#include "../lab_slider.h"
 #include "../log.h"
 #include "../vblank.h"
+#include "../motion.h"
+#include "../music_wallpaper_frame.h"
 #include <shellapi.h>
+#include <commdlg.h>
 #include <shellscalingapi.h>
 #include <shlobj.h>
 #include <shldisp.h>
 #include <dwmapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <map>
@@ -37,11 +45,16 @@ using dock::json::Value;
 
 namespace {
 constexpr wchar_t kHostClass[] = L"DockyDesktopHostV1", kWidgetClass[] = L"DockyDesktopWidget", kGalleryClass[] = L"DockyDesktopGallery";
-constexpr UINT kTrayMsg = WM_APP + 1, kDataReady = WM_APP + 3, kCalendarReady = WM_APP + 4, kDevicesReady = WM_APP + 5, kWeatherReady = WM_APP + 6;
+constexpr UINT kTrayMsg = WM_APP + 1, kDataReady = WM_APP + 3, kCalendarReady = WM_APP + 4, kDevicesReady = WM_APP + 5, kWeatherReady = WM_APP + 6, kMusicFrame = WM_APP + 20;
+std::atomic<bool> musicFramePending{false};
 constexpr UINT_PTR kTickTimer = 1, kPollTimer = 2, kExitTimer = 3, kDevMenuTimer = 4, kDevMenuShot = 5;
 // Game mode: a full-screen app (game, video, F11 browser) in front covers the widgets, so clocks, system graphs and data
 // polling pause until it leaves (they repaint on the next tick).
+// Games list (Settings > Menu Bar > Game compatibility): a listed program running pauses the widgets too.
+bool gameCompatDesktop = false;
+docky::game::Watcher desktopGameWatch;
 bool FullscreenAppInFront() {
+    if (!desktopGameWatch.Poll(liquid::settings::DefaultPath(), gameCompatDesktop).empty()) return true;
     HWND f = GetForegroundWindow();
     if (!f || !IsWindowVisible(f) || IsIconic(f)) return false;
     DWORD pid = 0, shellPid = 0; GetWindowThreadProcessId(f, &pid); GetWindowThreadProcessId(GetShellWindow(), &shellPid);
@@ -59,6 +72,11 @@ struct WidgetWin {
     HWND hwnd = nullptr;
     std::unique_ptr<Canvas> canvas = std::make_unique<Canvas>();
     ULONGLONG lastPaint = 0;
+    // Wheel scrolling (Calendar, Weather): a spring toward the wheel's target; the painter reports the range.
+    docky::motion::Spring scroll;
+    float scrollMin = 0, scrollMax = 0;
+    ULONGLONG lastScroll = 0;  // after 20 s without scrolling the widget glides back to its normal view
+    double scrollStepAt = 0;
 };
 struct Config {
     std::vector<WidgetWin> widgets;
@@ -120,6 +138,9 @@ void SaveConfig() {
     const auto& pr = CurrentPrefs(); Value pf = Value::MakeObject();
     pf.Set("style", Value::MakeString(pr.style == 1 ? "glass" : "solid")); pf.Set("gap", Value::MakeNumber(pr.gap)); pf.Set("margin", Value::MakeNumber(pr.margin));
     pf.Set("snap", Value::MakeNumber(pr.snap)); pf.Set("glass", Value::MakeNumber(pr.glass)); pf.Set("menuBattery", Value::MakeBool(pr.menuBattery)); pf.Set("fahrenheit", Value::MakeBool(pr.fahrenheit));
+    pf.Set("clockDark", Value::MakeBool(pr.clockDark)); pf.Set("batteryGlass", Value::MakeBool(pr.batteryGlass));
+    pf.Set("glassRim", Value::MakeNumber(pr.glassRim)); pf.Set("glassRefraction", Value::MakeNumber(pr.glassRefraction));
+    pf.Set("glassFrost", Value::MakeNumber(pr.glassFrost)); pf.Set("glassTint", Value::MakeNumber(pr.glassTint));
     auto names = [](const std::vector<std::wstring>& list) { Value a; a.type = Value::Type::Array; for (const auto& n : list) a.array.push_back(Value::MakeString(U(n))); return a; };
     pf.Set("batteryWidgetOff", names(pr.batteryWidgetOff)); pf.Set("batteryMenuOff", names(pr.batteryMenuOff));
     root.Set("widgetPrefs", std::move(pf));
@@ -161,12 +182,15 @@ bool LoadConfig() {
         auto num = [&](const char* k, float& out, float lo, float hi) { if (const Value* v = pf->Find(k); v && v->type == Value::Type::Number) out = std::clamp(static_cast<float>(v->number), lo, hi); };
         if (const Value* v = pf->Find("menuBattery"); v && v->type == Value::Type::Bool) pr.menuBattery = v->boolean;
         if (const Value* v = pf->Find("fahrenheit"); v && v->type == Value::Type::Bool) pr.fahrenheit = v->boolean;
+        if (const Value* v = pf->Find("clockDark"); v && v->type == Value::Type::Bool) pr.clockDark = v->boolean;
+        if (const Value* v = pf->Find("batteryGlass"); v && v->type == Value::Type::Bool) pr.batteryGlass = v->boolean;
         auto names = [&](const char* k, std::vector<std::wstring>& out) {
             if (const Value* v = pf->Find(k); v && v->type == Value::Type::Array)
                 for (const Value& n : v->array) if (n.type == Value::Type::String && out.size() < 64) out.push_back(W(n.string));
         };
         names("batteryWidgetOff", pr.batteryWidgetOff); names("batteryMenuOff", pr.batteryMenuOff);
         num("gap", pr.gap, 8, 32); num("margin", pr.margin, 8, 48); num("snap", pr.snap, 0, 32); num("glass", pr.glass, 0, 1);
+        num("glassRim", pr.glassRim, 0, 1.5f); num("glassRefraction", pr.glassRefraction, 0, 1); num("glassFrost", pr.glassFrost, 0, 1); num("glassTint", pr.glassTint, 0, 1);
     }
     if (const Value* ev = root.Find("extensionSettings"); ev && ev->IsObject())
         for (const auto& [id, o] : ev->object) {
@@ -202,9 +226,12 @@ void PaintWidgetWin(WidgetWin& w) {
         if (!path.empty() && ext->folder.size() && path.find(L':') == std::wstring::npos) path = ext->folder + L"\\" + path;
         if (path != ext->imagePath) { ext->imagePath = path; ext->image.clear(); if (!path.empty()) LoadImageFile(path, 900, ext->image, ext->imageW, ext->imageH); }
     }
-    const Theme content = PaintPlate(rt, shape, screen, theme, LightPlate(w.kind));
+    const Theme content = PaintPlate(rt, shape, screen, theme, PlateToneOf(w.kind));
     rt->PushAxisAlignedClip(shape, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    PaintScroll() = WidgetScroll{Scrollable(w.kind) ? w.scroll.F() : 0.f, w.scrollMin, w.scrollMax};
     PaintWidget(rt, w.kind, w.size, shape, content, ext);
+    if (Scrollable(w.kind)) { w.scrollMin = PaintScroll().min; w.scrollMax = PaintScroll().max; }
+    PaintScroll() = WidgetScroll{};  // other paths (gallery, previews) draw the normal view
     rt->PopAxisAlignedClip();
     if (EditMode()) {  // remove badge (macOS edit mode), near the top-left corner
         ComPtr<ID2D1SolidColorBrush> b; rt->CreateSolidColorBrush(D2D1::ColorF(0.30f, 0.30f, 0.32f, 0.96f), &b);
@@ -297,7 +324,25 @@ struct Drag { HWND h = nullptr; POINT start{}, origin{}; bool moving = false; UL
 docky::vblank::Ticker glideTicker, galleryTicker, settingsTicker;
 struct Glide { HWND h = nullptr; POINT from{}, to{}; LONGLONG start = 0; };
 std::vector<Glide> glides;
-constexpr UINT_PTR kGlideTimer = 7;
+constexpr UINT_PTR kGlideTimer = 7, kScrollTimer = 8;
+double Seconds();
+// One frame of a widget's scroll spring; keeps the timer while it moves.
+void StepScroll(HWND h) {
+    WidgetWin* w = WidgetOf(h);
+    if (!w) { KillTimer(h, kScrollTimer); return; }
+    const double now = Seconds(), dt = std::clamp(now - w->scrollStepAt, 0.0, 0.05);
+    w->scrollStepAt = now;
+    const bool moving = w->scroll.Step(dt);
+    PaintWidgetWin(*w);
+    if (!moving) KillTimer(h, kScrollTimer);
+}
+void ScrollTo(WidgetWin& w, float target) {
+    target = std::clamp(target, w.scrollMin, w.scrollMax);
+    w.scroll.SetSpec(docky::motion::tokens::Scroll);
+    w.scroll.SetTarget(target);
+    w.scrollStepAt = Seconds();
+    SetTimer(w.hwnd, kScrollTimer, 8, nullptr);
+}
 constexpr double kGlideSeconds = 0.24;
 double Seconds() { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER c{}; QueryPerformanceCounter(&c); return static_cast<double>(c.QuadPart) / f.QuadPart; }
 void MoveWidget(WidgetWin& w, POINT p, bool repaint) {
@@ -371,7 +416,16 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         } else OpenBuiltin(w->kind);
         return 0;
     }
-    case WM_TIMER: if (wp == kGlideTimer) StepGlide(h); return 0;
+    case WM_TIMER: if (wp == kGlideTimer) StepGlide(h); else if (wp == kScrollTimer) StepScroll(h); return 0;
+    case WM_MOUSEWHEEL: {  // Calendar and Weather scroll (one notch = 48 DIP; touchpads send finer steps)
+        WidgetWin* w = WidgetOf(h);
+        if (!w || !Scrollable(w->kind) || EditMode() || drag.h) return 0;
+        if (w->scrollMax <= w->scrollMin) { PaintWidgetWin(*w); if (w->scrollMax <= w->scrollMin) return 0; }  // range known after a paint
+        const float delta = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 48.f;
+        w->lastScroll = GetTickCount64();
+        ScrollTo(*w, static_cast<float>(w->scroll.Target()) + delta);
+        return 0;
+    }
     case WM_CAPTURECHANGED:
         if (drag.h == h && drag.moving) {  // capture lost mid-drag: drop where it is
             drag = {};
@@ -646,7 +700,7 @@ void PaintGallery() {
             dc->SetTransform(D2D1::Matrix3x2F::Scale(kPreviewScale, kPreviewScale) * D2D1::Matrix3x2F::Translation(r.left, r.top) * old);
             const D2D1_RECT_F inner = D2D1::RectF(0, 0, s.width, s.height);
             const RECT screen{galleryRect.left + static_cast<LONG>(r.left), galleryRect.top + static_cast<LONG>(r.top), galleryRect.left + static_cast<LONG>(r.right), galleryRect.top + static_cast<LONG>(r.bottom)};
-            const Theme content = PaintPlate(dc, inner, screen, theme, LightPlate(t.kind));
+            const Theme content = PaintPlate(dc, inner, screen, theme, PlateToneOf(t.kind));
             dc->PushAxisAlignedClip(inner, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             PaintWidget(dc, t.kind, t.size, inner, content, FindExt(t.kind));
             dc->PopAxisAlignedClip();
@@ -766,7 +820,8 @@ void OpenGallery() {
 // ---- Widget Settings: a Liquid Glass panel (style, spacing, snap distance, margin, Stacks, calendars) -------------
 GlassWindow settingsWin;
 RECT settingsRect{};
-enum class Ctl { None, Done, Style, Gap, Snap, Margin, Glass, Stacks, Open, Group, Icons, FreeStacks, EditCalendars, RefreshCalendars, MenuBattery, Units, SetCity, RefreshWeather, BatteryWidget, BatteryMenu, ExtSetting };
+enum class Ctl { None, Done, Style, Gap, Snap, Margin, Glass, Stacks, Open, Group, Icons, FreeStacks, EditCalendars, RefreshCalendars, MenuBattery, Units, SetCity, RefreshWeather, BatteryWidget, BatteryMenu, ExtSetting,
+                 CalColour, CalRemove, CalField, CalAdd, CalFile, CalUndo, CalWheel, CalBright, CalSwatch, CalPickerDone, ClockStyle, BatteryGlass, GlassRim, GlassRefraction, GlassFrost, GlassTint };
 struct Control { Ctl id; D2D1_RECT_F rect; int index = 0; bool on = false; };
 std::vector<Control> controls;
 Ctl draggingSlider = Ctl::None;
@@ -811,6 +866,10 @@ SliderSpec Slider(Ctl id) {
     case Ctl::Gap: return {id, 8, 32, &p.gap};
     case Ctl::Snap: return {id, 0, 32, &p.snap};
     case Ctl::Margin: return {id, 8, 48, &p.margin};
+    case Ctl::GlassRim: return {id, 0, 1.5f, &p.glassRim};
+    case Ctl::GlassRefraction: return {id, 0, 1, &p.glassRefraction};
+    case Ctl::GlassFrost: return {id, 0, 1, &p.glassFrost};
+    case Ctl::GlassTint: return {id, 0, 1, &p.glassTint};
     default: return {id, 0, 1, &p.glass};
     }
 }
@@ -827,7 +886,7 @@ void Repack(float oldGap, float oldMargin) {
 // Settings pages: the general page (Widgets & Stacks) and one page per widget that has settings (macOS "Edit
 // Widget"): Weather, Batteries, Calendar, and third-party widgets that declare "settings". A widget's right-click menu
 // opens its own page next to it, so each widget only shows what belongs to it.
-enum class Page { General, Weather, Batteries, Calendar, Ext };
+enum class Page { General, Weather, Batteries, Calendar, Clock, Ext };
 Page settingsPage = Page::General;
 std::wstring settingsExtId;   // Page::Ext: the third-party widget
 HWND settingsAnchor = nullptr;  // the widget the page belongs to (the panel sits beside it)
@@ -835,6 +894,143 @@ ExtWidget* SettingsExt() {
     for (auto& e : extWidgets) if (e.id == settingsExtId) return &e;
     return nullptr;
 }
+// ---- Calendar page: the subscriptions in calendars.txt as a list (colour, name, status, remove) and an Add field ----
+// The file stays the source of truth (it is re-read every paint, so a hand edit shows at once); every change is
+// written back atomically and the feeds are fetched again. Links are shown by host only: they are secret addresses.
+constexpr float kCalRow = 52.f, kCalFieldRow = 44.f;
+namespace calconfig = docky::desk::calconfig;
+calconfig::Config calConfig;               // as last painted (row indexes refer to it)
+std::wstring calField, calError;           // the Add field's text; an inline message under it (empty: the hint)
+bool calFocus = false;                     // the Add field takes the keyboard
+ULONGLONG calCaretStart = 0; bool calCaretOn = true;
+struct CalUndo { bool active = false; size_t index = 0; calconfig::Entry entry; std::wstring name; } calUndo;
+Control settingsPressed{Ctl::None, {}};    // a button held down (drawn pressed; released outside: cancelled)
+bool settingsPressedOut = false;           // the pointer moved off the held button (drawn normal until it returns)
+bool SettingsPressed(Ctl id, int index = 0) { return settingsPressed.id == id && settingsPressed.index == index && !settingsPressedOut; }
+std::wstring ReadWideFile(const std::wstring& path) {
+    std::ifstream f(path, std::ios::binary); std::ostringstream ss; ss << f.rdbuf(); std::string s = ss.str();
+    if (s.size() >= 3 && static_cast<unsigned char>(s[0]) == 0xEF && static_cast<unsigned char>(s[1]) == 0xBB) s.erase(0, 3);
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), nullptr, 0);
+    std::wstring w(static_cast<size_t>((std::max)(0, n)), L'\0');
+    if (n > 0) MultiByteToWideChar(CP_UTF8, 0, s.data(), static_cast<int>(s.size()), w.data(), n);
+    return w;
+}
+void LoadCalConfig() { calConfig = calconfig::Parse(ReadWideFile(CalendarFeeds::ConfigPath())); }
+bool SaveCalConfig() {
+    const std::string text = U(calconfig::Serialize(calConfig));
+    CreateDirectoryW(DataDir().c_str(), nullptr);
+    const std::wstring path = CalendarFeeds::ConfigPath(), temp = path + L".tmp";
+    { std::ofstream f(temp, std::ios::binary | std::ios::trunc); if (!f) return false; f.write(text.data(), static_cast<std::streamsize>(text.size())); if (!f) return false; }
+    if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(temp.c_str()); return false; }
+    Calendars().Refresh();
+    return true;
+}
+const docky::desk::FeedStatus* CalStatus(const std::vector<docky::desk::FeedStatus>& feeds, const std::wstring& source) {
+    for (const auto& f : feeds) if (f.source == source) return &f;
+    return nullptr;
+}
+std::wstring CalName(const std::vector<docky::desk::FeedStatus>& feeds, const calconfig::Entry& e) {
+    const auto* s = CalStatus(feeds, e.source);
+    return s && !s->name.empty() ? s->name : calconfig::ShortName(e.source);
+}
+void CalFocus(bool on) { calFocus = on; calCaretStart = GetTickCount64(); calCaretOn = true; }
+void CalAddText() {
+    const auto r = calconfig::Add(calConfig, calField, [](const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; });
+    calUndo.active = false;
+    switch (r) {
+    case calconfig::AddResult::Empty: CalFocus(true); calError.clear(); return;
+    case calconfig::AddResult::NotCalendar: calError = L"Not an iCal link. It should start with https:// or webcal://"; CalFocus(true); return;
+    case calconfig::AddResult::Duplicate: calError = L"This calendar is already in the list."; CalFocus(true); return;
+    case calconfig::AddResult::Added:
+        if (!SaveCalConfig()) { calConfig.entries.pop_back(); calError = L"Couldn't save calendars.txt."; return; }
+        calField.clear(); calError.clear(); CalFocus(false); return;
+    }
+}
+void CalChooseFile() {
+    wchar_t file[MAX_PATH]{};
+    OPENFILENAMEW ofn{sizeof(ofn)}; ofn.hwndOwner = settingsWin.Hwnd(); ofn.lpstrFilter = L"iCalendar (*.ics)\0*.ics\0All files\0*.*\0";
+    ofn.lpstrFile = file; ofn.nMaxFile = MAX_PATH; ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (!GetOpenFileNameW(&ofn)) return;
+    calField = file; CalAddText();
+}
+void CalPaste() {
+    if (!OpenClipboard(settingsWin.Hwnd())) return;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const auto* p = static_cast<const wchar_t*>(GlobalLock(h))) {
+            std::wstring t = p; GlobalUnlock(h);
+            for (auto& ch : t) if (ch == L'\r' || ch == L'\n' || ch == L'\t') ch = L' ';
+            calField += calconfig::Trim(t);
+            if (calField.size() > 2048) calField.resize(2048);
+        }
+    }
+    CloseClipboard();
+    calError.clear();
+}
+// Colour picker: clicking a calendar's dot opens a colour wheel under its row (hue around, saturation outward), a
+// brightness bar and the preset colours. Dragging previews the colour; it is saved to calendars.txt on release.
+constexpr float kCalPickerH = 168.f, kCalWheelR = 68.f;
+int calPicker = -1;                        // row whose picker is open, -1 none
+Ctl calPickerDrag = Ctl::None;             // CalWheel or CalBright while dragging
+float calH = 0, calS = 1, calV = 1;        // the picked colour (hue 0..360)
+float calPickerTop = 0;                    // where the open picker was last drawn (DIP, settings window)
+unsigned HsvToRgb(float h, float s, float v) {
+    h = std::fmod(std::fmod(h, 360.f) + 360.f, 360.f) / 60.f; s = std::clamp(s, 0.f, 1.f); v = std::clamp(v, 0.f, 1.f);
+    const int i = static_cast<int>(h) % 6; const float f = h - std::floor(h), p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+    float r = v, g = t, b = p;
+    switch (i) { case 1: r = q; g = v; b = p; break; case 2: r = p; g = v; b = t; break; case 3: r = p; g = q; b = v; break; case 4: r = t; g = p; b = v; break; case 5: r = v; g = p; b = q; break; default: break; }
+    auto c = [](float x) { return static_cast<unsigned>(std::lround(std::clamp(x, 0.f, 1.f) * 255.f)); };
+    return (c(r) << 16) | (c(g) << 8) | c(b);
+}
+void RgbToHsv(unsigned rgb, float& h, float& s, float& v) {
+    const float r = ((rgb >> 16) & 255) / 255.f, g = ((rgb >> 8) & 255) / 255.f, b = (rgb & 255) / 255.f;
+    const float mx = (std::max)({r, g, b}), mn = (std::min)({r, g, b}), d = mx - mn;
+    v = mx; s = mx > 0 ? d / mx : 0;
+    if (d <= 0) return;  // grey: keep the previous hue
+    h = mx == r ? 60.f * std::fmod((g - b) / d, 6.f) : mx == g ? 60.f * ((b - r) / d + 2) : 60.f * ((r - g) / d + 4);
+    if (h < 0) h += 360.f;
+}
+D2D1_COLOR_F ColourF(unsigned rgb, float a = 1) { return D2D1::ColorF(((rgb >> 16) & 255) / 255.f, ((rgb >> 8) & 255) / 255.f, (rgb & 255) / 255.f, a); }
+void CalSetPicked(bool save) {
+    if (calPicker < 0 || calPicker >= static_cast<int>(calConfig.entries.size())) return;
+    auto& e = calConfig.entries[static_cast<size_t>(calPicker)];
+    e.hasColour = true; e.colour = HsvToRgb(calH, calS, calV);
+    if (save) SaveCalConfig();
+}
+// The wheel image at the brightness shown (premultiplied BGRA, 2 px per DIP, anti-aliased rim); rebuilt when V changes.
+const std::vector<std::uint32_t>& CalWheelPixels(int size, float v) {
+    static std::vector<std::uint32_t> px; static int builtSize = 0; static float builtV = -1;
+    if (builtSize == size && std::fabs(builtV - v) < 0.002f) return px;
+    builtSize = size; builtV = v; px.assign(static_cast<size_t>(size) * size, 0);
+    const float r = size * 0.5f;
+    for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+        const float dx = x + 0.5f - r, dy = y + 0.5f - r, d = std::sqrt(dx * dx + dy * dy);
+        const float a = std::clamp(r - d, 0.f, 1.f);
+        if (a <= 0) continue;
+        const float hue = std::atan2(-dy, dx) * 57.29578f;
+        const unsigned rgb = HsvToRgb(hue < 0 ? hue + 360.f : hue, (std::min)(1.f, d / r), v);
+        auto ch = [&](int shift) { return static_cast<std::uint32_t>(std::lround(((rgb >> shift) & 255) * a)); };
+        px[static_cast<size_t>(y) * size + x] = (static_cast<std::uint32_t>(std::lround(a * 255)) << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
+    }
+    return px;
+}
+D2D1_POINT_2F CalWheelCentre(float pickerTop) { return D2D1::Point2F(36 + kCalWheelR, pickerTop + 16 + kCalWheelR); }
+D2D1_RECT_F CalBrightBar(float pickerTop, float W) { return D2D1::RectF(200, pickerTop + 40, W - 36, pickerTop + 54); }
+void CalPickAt(Ctl part, D2D1_POINT_2F p, float pickerTop, float W) {
+    if (part == Ctl::CalWheel) {
+        const auto c = CalWheelCentre(pickerTop); const float dx = p.x - c.x, dy = p.y - c.y;
+        const float hue = std::atan2(-dy, dx) * 57.29578f;
+        calH = hue < 0 ? hue + 360.f : hue; calS = (std::min)(1.f, std::sqrt(dx * dx + dy * dy) / kCalWheelR);
+        if (calV < 0.15f) calV = 1;  // picking a hue on a black wheel: show it
+    } else if (part == Ctl::CalBright) {
+        const auto bar = CalBrightBar(pickerTop, W); calV = std::clamp((p.x - bar.left) / (bar.right - bar.left), 0.f, 1.f);
+    }
+    CalSetPicked(false);
+}
+float CalendarPageHeight() {
+    const size_t rows = (std::max<size_t>)(1, calConfig.entries.size());
+    return 62 + 22 + rows * kCalRow + (calPicker >= 0 ? kCalPickerH : 0.f) + 14 + 22 + kCalFieldRow + 6 + 20 + 10 + 28 + 18;
+}
+
 int ExtValue(const ExtWidget& e, const ExtSetting& s) {
     auto it = config.extValues.find(e.id);
     if (it != config.extValues.end()) { auto v = it->second.find(s.key); if (v != it->second.end()) return v->second; }
@@ -843,15 +1039,17 @@ int ExtValue(const ExtWidget& e, const ExtSetting& s) {
 float SettingsHeight() {
     switch (settingsPage) {
     case Page::Weather: return 62 + 22 + 2 * 40.f + 16;
-    case Page::Batteries: return 62 + 22 + 40 + kDeviceRow * static_cast<float>(Devices().Snapshot().size()) + 16;
-    case Page::Calendar: return 62 + 22 + 62 + 16;
+    case Page::Batteries: return 62 + 22 + (CurrentPrefs().batteryGlass ? 4 : 1) * 40.f + 14 + 22 + 40.f + kDeviceRow * static_cast<float>(Devices().Snapshot().size()) + 16;
+    case Page::Clock: return 62 + 22 + 40.f + 16;
+    case Page::Calendar: return CalendarPageHeight();
     case Page::Ext: { const ExtWidget* e = SettingsExt(); return 62 + 22 + 40.f * (std::max)(1, e ? static_cast<int>(e->settings.size()) : 1) + 16; }
-    default: return 62 + 22 + (CurrentPrefs().style == 1 ? 5 : 4) * 40.f + 14 + 22 + 5 * 40.f + 16;
+    default: return 62 + 22 + (CurrentPrefs().style == 1 ? 6 : 5) * 40.f + 14 + 22 + 5 * 40.f + 16;
     }
 }
 std::wstring SettingsTitle() {
     switch (settingsPage) {
     case Page::Weather: return L"Weather";
+    case Page::Clock: return L"Clock";
     case Page::Batteries: return L"Batteries";
     case Page::Calendar: return L"Calendar";
     case Page::Ext: { const ExtWidget* e = SettingsExt(); return e ? (e->title.empty() ? e->id : e->title) : L"Widget"; }
@@ -860,6 +1058,8 @@ std::wstring SettingsTitle() {
 }
 void PaintSettings() {
     if (!settingsWin.Hwnd() || !IsWindowVisible(settingsWin.Hwnd())) return;
+    if (settingsPage == Page::Calendar && calPickerDrag == Ctl::None) LoadCalConfig();  // before the height: one row per calendar (not mid-drag: the preview is unsaved)
+    if (calPicker >= static_cast<int>(calConfig.entries.size())) calPicker = -1;
     const float W = kSetW, H = SettingsHeight();
     controls.clear();
     settingsWin.LocalGlass().active = false;
@@ -915,20 +1115,13 @@ void PaintSettings() {
         };
         auto slider = [&](Ctl id, int row, float top, const wchar_t* unit) {
             const auto s = Slider(id); const float x = W - 30 - 210, x2 = W - 30 - 44, cy = top + row * 40.f + 20;
-            const float t = (*s.value - s.lo) / (s.hi - s.lo), kx = x + (x2 - x) * t;
-            const float th = 6.f * kLabSlider * .5f;  // half the Lab's 6 px track
-            const D2D1_RECT_F track = D2D1::RectF(x, cy - th, x2, cy + th);
-            b->SetColor(gpu || theme.dark ? D2D1::ColorF(0x4B / 255.f, 0x4B / 255.f, 0x4D / 255.f, 1) : D2D1::ColorF(0xDA / 255.f, 0xDA / 255.f, 0xDA / 255.f, 1));
-            dc->FillRoundedRectangle(D2D1::RoundedRect(track, th, th), b.Get());
-            b->SetColor(D2D1::ColorF(0x39 / 255.f, 0x8A / 255.f, 0xF5 / 255.f, 1)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x, cy - th, kx, cy + th), th, th), b.Get());
+            const float t = (*s.value - s.lo) / (s.hi - s.lo);
             const float press = motion ? LabPress(id, 0, now) : 0.f;
-            const dock::GlassParameters lp = dock::ControlLensGlass(30.f * kLabSlider);
-            const float kw = 40.f * kLabSlider * (1.f + (lp.sliderPressWidth - 1.f) * press), kh = 30.f * kLabSlider * (1.f + (lp.sliderPressHeight - 1.f) * press);
-            const D2D1_RECT_F knob = D2D1::RectF(kx - kw * .5f, cy - kh * .5f, kx + kw * .5f, cy + kh * .5f);
-            if (press > .001f && gpu) lens(knob, track, kLabSlider, press);
-            else { b->SetColor(D2D1::ColorF(1, 1, 1, 1)); dc->FillRoundedRectangle(D2D1::RoundedRect(knob, kh * .5f, kh * .5f), b.Get());
-                   b->SetColor(D2D1::ColorF(0, 0, 0, .12f)); dc->DrawRoundedRectangle(D2D1::RoundedRect(knob, kh * .5f, kh * .5f), b.Get(), .7f); }
-            wchar_t v[16]; swprintf_s(v, id == Ctl::Glass ? L"%.0f%%" : L"%.0f%s", id == Ctl::Glass ? *s.value * 100 : *s.value, unit);
+            const auto shape=dock::LabSlider(x,x2,cy,t,kLabSlider,press);
+            dock::DrawLabSlider(dc,b.Get(),shape,gpu||theme.dark,gpu);
+            if(press>.001f&&gpu)lens(shape.thumb,shape.track,kLabSlider,press);
+            const bool percent = id == Ctl::Glass || id == Ctl::GlassRim || id == Ctl::GlassRefraction || id == Ctl::GlassFrost || id == Ctl::GlassTint;
+            wchar_t v[16]; swprintf_s(v, percent ? L"%.0f%%" : L"%.0f%s", percent ? *s.value * 100 : *s.value, unit);
             Text(dc, v, Font(12.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(x2 + 4, cy - 10, W - 28, cy + 10), dim);
             controls.push_back({id, D2D1::RectF(x - 10, cy - 14, x2 + 10, cy + 14)});
         };
@@ -960,20 +1153,21 @@ void PaintSettings() {
             controls.push_back(c);
         };
         auto button = [&](Ctl id, D2D1_RECT_F r, const std::wstring& text, int index = 0) {
-            b->SetColor(D2D1::ColorF(1, 1, 1, 0.16f)); dc->FillRoundedRectangle(D2D1::RoundedRect(r, 12, 12), b.Get());
+            b->SetColor(D2D1::ColorF(1, 1, 1, SettingsPressed(id, index) ? 0.30f : 0.16f)); dc->FillRoundedRectangle(D2D1::RoundedRect(r, 12, 12), b.Get());
             Text(dc, text, Font(12.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), r, ink); controls.push_back({id, r, index});
         };
         const auto& p = CurrentPrefs();
         float top = y;
         switch (settingsPage) {
         case Page::General:
-            section(L"WIDGETS", p.style == 1 ? 5 : 4); top = y;
+            section(L"WIDGETS", p.style == 1 ? 6 : 5); top = y;
             label(L"Style", 0, top); segmented(Ctl::Style, 0, top, {L"Solid", L"Glass"}, p.style);
             label(L"Spacing", 1, top); slider(Ctl::Gap, 1, top, L" pt");
             label(L"Snap distance", 2, top); slider(Ctl::Snap, 2, top, L" pt");
             label(L"Edge margin", 3, top); slider(Ctl::Margin, 3, top, L" pt");
-            if (p.style == 1) { label(L"Glass tint", 4, top); slider(Ctl::Glass, 4, top, L""); }
-            y = top + (p.style == 1 ? 5 : 4) * 40.f + 14;
+            label(L"Edge highlight", 4, top); slider(Ctl::GlassRim, 4, top, L"");  // the liquid glass rim on every widget
+            if (p.style == 1) { label(L"Glass tint", 5, top); slider(Ctl::Glass, 5, top, L""); }
+            y = top + (p.style == 1 ? 6 : 5) * 40.f + 14;
             section(L"STACKS", 5); top = y;
             label(L"Use Stacks", 0, top); toggle(Ctl::Stacks, 0, top, config.stacks);
             label(L"Open stacks", 1, top); segmented(Ctl::Open, 1, top, {L"On Desktop", L"Glass Panel"}, config.style == StackStyle::Panel ? 1 : 0);
@@ -991,8 +1185,23 @@ void PaintSettings() {
             button(Ctl::RefreshWeather, D2D1::RectF(W - 30 - 72, top + 48, W - 30, top + 72), L"Refresh");
             break;
         }
+        case Page::Clock:  // the digital Clock: black digits on white (macOS) or white digits on black
+            section(L"CLOCK", 1); top = y;
+            label(L"Appearance", 0, top); segmented(Ctl::ClockStyle, 0, top, {L"Light", L"Dark"}, p.clockDark ? 1 : 0);
+            break;
         case Page::Batteries: {  // the menu bar switch, then one row per device with a Widget and a Menu Bar checkbox
             const float colWidget = W - 30 - 112, colMenu = W - 30 - 30;  // checkbox centres
+            {   // LIQUID GLASS: the plate as liquid glass over the wallpaper, and how it looks
+                const int rows = p.batteryGlass ? 4 : 1;
+                section(L"LIQUID GLASS", rows); top = y;
+                label(L"Glass background", 0, top); toggle(Ctl::BatteryGlass, 0, top, p.batteryGlass);
+                if (p.batteryGlass) {
+                    label(L"Refraction", 1, top); slider(Ctl::GlassRefraction, 1, top, L"");
+                    label(L"Frost", 2, top); slider(Ctl::GlassFrost, 2, top, L"");
+                    label(L"Tint", 3, top); slider(Ctl::GlassTint, 3, top, L"");
+                }
+                y = top + rows * 40.f + 14;
+            }
             Text(dc, L"DEVICES", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim);
             if (!settingsDevices.empty()) {
                 Text(dc, L"Widget", Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(colWidget - 40, y, colWidget + 40, y + 18), dim);
@@ -1031,13 +1240,140 @@ void PaintSettings() {
             break;
         }
         case Page::Calendar: {
-            section(L"CALENDARS", 1); top = y;
-            const auto events = Calendars().Events();
-            std::wstring status = Calendars().Configured() ? std::to_wstring(events.size()) + L" upcoming events" : L"No calendars added";
-            Text(dc, status, Font(13.f), D2D1::RectF(30, top, 210, top + 40), ink);
-            button(Ctl::EditCalendars, D2D1::RectF(W - 30 - 210, top + 8, W - 30 - 80, top + 32), L"Edit Calendars…");
-            button(Ctl::RefreshCalendars, D2D1::RectF(W - 30 - 72, top + 8, W - 30, top + 32), L"Refresh");
-            Text(dc, L"One iCalendar (.ics) link per line: Outlook, Google, iCloud and Canvas all offer one.", Font(11.f), D2D1::RectF(28, top + 44, W - 24, top + 62), dim);
+            const auto feeds = Calendars().Feeds();
+            const bool fetching = Calendars().Fetching();
+            const D2D1_COLOR_F accent = D2D1::ColorF(0.04f, 0.52f, 1.f, 1), danger = D2D1::ColorF(1.f, 0.27f, 0.23f, 1);
+            const size_t n = calConfig.entries.size();
+            // CALENDARS: one row per subscription. The dot is its colour (click: a colour wheel opens under the row),
+            // the title its own name (or the link's site), the subtitle what the last fetch found; the minus removes
+            // it (with Undo).
+            Text(dc, L"CALENDARS", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
+            const float listH = (std::max<size_t>)(1, n) * kCalRow + (calPicker >= 0 ? kCalPickerH : 0.f);
+            b->SetColor(D2D1::ColorF(1, 1, 1, 0.08f)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(16, y, W - 16, y + listH), 12, 12), b.Get());
+            if (!n) {
+                Text(dc, L"No calendars yet", Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(30, y + 8, W - 30, y + 28), ink);
+                Text(dc, L"Add one below. Its events appear in the Calendar widget.", Font(11.5f), D2D1::RectF(30, y + 27, W - 30, y + 45), dim);
+            }
+            for (size_t i = 0; i < n; ++i) {
+                const auto& e = calConfig.entries[i];
+                const float ry = y + kCalRow * i + (calPicker >= 0 && static_cast<int>(i) > calPicker ? kCalPickerH : 0.f), cy = ry + kCalRow / 2;
+                if (i) { b->SetColor(D2D1::ColorF(1, 1, 1, 0.07f)); dc->FillRectangle(D2D1::RectF(58, ry, W - 16, ry + 1), b.Get()); }
+                const unsigned rgb = calconfig::ColourOf(calConfig, i);
+                const D2D1_COLOR_F col = D2D1::ColorF(((rgb >> 16) & 255) / 255.f, ((rgb >> 8) & 255) / 255.f, (rgb & 255) / 255.f, 1);
+                const bool dotDown = SettingsPressed(Ctl::CalColour, static_cast<int>(i)), open = calPicker == static_cast<int>(i);
+                b->SetColor(col); dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(38, cy), dotDown ? 6.f : 7.f, dotDown ? 6.f : 7.f), b.Get());
+                b->SetColor(open ? D2D1::ColorF(accent.r, accent.g, accent.b, 1) : D2D1::ColorF(1, 1, 1, 0.22f)); dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(38, cy), 9.5f, 9.5f), b.Get(), open ? 2.f : 1.f);
+                controls.push_back({Ctl::CalColour, D2D1::RectF(22, ry + 6, 54, ry + kCalRow - 6), static_cast<int>(i)});
+                const auto* st = CalStatus(feeds, e.source);
+                const bool link = calconfig::IsLink(e.source);
+                const std::wstring title = st && !st->name.empty() ? st->name : calconfig::ShortName(e.source);
+                const std::wstring site = link ? calconfig::ShortName(e.source) : L"File on this PC";
+                std::wstring sub; bool bad = false;
+                if (!st) sub = fetching ? L"Updating…" : L"Waiting to update";
+                else if (!st->ok) { sub = link ? L"Couldn't load this calendar. Check the link." : L"Couldn't read this file."; bad = true; }
+                else sub = (st->name.empty() && link ? L"" : site + L"  ·  ") + (st->events == 1 ? L"1 upcoming event" : std::to_wstring(st->events) + L" upcoming events");
+                Text(dc, title, Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(58, ry + 8, W - 64, ry + 27), ink);
+                Text(dc, sub, Font(11.5f), D2D1::RectF(58, ry + 27, W - 64, ry + 45), bad ? danger : dim);
+                // Remove: a minus in a circle, red while pressed.
+                const D2D1_POINT_2F rc = D2D1::Point2F(W - 30 - 11, cy);
+                const bool rmDown = SettingsPressed(Ctl::CalRemove, static_cast<int>(i));
+                b->SetColor(rmDown ? danger : D2D1::ColorF(1, 1, 1, 0.14f)); dc->FillEllipse(D2D1::Ellipse(rc, 11, 11), b.Get());
+                b->SetColor(rmDown ? D2D1::ColorF(1, 1, 1, 1) : ink); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(rc.x - 5.5f, rc.y - 1, rc.x + 5.5f, rc.y + 1), 1, 1), b.Get());
+                controls.push_back({Ctl::CalRemove, D2D1::RectF(rc.x - 17, ry + 6, rc.x + 17, ry + kCalRow - 6), static_cast<int>(i)});
+                if (!open) continue;
+                // The colour picker under this row.
+                const float pTop = ry + kCalRow; calPickerTop = pTop;
+                b->SetColor(D2D1::ColorF(1, 1, 1, 0.07f)); dc->FillRectangle(D2D1::RectF(30, pTop, W - 30, pTop + 1), b.Get());
+                const unsigned picked = HsvToRgb(calH, calS, calV);
+                {   // the wheel: hue around, saturation from the centre out, at the bar's brightness
+                    const auto c = CalWheelCentre(pTop); const int size = static_cast<int>(kCalWheelR * 4);
+                    const auto& px = CalWheelPixels(size, calV);
+                    ComPtr<ID2D1Bitmap> wheel;
+                    if (SUCCEEDED(dc->CreateBitmap(D2D1::SizeU(size, size), px.data(), size * 4, D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &wheel)))
+                        dc->DrawBitmap(wheel.Get(), D2D1::RectF(c.x - kCalWheelR, c.y - kCalWheelR, c.x + kCalWheelR, c.y + kCalWheelR), 1.f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                    const float rad = calH / 57.29578f, kx = c.x + std::cos(rad) * calS * kCalWheelR, ky = c.y - std::sin(rad) * calS * kCalWheelR;
+                    b->SetColor(ColourF(picked)); dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, ky), 7, 7), b.Get());
+                    b->SetColor(D2D1::ColorF(1, 1, 1, 1)); dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(kx, ky), 7, 7), b.Get(), 2.5f);
+                    b->SetColor(D2D1::ColorF(0, 0, 0, 0.25f)); dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(kx, ky), 8.5f, 8.5f), b.Get(), 1.f);
+                    controls.push_back({Ctl::CalWheel, D2D1::RectF(c.x - kCalWheelR - 6, c.y - kCalWheelR - 6, c.x + kCalWheelR + 6, c.y + kCalWheelR + 6)});
+                }
+                Text(dc, L"Brightness", Font(11.5f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(200, pTop + 16, W - 36, pTop + 34), dim);
+                {   // brightness: black to the full colour
+                    const auto bar = CalBrightBar(pTop, W);
+                    D2D1_GRADIENT_STOP stops[2] = {{0.f, D2D1::ColorF(0, 0, 0, 1)}, {1.f, ColourF(HsvToRgb(calH, calS, 1))}};
+                    ComPtr<ID2D1GradientStopCollection> coll; ComPtr<ID2D1LinearGradientBrush> grad;
+                    if (SUCCEEDED(dc->CreateGradientStopCollection(stops, 2, &coll)) &&
+                        SUCCEEDED(dc->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(D2D1::Point2F(bar.left, 0), D2D1::Point2F(bar.right, 0)), coll.Get(), &grad)))
+                        dc->FillRoundedRectangle(D2D1::RoundedRect(bar, 7, 7), grad.Get());
+                    const float kx = bar.left + (bar.right - bar.left) * calV, kc = (bar.top + bar.bottom) / 2;
+                    b->SetColor(D2D1::ColorF(1, 1, 1, 1)); dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, kc), 9, 9), b.Get());
+                    b->SetColor(ColourF(picked)); dc->FillEllipse(D2D1::Ellipse(D2D1::Point2F(kx, kc), 6, 6), b.Get());
+                    controls.push_back({Ctl::CalBright, D2D1::RectF(bar.left - 10, bar.top - 10, bar.right + 10, bar.bottom + 10)});
+                }
+                for (int k = 0; k < 8; ++k) {  // the preset colours
+                    const D2D1_POINT_2F sc = D2D1::Point2F(211 + k * 28.f, pTop + 86);
+                    const bool same = calconfig::kPalette[k] == picked;
+                    b->SetColor(ColourF(calconfig::kPalette[k])); dc->FillEllipse(D2D1::Ellipse(sc, 10, 10), b.Get());
+                    if (same) { b->SetColor(D2D1::ColorF(1, 1, 1, 0.9f)); dc->DrawEllipse(D2D1::Ellipse(sc, 13, 13), b.Get(), 2.f); }
+                    controls.push_back({Ctl::CalSwatch, D2D1::RectF(sc.x - 14, sc.y - 14, sc.x + 14, sc.y + 14), k});
+                }
+                {   // the result and Done
+                    b->SetColor(ColourF(picked)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(200, pTop + 116, 228, pTop + 144), 8, 8), b.Get());
+                    wchar_t hex[16]; swprintf_s(hex, L"#%06X", picked);
+                    Text(dc, hex, Font(12.5f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(238, pTop + 116, 330, pTop + 144), ink);
+                    const D2D1_RECT_F doneBtn = D2D1::RectF(W - 36 - 64, pTop + 116, W - 36, pTop + 144);
+                    const bool down = SettingsPressed(Ctl::CalPickerDone);
+                    b->SetColor(D2D1::ColorF(accent.r * (down ? .8f : 1.f), accent.g * (down ? .8f : 1.f), accent.b * (down ? .85f : 1.f), 1));
+                    dc->FillRoundedRectangle(D2D1::RoundedRect(doneBtn, 8, 8), b.Get());
+                    Text(dc, L"Done", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), doneBtn, D2D1::ColorF(1, 1, 1, 1));
+                    controls.push_back({Ctl::CalPickerDone, doneBtn});
+                }
+            }
+            y += listH + 14;
+            // ADD CALENDAR: a field for a pasted link (Enter adds it) and Add; the line under it is the hint, or what
+            // went wrong, or Undo after a removal.
+            Text(dc, L"ADD CALENDAR", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
+            b->SetColor(D2D1::ColorF(1, 1, 1, 0.08f)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(16, y, W - 16, y + kCalFieldRow), 12, 12), b.Get());
+            const D2D1_RECT_F field = D2D1::RectF(26, y + 8, W - 30 - 64, y + kCalFieldRow - 8), add = D2D1::RectF(W - 30 - 56, y + 8, W - 26, y + kCalFieldRow - 8);
+            b->SetColor(D2D1::ColorF(1, 1, 1, calFocus ? 0.14f : 0.09f)); dc->FillRoundedRectangle(D2D1::RoundedRect(field, 8, 8), b.Get());
+            if (calFocus) { b->SetColor(D2D1::ColorF(accent.r, accent.g, accent.b, 0.9f)); dc->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(field.left - 1, field.top - 1, field.right + 1, field.bottom + 1), 9, 9), b.Get(), 2.f); }
+            controls.push_back({Ctl::CalField, field});
+            {
+                IDWriteTextFormat* f = Font(12.5f, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+                const float tx = field.left + 10, room = field.right - 10 - tx;
+                std::wstring shown = calField;
+                if (!shown.empty() && TextWidth(shown, f) > room) {  // the end of a long link stays in view
+                    size_t lo = 0, hi = shown.size();
+                    while (lo < hi) { const size_t mid = (lo + hi) / 2; if (TextWidth(L"…" + calField.substr(mid), f) > room) lo = mid + 1; else hi = mid; }
+                    shown = L"…" + calField.substr(lo);
+                }
+                if (shown.empty()) Text(dc, L"Paste an iCal link (https:// or webcal://)", Font(12.5f), D2D1::RectF(tx, field.top, field.right - 8, field.bottom), dim);
+                else Text(dc, shown, f, D2D1::RectF(tx, field.top, field.right - 4, field.bottom), ink);
+                if (calFocus && calCaretOn) {
+                    const float cx = tx + (shown.empty() ? 0.f : TextWidth(shown, f)) + 1;
+                    b->SetColor(accent); dc->FillRectangle(D2D1::RectF(cx, field.top + 6, cx + 1.5f, field.bottom - 6), b.Get());
+                }
+            }
+            const bool canAdd = !calconfig::Trim(calField).empty(), addDown = SettingsPressed(Ctl::CalAdd);
+            b->SetColor(canAdd ? D2D1::ColorF(accent.r * (addDown ? .8f : 1.f), accent.g * (addDown ? .8f : 1.f), accent.b * (addDown ? .85f : 1.f), 1) : D2D1::ColorF(1, 1, 1, addDown ? 0.22f : 0.12f));
+            dc->FillRoundedRectangle(D2D1::RoundedRect(add, 8, 8), b.Get());
+            Text(dc, L"Add", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), add, canAdd ? D2D1::ColorF(1, 1, 1, 1) : dim);
+            controls.push_back({Ctl::CalAdd, add});
+            y += kCalFieldRow + 6;
+            if (calUndo.active) {
+                Text(dc, L"Removed “" + calUndo.name + L"”.", Font(11.5f), D2D1::RectF(28, y, W - 100, y + 20), dim);
+                const D2D1_RECT_F undo = D2D1::RectF(W - 30 - 56, y, W - 26, y + 20);
+                Text(dc, L"Undo", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), undo, SettingsPressed(Ctl::CalUndo) ? dim : accent);
+                controls.push_back({Ctl::CalUndo, D2D1::RectF(undo.left - 8, undo.top - 4, undo.right + 4, undo.bottom + 4)});
+            } else if (!calError.empty()) Text(dc, calError, Font(11.5f), D2D1::RectF(28, y, W - 24, y + 20), danger);
+            else Text(dc, L"Outlook, Google, iCloud and Canvas each offer a private iCal link.", Font(11.5f), D2D1::RectF(28, y, W - 24, y + 20), dim);
+            y += 20 + 10;
+            // Footer: a local .ics file, what the widget shows, and Refresh.
+            button(Ctl::CalFile, D2D1::RectF(16, y, 16 + 128, y + 28), L"Choose .ics File…");
+            const size_t upcoming = Calendars().Events().size();
+            const std::wstring status = fetching ? L"Updating…" : n ? (upcoming == 1 ? L"1 upcoming" : std::to_wstring(upcoming) + L" upcoming") : L"";
+            Text(dc, status, Font(11.5f, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_TEXT_ALIGNMENT_TRAILING), D2D1::RectF(150, y, W - 16 - 88, y + 28), dim);
+            button(Ctl::RefreshCalendars, D2D1::RectF(W - 16 - 80, y, W - 16, y + 28), L"Refresh");
             break;
         }
         case Page::Ext: {
@@ -1064,11 +1400,12 @@ void SetSlider(Ctl id, float x) {
     const auto s = Slider(id); const float x0 = kSetW - 30 - 210, x1 = kSetW - 30 - 44;
     const float oldGap = CurrentPrefs().gap, oldMargin = CurrentPrefs().margin;
     float v = s.lo + (s.hi - s.lo) * std::clamp((x - x0) / (x1 - x0), 0.f, 1.f);
-    if (id != Ctl::Glass) v = std::round(v);
+    if (id == Ctl::Gap || id == Ctl::Snap || id == Ctl::Margin) v = std::round(v);
     if (v == *s.value) return;
     *s.value = v;
     if (id == Ctl::Gap || id == Ctl::Margin) Repack(oldGap, oldMargin);
-    if (id == Ctl::Glass) RepaintAll();
+    if (id == Ctl::Glass || id == Ctl::GlassRim) RepaintAll();
+    if (id == Ctl::GlassRefraction || id == Ctl::GlassFrost || id == Ctl::GlassTint) for (auto& wdg : config.widgets) if (wdg.kind == L"battery") PaintWidgetWin(wdg);
     PaintSettings();
 }
 // A third-party setting changed: tell its app (widget.setting) or re-run its manifest command with the new values.
@@ -1082,7 +1419,7 @@ void SendExtSetting(const ExtWidget& e, const ExtSetting& s, int value) {
 }
 bool IsLabSwitch(const Control& c) {
     switch (c.id) {
-    case Ctl::Stacks: case Ctl::Icons: case Ctl::FreeStacks: case Ctl::MenuBattery: case Ctl::BatteryWidget: case Ctl::BatteryMenu: return true;
+    case Ctl::Stacks: case Ctl::Icons: case Ctl::FreeStacks: case Ctl::MenuBattery: case Ctl::BatteryGlass: case Ctl::BatteryWidget: case Ctl::BatteryMenu: return true;
     case Ctl::ExtSetting: { const ExtWidget* e = SettingsExt(); const int row = c.index / 64;
         return e && row >= 0 && row < static_cast<int>(e->settings.size()) && e->settings[static_cast<size_t>(row)].type == "toggle"; }
     default: return false;
@@ -1090,9 +1427,13 @@ bool IsLabSwitch(const Control& c) {
 }
 void ActivateControl(const Control& c);
 void SettingsClick(D2D1_POINT_2F p, bool down) {
+    if (down && calFocus) {  // a press anywhere but the field ends typing (the field itself keeps it)
+        bool onField = false; for (const auto& c : controls) if (c.id == Ctl::CalField && In(c.rect, p)) onField = true;
+        if (!onField) { CalFocus(false); PaintSettings(); }
+    }
     for (const auto& c : controls) {
         if (!In(c.rect, p)) continue;
-        if (c.id == Ctl::Gap || c.id == Ctl::Snap || c.id == Ctl::Margin || c.id == Ctl::Glass) {
+        if (c.id == Ctl::Gap || c.id == Ctl::Snap || c.id == Ctl::Margin || c.id == Ctl::Glass || c.id == Ctl::GlassRim || c.id == Ctl::GlassRefraction || c.id == Ctl::GlassFrost || c.id == Ctl::GlassTint) {
             if (down) { draggingSlider = c.id; labPointer = p; LabBeginPress(Control{c.id, c.rect, 0}, true); SetCapture(settingsWin.Hwnd()); SetSlider(c.id, p.x); }
             return;
         }
@@ -1101,10 +1442,21 @@ void SettingsClick(D2D1_POINT_2F p, bool down) {
                         LabBeginPress(c, true); SetCapture(settingsWin.Hwnd()); PaintSettings(); }
             return;
         }
-        if (down) return;
-        ActivateControl(c);
+        if (c.id == Ctl::CalField) { if (down) { CalFocus(true); SetForegroundWindow(settingsWin.Hwnd()); PaintSettings(); } return; }
+        if (c.id == Ctl::CalWheel || c.id == Ctl::CalBright) {  // drag the colour; saved on release
+            if (down) { calPickerDrag = c.id; SetCapture(settingsWin.Hwnd()); CalPickAt(c.id, p, calPickerTop, kSetW); PaintSettings(); }
+            return;
+        }
+        // Buttons look pressed the moment they are pressed and act on release over them (released elsewhere: nothing).
+        if (down) { settingsPressed = c; settingsPressedOut = false; SetCapture(settingsWin.Hwnd()); PaintSettings(); }
         return;
     }
+}
+void SettingsRelease(D2D1_POINT_2F p) {
+    const Control c = settingsPressed;
+    settingsPressed = Control{Ctl::None, {}};
+    if (GetCapture() == settingsWin.Hwnd()) ReleaseCapture();
+    if (In(c.rect, p)) ActivateControl(c); else PaintSettings();
 }
 // Mouse-up on a pressed Lab switch: a click toggles it; a drag sets the side the thumb was dropped on.
 void LabSwitchRelease(D2D1_POINT_2F p) {
@@ -1131,6 +1483,8 @@ void ActivateControl(const Control& c) {
         case Ctl::Group: config.by = c.index ? GroupBy::Date : GroupBy::Kind; GetStacks().SetGroupBy(config.by); break;
         case Ctl::Icons: config.hideIcons = !config.hideIcons; HideDesktopIcons(config.stacks && config.hideIcons); break;
         case Ctl::FreeStacks: config.freeStacks = !config.freeStacks; GetStacks().SetFreePlacement(config.freeStacks); break;
+        case Ctl::ClockStyle: CurrentPrefs().clockDark = c.index == 1; for (auto& wdg : config.widgets) if (wdg.kind == L"clock") PaintWidgetWin(wdg); break;
+        case Ctl::BatteryGlass: CurrentPrefs().batteryGlass = !CurrentPrefs().batteryGlass; for (auto& wdg : config.widgets) if (wdg.kind == L"battery") PaintWidgetWin(wdg); break;
         case Ctl::Units: CurrentPrefs().fahrenheit = c.index == 1; WeatherService().SetFahrenheit(CurrentPrefs().fahrenheit); break;
         case Ctl::SetCity: ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + Weather::CityPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL); return;
         case Ctl::RefreshWeather: WeatherService().Refresh(); return;
@@ -1146,7 +1500,33 @@ void ActivateControl(const Control& c) {
             break;
         }
         case Ctl::EditCalendars: ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + CalendarFeeds::ConfigPath() + L"\"").c_str(), nullptr, SW_SHOWNORMAL); return;
-        case Ctl::RefreshCalendars: Calendars().Refresh(); return;
+        case Ctl::RefreshCalendars: Calendars().Refresh(); PaintSettings(); return;
+        case Ctl::CalAdd: CalAddText(); PaintSettings(); return;
+        case Ctl::CalFile: CalChooseFile(); PaintSettings(); return;
+        case Ctl::CalColour:
+            if (c.index < 0 || c.index >= static_cast<int>(calConfig.entries.size())) return;
+            if (calPicker == c.index) calPicker = -1;
+            else { calPicker = c.index; RgbToHsv(calconfig::ColourOf(calConfig, static_cast<size_t>(c.index)), calH, calS, calV); }
+            PaintSettings(); return;
+        case Ctl::CalSwatch:
+            if (c.index < 0 || c.index >= 8) return;
+            RgbToHsv(calconfig::kPalette[c.index], calH, calS, calV); CalSetPicked(true); PaintSettings(); return;
+        case Ctl::CalPickerDone: calPicker = -1; PaintSettings(); return;
+        case Ctl::CalRemove: {
+            if (c.index < 0 || c.index >= static_cast<int>(calConfig.entries.size())) return;
+            const size_t i = static_cast<size_t>(c.index);
+            const CalUndo undo{true, i, calConfig.entries[i], CalName(Calendars().Feeds(), calConfig.entries[i])};
+            calconfig::Remove(calConfig, i); calPicker = -1;
+            if (SaveCalConfig()) { calUndo = undo; calError.clear(); } else { calError = L"Couldn't save calendars.txt."; }
+            PaintSettings(); return;
+        }
+        case Ctl::CalUndo:
+            if (calUndo.active && calconfig::Find(calConfig, calUndo.entry.source) < 0) {
+                const size_t at = (std::min)(calUndo.index, calConfig.entries.size());
+                calConfig.entries.insert(calConfig.entries.begin() + static_cast<std::ptrdiff_t>(at), calUndo.entry);
+                SaveCalConfig();
+            }
+            calUndo.active = false; PaintSettings(); return;
         case Ctl::ExtSetting: {
             ExtWidget* e = SettingsExt();
             const int row = c.index / 64, option = c.index % 64;
@@ -1169,7 +1549,12 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_LBUTTONDOWN: SettingsClick(p, true); return 0;
     case WM_MOUSEMOVE:
-        if (draggingSlider != Ctl::None && (w & MK_LBUTTON)) { labPointer = p; SetSlider(draggingSlider, p.x); }
+        if (settingsPressed.id != Ctl::None && (w & MK_LBUTTON)) {
+            const bool out = !In(settingsPressed.rect, p);
+            if (out != settingsPressedOut) { settingsPressedOut = out; PaintSettings(); }
+        }
+        else if (draggingSlider != Ctl::None && (w & MK_LBUTTON)) { labPointer = p; SetSlider(draggingSlider, p.x); }
+        else if (calPickerDrag != Ctl::None && (w & MK_LBUTTON)) { CalPickAt(calPickerDrag, p, calPickerTop, kSetW); PaintSettings(); }
         else if (labDown && IsLabSwitch(labPressed) && (w & MK_LBUTTON)) {
             labPointer = p;
             const float travel = (116.f - 74.f - 6.f) * kLabSwitch;
@@ -1179,19 +1564,41 @@ LRESULT CALLBACK SettingsProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     case WM_LBUTTONUP:
+        if (calPickerDrag != Ctl::None) { const Ctl part = calPickerDrag; CalPickAt(part, p, calPickerTop, kSetW); calPickerDrag = Ctl::None; ReleaseCapture(); CalSetPicked(true); PaintSettings(); return 0; }
         if (draggingSlider != Ctl::None) { const Ctl id = draggingSlider; draggingSlider = Ctl::None; ReleaseCapture(); LabBeginPress(Control{id, {}, 0}, false); SaveConfig(); PaintSettings(); return 0; }
         if (labDown && IsLabSwitch(labPressed)) { LabSwitchRelease(p); return 0; }
+        if (settingsPressed.id != Ctl::None) { SettingsRelease(p); return 0; }
         SettingsClick(p, false); return 0;
+    case WM_CHAR:  // the Add Calendar field
+        if (!calFocus || settingsPage != Page::Calendar) return 0;
+        if (w == 0x16) CalPaste();                                   // Ctrl+V
+        else if (w == L'\r') CalAddText();                            // Enter adds
+        else if (w == 0x08) { if (!calField.empty()) calField.pop_back(); calError.clear(); }
+        else if (w == 0x7F) { calField.clear(); calError.clear(); }  // Ctrl+Backspace clears
+        else if (w >= 32 && calField.size() < 2048) { calField += static_cast<wchar_t>(w); calError.clear(); }
+        else return 0;
+        calCaretStart = GetTickCount64(); calCaretOn = true; PaintSettings(); return 0;
     case WM_CAPTURECHANGED:
+        if (calPickerDrag != Ctl::None && reinterpret_cast<HWND>(l) != h) { calPickerDrag = Ctl::None; CalSetPicked(true); PaintSettings(); return 0; }
+        if (settingsPressed.id != Ctl::None && reinterpret_cast<HWND>(l) != h) { settingsPressed = Control{Ctl::None, {}}; PaintSettings(); return 0; }
         if (labDown && IsLabSwitch(labPressed) && reinterpret_cast<HWND>(l) != h) { labDragging = false; LabBeginPress(labPressed, false); PaintSettings(); }
         return 0;
     case WM_KEYDOWN:
-        if (w == VK_ESCAPE) { settingsWin.Hide(); SaveConfig(); }
+        if (w == VK_ESCAPE && calFocus && settingsPage == Page::Calendar) {  // first Esc leaves the field, the next closes
+            if (!calField.empty()) calField.clear(); else CalFocus(false);
+            calError.clear(); PaintSettings();
+        }
+        else if (w == VK_INSERT && (GetKeyState(VK_SHIFT) & 0x8000) && calFocus && settingsPage == Page::Calendar) { CalPaste(); PaintSettings(); }
+        else if (w == VK_ESCAPE) { settingsWin.Hide(); SaveConfig(); }
         else if (w == VK_F9 && !DevPngDir().empty()) { settingsWin.RequestSnapshot(DevPngDir() + L"\\settings-pressed.bmp"); PaintSettings(); }  // development
         (void)h; return 0;
     case WM_TIMER:  // every frame: what is behind the panel shows through; only the glass is redrawn (content cache)
         if (!settingsWin.Visible()) { KillTimer(h, 1); settingsTicker.Stop(); return 0; }
         if (LabAnimating()) { PaintSettings(); return 0; }  // a Glass Lab thumb is moving or changing size
+        if (calFocus && settingsPage == Page::Calendar) {  // the field's caret blinks (on 530 ms, off 530 ms)
+            const bool on = ((GetTickCount64() - calCaretStart) / 530) % 2 == 0;
+            if (on != calCaretOn) { calCaretOn = on; PaintSettings(); return 0; }
+        }
         if (labPressed.id != Ctl::None && !labDown) { labPressed = Control{Ctl::None, {}}; PaintSettings(); return 0; }  // release finished
         if (draggingSlider == Ctl::None && settingsWin.GlassChanged()) {
             if (!DevPngDir().empty()) settingsWin.RequestSnapshot(DevPngDir() + L"\\settings-retuned.bmp");
@@ -1208,6 +1615,8 @@ void OpenSettingsPage(Page page, const std::wstring& extId, HWND anchor) {
     if (!settingsWin.Hwnd() && !settingsWin.Create(L"DockyDesktopSettings", SettingsProc, WS_EX_TOPMOST, false)) return;
     settingsWin.SetFrosted(true); settingsWin.SetLiveBackdrop(true);
     settingsPage = page; settingsExtId = extId; settingsAnchor = anchor;
+    settingsPressed = Control{Ctl::None, {}}; calField.clear(); calError.clear(); calUndo.active = false;
+    if (page == Page::Calendar) { LoadCalConfig(); CalFocus(calConfig.entries.empty()); } else CalFocus(false);  // empty: ready to paste
     RECT ar{};
     const bool anchored = anchor && IsWindow(anchor) && GetWindowRect(anchor, &ar);
     const POINT ref = anchored ? POINT{(ar.left + ar.right) / 2, (ar.top + ar.bottom) / 2} : POINT{0, 0};
@@ -1237,6 +1646,7 @@ void OpenSettings() { OpenSettingsPage(Page::General, L"", nullptr); }
 // The page a widget's "Edit" item opens; false when the widget has no settings of its own.
 bool WidgetPage(const WidgetWin& w, Page& page, std::wstring& extId) {
     if (w.kind == L"weather") { page = Page::Weather; return true; }
+    if (w.kind == L"clock") { page = Page::Clock; return true; }
     if (w.kind == L"battery") { page = Page::Batteries; return true; }
     if (w.kind == L"calendar") { page = Page::Calendar; return true; }
     if (w.kind.rfind(L"ext:", 0) == 0) {
@@ -1480,6 +1890,27 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (ForwardShellMenuMessage(m, w, l, forwarded)) return forwarded;
     if (taskbarCreated && m == taskbarCreated) { trayAdded = false; AddTray(); return 0; }
     if (hostStarted && m == hostStarted) { UpdateBatteryItem(); return 0; }  // the Menu Bar (re)started
+    // Manager shortcut (Settings > Control Center): hide every visible window of this program except the host, or
+    // show the ones hidden that way again.
+    static const UINT toggleVisible = RegisterWindowMessageW(L"DockyDesktopToggleVisible");
+    if (m == toggleVisible) {
+        // Widgets and Stacks (the desktop's files) always go together; Windows' own desktop icons follow when
+        // Settings > Music > Hide desktop icons too is on (default).
+        static std::vector<HWND> hidden; static bool hiddenNow = false;
+        if (hiddenNow) {
+            for (HWND hw : hidden) if (IsWindow(hw)) ShowWindow(hw, SW_SHOWNA);
+            hidden.clear(); hiddenNow = false; HideDesktopIconsForShortcut(false); return 0;
+        }
+        hiddenNow = true;
+        if (liquid::settings::Load(liquid::settings::DefaultPath()).value.controlCenter.hideDesktopIconsWithWidgets) HideDesktopIconsForShortcut(true);
+        struct Ctx { HWND host; std::vector<HWND>* out; } ctx{h, &hidden};
+        EnumWindows([](HWND w, LPARAM l) -> BOOL {
+            auto* c = reinterpret_cast<Ctx*>(l); DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+            if (pid == GetCurrentProcessId() && w != c->host && IsWindowVisible(w)) { ShowWindow(w, SW_HIDE); c->out->push_back(w); }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+        return 0;
+    }
     switch (m) {
     case WM_COPYDATA: {
         std::string json; if (!docky::ext::ReadJson(l, json)) return 0;
@@ -1518,6 +1949,12 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
         }
         return 0;
+    case kMusicFrame:  // the music wallpaper published a frame: glass widgets follow it now, not on the next tick
+        musicFramePending = false;
+        if (Wallpaper::Get().RefreshMusic())
+            for (auto& wdg : config.widgets)
+                if (CurrentPrefs().style == 1 || PlateToneOf(wdg.kind) == PlateTone::Glass) PaintWidgetWin(wdg);
+        return 0;
     case kWeatherReady:
         for (auto& wdg : config.widgets) if (wdg.kind == L"weather") PaintWidgetWin(wdg);
         RefreshGallery(); RefreshSettings(); return 0;
@@ -1541,11 +1978,18 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if ((w == kTickTimer || w == kPollTimer) && FullscreenAppInFront()) return 0;  // game mode: widgets are covered
         if (w == kTickTimer) {
             const ULONGLONG now = GetTickCount64();
-            for (auto& wdg : config.widgets) if (now - wdg.lastPaint + 20 >= RefreshMs(wdg.kind)) PaintWidgetWin(wdg);
+            const bool musicChanged = Wallpaper::Get().RefreshMusic();
+            for (auto& wdg : config.widgets) {
+                const bool glassChanged = musicChanged && (CurrentPrefs().style == 1 || PlateToneOf(wdg.kind) == PlateTone::Glass);
+                if (glassChanged || now - wdg.lastPaint + 20 >= RefreshMs(wdg.kind)) PaintWidgetWin(wdg);
+                // Back to the normal view (today, current weather) 20 s after the last scroll.
+                if (wdg.lastScroll && now - wdg.lastScroll > 20000 && std::fabs(wdg.scroll.Target()) > 0.5) { wdg.lastScroll = 0; ScrollTo(wdg, 0); }
+            }
         } else if (w == kPollTimer) {
             SampleSystem();
+            if (Wallpaper::Get().Stale()) { Wallpaper::Get().Invalidate(); RepaintAll(); GetStacks().Relayout(); }  // new wallpaper, no broadcast
             const auto rev = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
-            if (rev != themeRevision) { themeRevision = rev; ThemeChanged(); const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value.performance; docky::vblank::SetCaps(pf.animationFps, pf.captureFps); }
+            if (rev != themeRevision) { themeRevision = rev; ThemeChanged(); const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
             static int ticks = 0;
             if (++ticks % 5 == 0) {
                 ReloadManifests();
@@ -1572,7 +2016,7 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_DESTROY:
         CloseGallery(); Calendars().Stop(); Devices().Stop(); WeatherService().Stop();
-        RemoveBatteryItems(); liquid::popup::Close(); RemoveTray(); GetStacks().Stop(); HideDesktopIcons(false);
+        RemoveBatteryItems(); liquid::popup::Close(); RemoveTray(); GetStacks().Stop(); HideDesktopIconsForShortcut(false); HideDesktopIcons(false);
         for (auto& wdg : config.widgets) if (wdg.hwnd) { UnregisterLayer(wdg.hwnd); DestroyWindow(wdg.hwnd); wdg.hwnd = nullptr; }
         PostQuitMessage(0); return 0;
     }
@@ -1602,17 +2046,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         std::wstring target = list && n >= 3 ? a[2] : L"";
         const bool a2render = a && n >= 5 && std::wstring(a[1]) == L"--render-widget";
         const std::wstring renderKind = a2render ? a[2] : L"", renderSize = a2render ? a[3] : L"", renderOut = a2render ? a[4] : L"";
+        if (a2render && n >= 6) { DevCalendar() = a[5]; for (auto& c : DevCalendar()) if (c == L'|') c = L'\n'; }  // optional test feeds ("a.ics #RRGGBB|b.ics"), not calendars.txt
         if (a) LocalFree(a);
         if (a2render) {  // --render-widget <kind> <small|medium|large> <out.png>: one widget, offscreen (diagnostics)
             CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
             Devices().Start(nullptr, 0); Calendars().Start(nullptr, 0); WeatherService().SetFahrenheit(CurrentPrefs().fahrenheit); WeatherService().Start(nullptr, 0);
             SampleSystem(); Sleep(renderKind == L"weather" ? 6000 : 800); SampleSystem();
+            LoadConfig();  // widget preferences (clock style, battery glass, plate style) as the running Desktop uses them
+            { wchar_t local[MAX_PATH]{}; if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(local) + L"\\LiquidDock\\glass.json"); }
             theme = CurrentTheme();
             const Size size = ParseSize(U(renderSize)); const auto sz = SizeDip(size);
             Canvas canvas; ID2D1RenderTarget* rt = canvas.Begin(static_cast<int>(sz.width + 2 * kShadow), static_cast<int>(sz.height + 2 * kShadow), 96);
             if (rt) {
                 const D2D1_RECT_F shape = D2D1::RectF(kShadow, kShadow, kShadow + sz.width, kShadow + sz.height);
-                const Theme content = PaintPlate(rt, shape, RECT{0, 0, static_cast<LONG>(sz.width), static_cast<LONG>(sz.height)}, theme, LightPlate(renderKind));
+                const Theme content = PaintPlate(rt, shape, RECT{0, 0, static_cast<LONG>(sz.width), static_cast<LONG>(sz.height)}, theme, PlateToneOf(renderKind));
+                {   // development: DOCKOVER_WIDGET_SCROLL=<DIP> renders a scrolled view (clamped by the painter's range)
+                    wchar_t v[32]{};
+                    if (GetEnvironmentVariableW(L"DOCKOVER_WIDGET_SCROLL", v, 32)) { PaintScroll() = WidgetScroll{0, -1e6f, 1e6f}; PaintWidget(rt, renderKind, size, shape, content, nullptr);
+                        const float off = std::clamp(static_cast<float>(_wtof(v)), PaintScroll().min, PaintScroll().max); canvas.End(nullptr, POINT{}); rt = canvas.Begin(static_cast<int>(sz.width + 2 * kShadow), static_cast<int>(sz.height + 2 * kShadow), 96);
+                        PaintPlate(rt, shape, RECT{0, 0, static_cast<LONG>(sz.width), static_cast<LONG>(sz.height)}, theme, PlateToneOf(renderKind)); PaintScroll() = WidgetScroll{off, 0, 0}; }
+                }
                 PaintWidget(rt, renderKind, size, shape, content, nullptr);
                 canvas.End(nullptr, POINT{});
                 canvas.SavePng(renderOut);
@@ -1644,6 +2097,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         else if (a == L"--settings") openSettings = true;
         else if (a == L"--settings-page" && i + 1 < argc) { openSettings = true; devPage = argv[++i]; }  // development: weather|battery|calendar
         else if (a == L"--dev-calendar" && i + 1 < argc) DevCalendar() = argv[++i];
+        else if (a == L"--dev-calendar-picker") calPicker = 0;  // development: the colour wheel open on the first calendar
         else if (a == L"--dev-png" && i + 1 < argc) { devPng = argv[++i]; DevPngDir() = devPng; }
         else if (a == L"--log" && i + 1 < argc) dock::Log::Get().Open(argv[++i]);
         else if (a == L"--dev-open-stack" && i + 1 < argc) devOpenStack = _wtoi(argv[++i]);
@@ -1664,32 +2118,17 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     wc.lpfnWndProc = WidgetProc; wc.lpszClassName = kWidgetClass; RegisterClassW(&wc);
     wc.lpfnWndProc = GalleryProc; wc.lpszClassName = kGalleryClass; RegisterClassW(&wc);
     host = CreateWindowExW(WS_EX_TOOLWINDOW, kHostClass, L"DockOver Desktop", WS_POPUP, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);
+    docky::capture_visible::Watch();  // screenshots show the widgets' glass (capture_visible.h)
     if (!host) { OleUninitialize(); CloseHandle(single); return 1; }
     ChangeWindowMessageFilterEx(host, WM_COPYDATA, MSGFLT_ALLOW, nullptr);
     taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     hostStarted = RegisterWindowMessageW(L"dockyHostStarted");
-    // Menus are docky's Liquid Glass popups. Their backdrop is composed here (wallpaper + this app's own windows), so
-    // this app never captures the screen; docky's glass tuning (Glass Studio > Menus, the same set as every other
-    // docky menu) is reused read-only.
-    liquid::popup::SetStaticBackdrop([](const RECT& r, std::vector<std::uint32_t>& out) { return CaptureScreen(r, out) || ComposeBackdrop(r, out); });
+    // Menus use the shared live capture pipeline, with a composed fallback when capture is unavailable.
+    liquid::popup::SetStaticBackdrop(ComposeBackdrop);
     liquid::popup::SetRenderDevice(SharedUiDevice());  // menus, panels and halos share one device (see SharedUiDevice)
-    // Live menus: desktop duplication per menu device (menus exclude themselves from capture), polled every display frame
-    // while a menu is open and released when it closes; the static copy above stays the fallback.
-    liquid::popup::SetLiveBackdrop([](ID3D11Device* device, const RECT& r, const RECT& window, bool poll, dock::BackdropFrame& out, bool& changed) {
-        static std::map<ID3D11Device*, std::unique_ptr<DesktopDuplication>> dups;
-        changed = false;
-        auto& dup = dups[device];
-        if (!dup) dup = std::make_unique<DesktopDuplication>();
-        if (IsRectEmpty(&r)) { dup->Reset(); return false; }
-        if (!dup->Start(device, r) || !dup->Covers(r)) return false;
-        dup->SetOwnWindow(window);
-        if (!dup->Valid()) changed = dup->Poll(r, 100);
-        else if (poll) changed = dup->Poll(r, 0);
-        return dup->Frame(out);
-    });
     { wchar_t local[MAX_PATH]{}; if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(local) + L"\\LiquidDock\\glass.json"); }
     themeRevision = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
-    { const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value.performance; docky::vblank::SetCaps(pf.animationFps, pf.captureFps); }
+    { const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
     theme = CurrentTheme();
     { const auto p = liquid::theme::Palette(theme.dark ? 2 : 1, theme.dark, theme.contrast); liquid::popup::SetTheme(theme.contrast || !theme.dark, liquid::theme::ColorRef(p.surface), liquid::theme::ColorRef(p.primary)); }
     SampleSystem();
@@ -1724,6 +2163,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     if (devOpenStack >= 0) GetStacks().DevOpen(devOpenStack);
     if (!isolated) AddTray();
     HWINEVENTHOOK hook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnForeground, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+    // Music wallpaper frames: a waiter thread turns the publisher's ready event into one queued message at a time.
+    std::thread([hostWnd = host] {
+        const HANDLE ready = docky::music_wallpaper::OpenReadyEvent();
+        if (!ready) return;
+        while (WaitForSingleObject(ready, INFINITE) == WAIT_OBJECT_0) {
+            if (!IsWindow(hostWnd)) break;
+            if (!musicFramePending.exchange(true)) PostMessageW(hostWnd, kMusicFrame, 0, 0);
+        }
+        CloseHandle(ready);
+    }).detach();
     SetTimer(host, kTickTimer, 250, nullptr);
     SetTimer(host, kPollTimer, 2000, nullptr);
     if (exitAfter) SetTimer(host, kExitTimer, exitAfter * 1000, nullptr);
@@ -1734,7 +2183,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     else if (openSettings) {  // beside the first widget of that kind, as its right-click "Edit" opens it
         HWND anchor = nullptr; for (const auto& w : config.widgets) if (w.kind == devPage) { anchor = w.hwnd; break; }
         if (devPage.rfind(L"ext:", 0) == 0) OpenSettingsPage(Page::Ext, devPage.substr(4), nullptr);
-        else OpenSettingsPage(devPage == L"weather" ? Page::Weather : devPage == L"battery" ? Page::Batteries : Page::Calendar, L"", anchor);
+        else OpenSettingsPage(devPage == L"weather" ? Page::Weather : devPage == L"battery" ? Page::Batteries : devPage == L"clock" ? Page::Clock : Page::Calendar, L"", anchor);
     }
     MSG msg{};
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessageW(&msg); }

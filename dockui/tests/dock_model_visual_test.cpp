@@ -3,6 +3,56 @@
 #include <cmath>
 #include <algorithm>
 int main(){
+ // The maximum resting width follows the monitor and the current tile count.
+ for (int count : {2, 8, 30, 100}) for (float width : {640.f, 1280.f, 1920.f, 3840.f}) {
+  dock::DockModel q;q.SetTiles(std::vector<bool>(count,false));const int maxSize=q.MaxIconSizeForWidth(width);
+  q.SetIconSize(static_cast<float>(maxSize));if(q.BaseWidth()>width+0.01f)return 24;
+  q.SetIconSize(static_cast<float>(maxSize+1));if(q.BaseWidth()<=width)return 25;
+ }
+ // When magnification makes the strip wider than the screen, it shifts towards the
+ // focused end while keeping the full magnification and the focused icon visible.
+ for (float width : {640.f, 1920.f, 3840.f}) for (int count : {5, 15, 30}) {
+  for(int target : {0, count/2, count-1}) {
+   dock::DockModel q;q.SetTiles(std::vector<bool>(count,false));
+   q.SetIconSize(static_cast<float>(q.MaxIconSizeForWidth(width)));q.SetWindowSize(width,500);
+   dock::DockFrame rest;q.Compute(rest,0);const float x=rest.items[target].cx,y=(rest.dockTop+rest.dockBottom)*0.5f;
+   q.SetPointer(true,x,y);for(int i=1;i<=480;++i)q.Update(1.0/240.0,i/240.0);
+   dock::DockFrame f;q.Compute(f,2);const auto& icon=f.items[target];
+   if(icon.size < rest.items[target].size*2.2f || icon.left < -0.02f || icon.left+icon.size > width+0.02f)return 26;
+   if(target==0 && f.dockLeft < -0.02f)return 27;
+   if(target==count-1 && f.dockRight > width+0.02f)return 28;
+  }
+ }
+ // Fast end-to-end moves and reversals must translate continuously, then settle at the edge.
+ {dock::DockModel q;q.SetTiles(std::vector<bool>(15,false));q.SetIconSize(static_cast<float>(q.MaxIconSizeForWidth(1200)));q.SetWindowSize(1200,500);
+  dock::DockFrame rest;q.Compute(rest,0);double t=0;float previous=rest.dockLeft;
+  for(int target : {14,0,14,0}) {
+   q.SetPointer(true,rest.items[target].cx,(rest.dockTop+rest.dockBottom)*0.5f);
+   dock::DockFrame immediate;q.Compute(immediate,t);if(std::fabs(immediate.dockLeft-previous)>0.02f)return 29;
+   for(int k=0;k<240;++k){t+=1.0/240.0;q.Update(1.0/240.0,t);dock::DockFrame f;q.Compute(f,t);
+    if(std::fabs(f.dockLeft-previous)>35.f)return 30;previous=f.dockLeft;}
+  }
+ }
+ // The settled edge translation changes continuously throughout a slow centre-to-end sweep.
+ {dock::DockModel q;q.SetTiles(std::vector<bool>(15,false));q.SetIconSize(static_cast<float>(q.MaxIconSizeForWidth(1200)));q.SetWindowSize(1200,500);
+  dock::DockFrame rest;q.Compute(rest,0);double t=0;float previous=0;bool havePrevious=false;
+  for(int step=0;step<=100;++step){const float x=rest.items[7].cx+(rest.items[14].cx-rest.items[7].cx)*step/100.f;
+   q.SetPointer(true,x,(rest.dockTop+rest.dockBottom)*0.5f);
+   for(int k=0;k<240;++k){t+=1.0/240.0;q.Update(1.0/240.0,t);}
+   dock::DockFrame f;q.Compute(f,t);if(havePrevious && std::fabs(f.dockLeft-previous)>15.f)return 31;
+   previous=f.dockLeft;havePrevious=true;
+  }
+ }
+ // Resizing uses a fixed canvas and must match a freshly laid-out model at every size.
+ {dock::DockModel live;live.SetTiles({false,false,true,false,true});live.SetWindowSize(2000,500);
+  for(float size : {80.f,24.f,46.f,73.f,32.f}) {
+   live.SetIconSize(size);dock::DockModel fresh;fresh.m.SetIconSize(size);fresh.SetTiles({false,false,true,false,true});fresh.SetWindowSize(2000,500);
+   dock::DockFrame a,b;live.Compute(a,0);fresh.Compute(b,0);
+   if(std::fabs(live.MaxExtra()-fresh.MaxExtra())>0.02f || std::fabs(a.dockLeft-b.dockLeft)>0.02f ||
+      std::fabs((a.dockLeft+a.dockRight)*0.5f-1000.f)>0.02f || std::fabs(a.dockBottom-494.5f)>0.02f)return 22;
+   for(size_t j=0;j<a.items.size();++j)if(std::fabs(a.items[j].cx-b.items[j].cx)>0.02f)return 23;
+  }
+ }
  dock::DockModel m;m.SetTiles({false,false,false,true,false,true});
  m.SetWindowSize(m.DesiredWindowWidth(),m.DesiredWindowHeight());
  dock::DockFrame rest;m.Compute(rest,0);
@@ -59,5 +109,25 @@ int main(){
   s.SetPointer(true,sl+2,sy);for(int i=0;i<240;++i){t+=1/240.0;s.Update(1/240.0,t);}s.Compute(g1,t);
   s.SetPointer(true,sr-2,sy);for(int i=0;i<240;++i){t+=1/240.0;s.Update(1/240.0,t);}s.Compute(g2,t);
   if(std::fabs(g1.items[7].size-g2.items[7].size)<0.5f||std::fabs(g1.items[9].size-g2.items[9].size)<0.5f)return 22;}
- std::puts("PASS geometry, magnification, adjacency, restore, reduced motion, interrupted hover, bounce and separator crossing");return 0;
+ // Width factors (the status group): all 1 must reproduce the square-icon layout exactly, at rest and while magnified.
+ {std::vector<bool> tiles(12,false);tiles[6]=true;dock::DockModel a,b;a.SetTiles(tiles);b.SetTiles(tiles,std::vector<float>(12,1.0f));
+  for(auto* q:{&a,&b})q->SetWindowSize(q->DesiredWindowWidth(),q->DesiredWindowHeight());
+  dock::DockFrame fa,fb;a.Compute(fa,0);b.Compute(fb,0);const float y=(fa.dockTop+fa.dockBottom)/2;
+  for(auto* q:{&a,&b}){q->SetPointer(true,fa.items[3].cx,y);double t=0;for(int i=0;i<240;++i){t+=1/240.0;q->Update(1/240.0,t);}}
+  dock::DockFrame ma,mb;a.Compute(ma,1);b.Compute(mb,1);
+  for(size_t i=0;i<12;++i){const auto &p=fa.items[i],&q=fb.items[i],&r=ma.items[i],&s=mb.items[i];
+   if(p.left!=q.left||p.size!=q.size||p.tileLeft!=q.tileLeft||r.left!=s.left||r.size!=s.size||r.tileRight!=s.tileRight)return 30;
+   if(!p.separator&&p.width!=p.size)return 31;}}
+ // A 0.5 and a 1.5 wide tile: bodies are factor x icon wide and icon tall, the gaps between bodies stay the icon gap,
+ // and a wide tile magnifies as a whole about its centre.
+ {std::vector<bool> tiles(6,false);std::vector<float> w{1,1,0.5f,1,1.5f,1};dock::DockModel q;q.SetTiles(tiles,w);q.SetWindowSize(q.DesiredWindowWidth(),q.DesiredWindowHeight());
+  dock::DockFrame f;q.Compute(f,0);const float icon=q.m.icon,gap=q.m.Gap();
+  if(std::fabs(f.items[2].width-0.5f*icon)>0.01f||std::fabs(f.items[4].width-1.5f*icon)>0.01f||std::fabs(f.items[4].size-icon)>0.01f)return 32;
+  for(int i=0;i<5;++i){const float between=f.items[i+1].left-(f.items[i].left+f.items[i].width);if(std::fabs(between-gap)>0.01f)return 33;}
+  if(std::fabs(q.BaseWidth()-(2*q.m.padX+5*q.m.pitch+(0.5f*icon+gap)+(1.5f*icon+gap)-q.m.pitch))>0.01f)return 34;
+  q.SetPointer(true,f.items[4].cx,(f.dockTop+f.dockBottom)/2);double t=0;for(int i=0;i<480;++i){t+=1/240.0;q.Update(1/240.0,t);}
+  dock::DockFrame m;q.Compute(m,t);const auto& g=m.items[4];
+  if(g.size<icon*2.0f||std::fabs(g.width-1.5f*g.size)>0.01f||std::fabs(g.cx-(g.left+g.width/2))>0.01f)return 35;
+  for(int i=0;i<5;++i)if(m.items[i+1].left<m.items[i].left+m.items[i].width-0.01f)return 36;}  // no overlap while magnified
+ std::puts("PASS geometry, magnification, adjacency, restore, reduced motion, interrupted hover, bounce, separator crossing and width factors");return 0;
 }

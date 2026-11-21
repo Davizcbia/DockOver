@@ -39,7 +39,7 @@ void NotifyUpdate(const std::string& version){
     NOTIFYICONDATAW n{sizeof(n)};n.hWnd=h;n.uID=1;n.uFlags=NIF_ICON|NIF_MESSAGE|NIF_TIP|NIF_INFO;n.uCallbackMessage=kUpdateBalloonMsg;
     n.hIcon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));if(!n.hIcon)n.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
     wcscpy_s(n.szTip,L"DockOver");wcscpy_s(n.szInfoTitle,L"DockOver update available");
-    _snwprintf_s(n.szInfo,_TRUNCATE,L"docky %hs is available. Click to open Settings and install it.",version.c_str());n.dwInfoFlags=NIIF_INFO;
+    _snwprintf_s(n.szInfo,_TRUNCATE,L"DockOver %hs is available. Click to open Settings and install it.",version.c_str());n.dwInfoFlags=NIIF_INFO;
     if(Shell_NotifyIconW(NIM_ADD,&n)){n.uVersion=NOTIFYICON_VERSION_4;Shell_NotifyIconW(NIM_SETVERSION,&n);
         const ULONGLONG until=GetTickCount64()+30000;MSG msg;
         while(GetTickCount64()<until){const DWORD r=MsgWaitForMultipleObjects(1,&updateStop,FALSE,500,QS_ALLINPUT);if(r==WAIT_OBJECT_0)break;
@@ -108,6 +108,54 @@ void LaunchDesktopApp(){
        CreateProcessW(exe.c_str(),cmd.data(),nullptr,nullptr,FALSE,0,nullptr,dir.c_str(),&si,&pi)){
         std::printf("manager: started DockOver Desktop pid=%lu\n",pi.dwProcessId);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);}
     else std::printf("manager: DockOver Desktop launch failed error=%lu\n",GetLastError());
+}
+// Settings > Control Center > "Music wallpaper": docky-now-playing.exe --wallpaper shows the playing Apple Music artwork
+// behind the desktop icons. The Manager starts it while the setting is on (checked every second, so it also comes back
+// after an Explorer restart), and asks it to close when the setting goes off or DockOver quits.
+// The Manager has no console when started from Explorer: wallpaper decisions also go to the Now Playing log.
+void WallpaperLog(const char* text,unsigned long value=0){
+    wchar_t base[MAX_PATH]{};if(!GetEnvironmentVariableW(L"LOCALAPPDATA",base,MAX_PATH))return;
+    const std::wstring path=std::wstring(base)+L"\\LiquidDesktop\\artwork\\now-playing.log";
+    HANDLE f=CreateFileW(path.c_str(),FILE_APPEND_DATA,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_ALWAYS,0,nullptr);if(f==INVALID_HANDLE_VALUE)return;
+    SYSTEMTIME st;GetLocalTime(&st);char line[256];const int n=sprintf_s(line,"%02d:%02d:%02d manager: %s %lu\r\n",st.wHour,st.wMinute,st.wSecond,text,value);
+    DWORD written=0;if(n>0)WriteFile(f,line,static_cast<DWORD>(n),&written,nullptr);CloseHandle(f);
+    std::printf("manager: music wallpaper: %s %lu\n",text,value);std::fflush(stdout);
+}
+void SyncMusicWallpaper(bool on){
+    if(!on){if(HWND w=FindWindowExW(HWND_MESSAGE,nullptr,L"DockyNowPlayingWallpaperCtl",nullptr))PostMessageW(w,WM_CLOSE,0,0);return;}
+    if(HANDLE running=OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\DockyNowPlayingWallpaper")){CloseHandle(running);return;}
+    const auto exe=AdjacentExe(L"docky-now-playing.exe");
+    if(exe.empty()||GetFileAttributesW(exe.c_str())==INVALID_FILE_ATTRIBUTES){WallpaperLog("docky-now-playing.exe not found");return;}
+    std::wstring cmd=L"\""+exe+L"\" --wallpaper";STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};
+    const auto dir=exe.substr(0,exe.find_last_of(L"\\/"));
+    if(CreateProcessW(exe.c_str(),cmd.data(),nullptr,nullptr,FALSE,0,nullptr,dir.c_str(),&si,&pi)){
+        WallpaperLog("started wallpaper pid",pi.dwProcessId);CloseHandle(pi.hThread);CloseHandle(pi.hProcess);}
+    else WallpaperLog("wallpaper launch failed, error",GetLastError());
+}
+// Settings > Control Center shortcuts (global, registered on the Manager thread like the taskbar shortcut).
+constexpr int kShortcutBase=0x4460;  // +0 desktop lyrics, +1 music wallpaper, +2 hide DockOver Desktop, +3 full-screen Now Playing
+void ApplyShortcuts(const liquid::settings::ControlCenter& cc,int (&active)[4]){
+    const int wanted[4]={cc.shortcutLyrics,cc.shortcutArtwork,cc.shortcutDesktop,cc.shortcutNowPlaying};
+    for(int i=0;i<4;++i){
+        if(wanted[i]==active[i])continue;
+        if(active[i])UnregisterHotKey(nullptr,kShortcutBase+i);
+        active[i]=0;
+        if(wanted[i]&&RegisterHotKey(nullptr,kShortcutBase+i,UINT(wanted[i]>>8)|MOD_NOREPEAT,UINT(wanted[i]&0xFF)))active[i]=wanted[i];
+        else if(wanted[i]){WallpaperLog("shortcut could not be registered (used by another program?)",static_cast<unsigned long>(wanted[i]));active[i]=-wanted[i];}
+    }
+}
+// DockOver Desktop's host window (class DockyDesktopHostV1); it shows or hides its widgets and Stacks on this message.
+void ToggleDesktopApp(){
+    static const UINT toggle=RegisterWindowMessageW(L"DockyDesktopToggleVisible");
+    EnumWindows([](HWND w,LPARAM)->BOOL{wchar_t cls[32]{};GetClassNameW(w,cls,32);if(!wcscmp(cls,L"DockyDesktopHostV1"))PostMessageW(w,toggle,0,0);return TRUE;},0);
+}
+void RunShortcut(int index,const std::wstring& settingsFile){
+    const auto cc=liquid::settings::Load(settingsFile).value.controlCenter;
+    if(index==0)liquid::settings::WriteBool(settingsFile,"controlCenter","wallpaperLyrics",!cc.wallpaperLyrics);
+    else if(index==1)liquid::settings::WriteBool(settingsFile,"controlCenter","musicWallpaper",!cc.musicWallpaper);
+    else if(index==2)ToggleDesktopApp();
+    else if(index==3){const auto exe=AdjacentExe(L"docky-now-playing.exe");if(!exe.empty())ShellExecuteW(nullptr,L"open",exe.c_str(),nullptr,nullptr,SW_SHOWNORMAL);}
+    WallpaperLog("shortcut",static_cast<unsigned long>(index));
 }
 bool MatchingBuild(const std::wstring& path) {
     std::ifstream input(path, std::ios::binary);
@@ -336,30 +384,37 @@ int wmain(int argc,wchar_t** argv){
         StartupError(L"Dock could not be started because another instance appeared or its status is unavailable. No independent process was closed.");
         if(quitEvent)CloseHandle(quitEvent);CloseHandle(stopEvent);stopEvent=nullptr;CloseHandle(single);return 4;
     }
+    // The Menu Bar is optional (Settings > Menu Bar > Show menu bar): when it is off its process does not run at all and
+    // the Dock's status group hosts the status items. It is started here and whenever the setting turns it back on.
     HANDLE menuChild=nullptr;
-    HANDLE menuInstance=OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\LiquidDesktopMenuBarV01SingleInstance");
-    DWORD menuError=menuInstance?ERROR_SUCCESS:GetLastError();
-    if(menuInstance || menuError==ERROR_ACCESS_DENIED){StartupError(L"Another Menu Bar started during startup. It will not be closed. Close it yourself and restart DockOver.");if(menuInstance)CloseHandle(menuInstance);}
-    else if(menuError==ERROR_FILE_NOT_FOUND){
+    auto startMenuBar=[&]()->bool{
+        HANDLE menuInstance=OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\LiquidDesktopMenuBarV01SingleInstance");
+        const DWORD menuError=menuInstance?ERROR_SUCCESS:GetLastError();
+        if(menuInstance||menuError==ERROR_ACCESS_DENIED){std::puts("manager: an independent Menu Bar is running; leaving it untouched");if(menuInstance)CloseHandle(menuInstance);return false;}
+        if(menuError!=ERROR_FILE_NOT_FOUND){std::printf("manager: Menu Bar mutex check failed error=%lu\n",menuError);return false;}
         const auto menuPath=AdjacentExe(L"LiquidMenuBar.exe");PROCESS_INFORMATION pi{};
         const auto menuLog=LocalPath(L"\\LiquidDock\\menubar.log");  // window-drag / full-screen decisions are only visible here
         ComponentSpec spec{L"Menu Bar",menuPath,L"\""+menuPath+L"\""+(menuLog.empty()?std::wstring():L" --log "+QuoteArgument(menuLog))};
-        if(!menuPath.empty() && LaunchComponent(spec,pi)){menuChild=pi.hProcess;CloseHandle(pi.hThread);std::printf("manager: launched Menu Bar pid=%lu\n",pi.dwProcessId);}
-        else std::printf("manager: Menu Bar launch failed error=%lu; Dock continues\n",GetLastError());
-    }else std::printf("manager: Menu Bar mutex check failed error=%lu\n",menuError);
-    if(!menuChild){
-        int posted=0;
-        for(int i=0;i<50 && !posted && WaitForSingleObject(child,0)==WAIT_TIMEOUT;++i){
-            posted=CloseOwned(child,L"LiquidDockV01");
-            if(!posted)Sleep(100);
-        }
-        std::printf("manager: startup incomplete; closing owned Dock (WM_CLOSE posted=%d)\n",posted);
-        WaitForSingleObject(child,8000);CloseHandle(child);if(firstFrameEvent)CloseHandle(firstFrameEvent);
-        if(quitEvent)CloseHandle(quitEvent);CloseHandle(stopEvent);stopEvent=nullptr;CloseHandle(single);
-        StartupError(L"Menu Bar could not start. DockOver did not start completely. Independent processes were not closed.");
-        return 4;
-    }
+        if(!menuPath.empty() && LaunchComponent(spec,pi)){menuChild=pi.hProcess;CloseHandle(pi.hThread);std::printf("manager: launched Menu Bar pid=%lu\n",pi.dwProcessId);std::fflush(stdout);return true;}
+        std::printf("manager: Menu Bar launch failed error=%lu; Dock continues\n",GetLastError());std::fflush(stdout);return false;
+    };
+    auto stopMenuBar=[&]{
+        if(!menuChild)return;
+        const int posted=CloseOwned(menuChild,L"LiquidDesktopMenuBarV01");
+        const DWORD r=WaitForSingleObject(menuChild,8000);
+        std::printf("manager: Menu Bar turned off (WM_CLOSE posted=%d, %s)\n",posted,r==WAIT_OBJECT_0?"exited":"still running after 8 s (left untouched)");std::fflush(stdout);
+        CloseHandle(menuChild);menuChild=nullptr;
+    };
+    bool menuBarEnabled=liquid::settings::Load(settingsFile).value.menuBar.enabled;
+    if(menuBarEnabled)startMenuBar();
+    else std::puts("manager: Menu Bar is turned off in Settings; not started");
     if(!managerSeconds&&settingsFile==liquid::settings::DefaultPath()&&liquid::settings::Load(settingsFile).value.dock.launchDesktop)LaunchDesktopApp();
+    const bool normalSession=!managerSeconds&&settingsFile==liquid::settings::DefaultPath();
+    bool musicWallpaper=normalSession&&liquid::settings::Load(settingsFile).value.controlCenter.musicWallpaper;
+    auto wallpaperRevision=liquid::settings::ReadRevision(settingsFile);ULONGLONG wallpaperCheck=0;
+    int shortcutsActive[4]{};
+    if(normalSession)ApplyShortcuts(liquid::settings::Load(settingsFile).value.controlCenter,shortcutsActive);
+    WallpaperLog(normalSession?(musicWallpaper?"session start, setting on":"session start, setting off"):"not a normal session");
     std::fflush(stdout);
     // Production taskbar integration: nothing is hidden until the recovery guardian has completed its ready
     // handshake (started after the Dock's first frame). Preference (hideOnStartup) and current state are separate.
@@ -403,10 +458,19 @@ int wmain(int argc,wchar_t** argv){
         DWORD timeout=1000;
         if(managerSeconds){ULONGLONG elapsed=GetTickCount64()-started;ULONGLONG limit=1000ull*managerSeconds;if(elapsed>=limit)break;timeout=static_cast<DWORD>(std::min<ULONGLONG>(1000,limit-elapsed));}
         DWORD wait=MsgWaitForMultipleObjects(count,handles,FALSE,timeout,QS_ALLINPUT);
+        // Music wallpaper: on its own one-second clock (the timeout branch below does not run while messages keep arriving).
+        if(normalSession&&GetTickCount64()-wallpaperCheck>=1000){wallpaperCheck=GetTickCount64();
+            const auto revision=liquid::settings::ReadRevision(settingsFile);
+            if(revision!=wallpaperRevision){wallpaperRevision=revision;const auto current=liquid::settings::Load(settingsFile);
+                if(current.status==liquid::settings::LoadStatus::Loaded||current.status==liquid::settings::LoadStatus::Missing){
+                    ApplyShortcuts(current.value.controlCenter,shortcutsActive);
+                    const bool next=current.value.controlCenter.musicWallpaper;if(next!=musicWallpaper){musicWallpaper=next;WallpaperLog(next?"setting on":"setting off");if(!next)SyncMusicWallpaper(false);}}}
+            if(musicWallpaper)SyncMusicWallpaper(true);}
         if(wait>=WAIT_ABANDONED_0&&wait<WAIT_ABANDONED_0+count)wait=WAIT_OBJECT_0+(wait-WAIT_ABANDONED_0);  // lease of a crashed Settings
         if(wait==WAIT_OBJECT_0)break;
         if(wait==WAIT_OBJECT_0+count){MSG msg{};while(PeekMessageW(&msg,nullptr,0,0,PM_REMOVE)){
                 if(msg.message==WM_HOTKEY&&msg.wParam==kHotkeyId){if(!suspension.Suspended())act(2,L"hotkey");}
+                else if(msg.message==WM_HOTKEY&&msg.wParam>=WPARAM(kShortcutBase)&&msg.wParam<WPARAM(kShortcutBase+4))RunShortcut(int(msg.wParam-kShortcutBase),settingsFile);
                 else{TranslateMessage(&msg);DispatchMessageW(&msg);}}continue;}
         if(leaseChangedIndex!=MAXDWORD&&wait==WAIT_OBJECT_0+leaseChangedIndex){
             if(suspension.OnChanged()){  // a Settings window started recording: pause the shortcut before acknowledging
@@ -429,7 +493,9 @@ int wmain(int argc,wchar_t** argv){
                     else if(next.hotkeyEnabled!=taskbarSettings.hotkeyEnabled||next.hotkeyModifiers!=taskbarSettings.hotkeyModifiers||next.hotkeyKey!=taskbarSettings.hotkeyKey){status.message.clear();ApplyHotkey(next,status,hotkeyRegistered);taskbarSettings=next;publish(L"");}
                     taskbarSettings.hideOnStartup=next.hideOnStartup;  // preference only: the current state is not changed
                     if(next.freeWorkArea!=taskbar.FreeWorkArea()){taskbarSettings.freeWorkArea=next.freeWorkArea;taskbar.SetFreeWorkArea(next.freeWorkArea);
-                        publish(next.freeWorkArea?L"Work area release enabled.":L"Work area release disabled; the reserved area was restored.");}}}
+                        publish(next.freeWorkArea?L"Work area release enabled.":L"Work area release disabled; the reserved area was restored.");}
+                    if(current.value.menuBar.enabled!=menuBarEnabled){menuBarEnabled=current.value.menuBar.enabled;
+                        if(menuBarEnabled){if(!menuChild)startMenuBar();}else stopMenuBar();}}}
             std::wstring log;if(taskbar.Poll(log))publish(std::wstring(L"Taskbar state changed: ")+tb::StateName(taskbar.Current())+L".");
             if(!log.empty()){std::printf("%ls",log.c_str());std::fflush(stdout);}
             continue;}
@@ -478,6 +544,8 @@ int wmain(int argc,wchar_t** argv){
         std::printf("manager: wait failed error=%lu\n",GetLastError());break;
     }
     guardSim.Stop();
+    if(musicWallpaper)SyncMusicWallpaper(false);
+    for(int i=0;i<4;++i)if(shortcutsActive[i]>0)UnregisterHotKey(nullptr,kShortcutBase+i);
     if(updateThread.joinable()){SetEvent(updateStop);updateThread.detach();}  // a check in progress ends with the process
     // Restore on exit (normal quit, Dock exit, Ctrl+C/close, --exit-after), then release the guardian, which
     // verifies the record once more. A crash skips this and the guardian performs the recovery instead.

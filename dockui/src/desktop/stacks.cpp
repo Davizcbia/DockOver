@@ -1193,13 +1193,26 @@ HWND DesktopListView() {
     return found;
 }
 bool g_iconsHidden = false;
+bool g_shortcutHidden = false;  // hidden by the Hide DockOver Desktop shortcut (they were showing before)
+void ApplyIconVisibility() {
+    if (HWND list = DesktopListView()) {
+        const bool hide = g_iconsHidden || g_shortcutHidden, visible = IsWindowVisible(list) != FALSE;
+        if (visible == hide) ShowWindow(list, hide ? SW_HIDE : SW_SHOW);
+    }
+}
 }
 // Explorer's desktop icon view is hidden with ShowWindow only (no setting is changed). It is re-checked every few
 // seconds because Explorer recreates or re-shows the view (Explorer restart, "Show desktop icons", resolution change).
 void HideDesktopIcons(bool hide) {
     g_iconsHidden = hide;
-    if (HWND list = DesktopListView()) { const bool visible = IsWindowVisible(list) != FALSE; if (visible == hide) ShowWindow(list, hide ? SW_HIDE : SW_SHOW); }
+    ApplyIconVisibility();
 }
-void MaintainDesktopIcons() { if (g_iconsHidden) HideDesktopIcons(true); }
+void HideDesktopIconsForShortcut(bool hide) {
+    if (hide) { HWND list = DesktopListView(); if (!list || !IsWindowVisible(list)) return; g_shortcutHidden = true; }  // only icons that were showing
+    else if (!g_shortcutHidden) return;
+    else g_shortcutHidden = false;
+    ApplyIconVisibility();
+}
+void MaintainDesktopIcons() { if (g_iconsHidden || g_shortcutHidden) ApplyIconVisibility(); }
 
 }  // namespace docky::desk

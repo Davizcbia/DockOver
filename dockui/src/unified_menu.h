@@ -9,6 +9,16 @@ using Closed=std::function<void()>;
 std::vector<menu::MenuItem> FromNative(HMENU menu);
 // One popup per process; arguments are copied. Position is in physical screen pixels.
 HWND Show(HWND owner,POINT anchor,std::vector<menu::MenuItem> items,Select select,Closed closed={});
+// Opens upwards: `bottomLeft` is the popup's bottom-left corner (a Dock tile's top edge); the popup keeps that bottom
+// edge when its rows change. Clamped to the work area like Show.
+HWND ShowAbove(HWND owner,POINT bottomLeft,std::vector<menu::MenuItem> items,Select select,Closed closed={});
+// Like ShowAbove, as a grid of icon cells (the Dock's Hidden Icons): each item is one cell showing its icon (or its first
+// letter), a dot marks checked items, and the hovered item's text appears in a footer (`title` when none is hovered).
+// Left and right clicks choose an item like a row (LastSelectionSecondary tells them apart). Columns: GridColumns.
+HWND ShowGridAbove(HWND owner,POINT bottomLeft,std::vector<menu::MenuItem> items,const std::wstring& title,Select select,Closed closed={});
+int GridColumns(size_t count);  // 1-6 items one row; up to 12 two balanced rows; then rows of 6
+// Screen rectangle (px) of item `index` in an open popup (a grid cell or a row); false when there is none.
+bool ItemScreenRect(HWND popup,size_t index,RECT& out);
 void SetVisualCaptureTest(bool enabled);
 // Inside a Select callback: true when the row was chosen with the right mouse button.
 bool LastSelectionSecondary();

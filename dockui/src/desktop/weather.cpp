@@ -144,7 +144,7 @@ void Fetch() {
     if (d.error.empty()) {
         wchar_t q[600];
         swprintf_s(q, L"https://api.open-meteo.com/v1/forecast?latitude=%.3f&longitude=%.3f&current=temperature_2m,weather_code,is_day"
-                      L"&hourly=temperature_2m,weather_code,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=6&temperature_unit=%ls",
+                      L"&hourly=temperature_2m,weather_code,is_day&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=10&temperature_unit=%ls",
                    lat, lon, d.fahrenheit ? L"fahrenheit" : L"celsius");
         Value r; std::string err;
         if (!dock::json::Parse(HttpGet(q), r, err) || !r.IsObject()) d.error = L"Weather service unreachable";
@@ -159,7 +159,7 @@ void Fetch() {
             if (ht && htemp && hcode) {
                 size_t start = 0;
                 for (size_t i = 0; i < ht->array.size(); ++i) if (dock::json::FromUtf8(ht->array[i].string).substr(0, 13) == now.substr(0, 13)) { start = i; break; }
-                for (size_t i = start; i < ht->array.size() && d.hours.size() < 6; ++i) {
+                for (size_t i = start; i < ht->array.size() && d.hours.size() < 24; ++i) {
                     WeatherHour h; const std::wstring t = dock::json::FromUtf8(ht->array[i].string);
                     h.hour = t.size() >= 13 ? _wtoi(t.substr(11, 2).c_str()) : 0;
                     h.temp = static_cast<float>(Num(&htemp->array[i])); h.code = static_cast<int>(Num(i < hcode->array.size() ? &hcode->array[i] : nullptr));
@@ -202,7 +202,7 @@ void Weather::Start(HWND notify, UINT message) {
     if (GetFileAttributesW(CityPath().c_str()) == INVALID_FILE_ATTRIBUTES) {
         CreateDirectoryW(DataDir().c_str(), nullptr);
         std::ofstream f(CityPath(), std::ios::binary);
-        f << "# Type a city on its own line below (for example: Storrs) to use it instead of Windows Location.\r\n";
+        f << "# Type a city on its own line below (for example: Cupertino) to use it instead of Windows Location.\r\n";
     }
     g.thread = std::thread([] {
         winrt::init_apartment(winrt::apartment_type::multi_threaded);

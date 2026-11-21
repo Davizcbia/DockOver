@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "../backdrop.h"
+#include "../capture_visible.h"
 #include "../log.h"
 #include "../vblank.h"
 
@@ -48,7 +49,7 @@ public:
         static std::mutex m; static auto* all = new std::map<HMONITOR, SharedDesktop*>;
         std::lock_guard<std::mutex> lock(m);
         auto& d = (*all)[monitor];
-        if (!d) d = new SharedDesktop;
+        if (!d) { d = new SharedDesktop; d->listenersOnly_ = true; }  // every consumer registers its area (Listen)
         return *d;
     }
 
@@ -56,9 +57,15 @@ public:
     bool Want(const RECT& area) {
         std::unique_lock<std::mutex> lock(mutex_);
         wanted_ = area;
-        if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
-        if (!dup_) wake_.notify_all();
         const POINT c{(area.left + area.right) / 2, (area.top + area.bottom) / 2};
+        if (owner_ && GetCurrentThreadId() == ownerThread_) {  // owner: create it here, on the render device
+            if (dup_ && PtInRect(&outputRect_, c)) return true;
+            if (failed_ && GetTickCount64() - failedAt_ < 5000) return false;
+            if (Ensure(area)) { changed_.notify_all(); return true; }
+            RevertOwnerLocked();  // continues below with the background thread
+        }
+        if (!owner_ && !thread_.joinable()) thread_ = std::thread([this] { Run(); });
+        if (!dup_) wake_.notify_all();
         if (dup_ && PtInRect(&outputRect_, c)) return true;
         if (failed_) return false;  // unavailable: never block the caller (GDI fallback); the thread retries every 5 s
         changed_.wait_for(lock, std::chrono::milliseconds(150), [&] { return (dup_ && PtInRect(&outputRect_, c)) || failed_.load(); });
@@ -73,6 +80,74 @@ public:
     // A consumer's own window (excluded from the image): changes entirely inside it are its own redraws.
     void SetOwn(const void* consumer, const RECT& window) { std::lock_guard<std::mutex> lock(mutex_); if (IsRectEmpty(&window)) own_.erase(consumer); else own_[consumer] = window; }
 
+    // ---- Owner mode (low-latency Dock, opt-in) ---------------------------------------------------------------------
+    // Measured 2026-11-20 (experiments/hostbackdrop-lab/REPORT-dxgi-latency.md): handing the desktop image from the
+    // duplication's own device to the glass renderer's device costs one display frame however it is synchronised (keyed
+    // mutex, shared texture + Flush). With an owner, the duplication lives on the owner's render device and the owner's
+    // thread takes the frames (PumpOwned) right before it renders, so its glass shows the desktop one frame after it was
+    // composed instead of two. Every other consumer keeps working unchanged through the shared image. The background
+    // thread parks while an owner exists. Device loss / shutdown: SetOwner(nullptr) on the owner thread.
+    void SetOwner(ID3D11Device* device) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (device == ownerDevice_.Get()) return;
+        // Park the background thread first: it holds mutex_ from one frame to the next, so merely waiting for !pumping_
+        // starved this call forever (the Dock hung when Low latency glass was switched on again, 2026-11-20).
+        handover_ = true;
+        idle_.wait(lock, [&] { return !pumping_; });  // the background thread is not inside Pump
+        handover_ = false;
+        Stop(); image_.Reset(); rtv_.Reset(); shared_ = nullptr; vs_.Reset(); ps_.Reset(); cb_.Reset(); scissor_.Reset();
+        device_.Reset(); ctx_.Reset(); history_.clear(); stale_.clear(); failed_ = false; ++generation_;
+        ownerDevice_ = device; ownerThread_ = device ? GetCurrentThreadId() : 0; owner_ = device != nullptr;
+        if (device) { device_ = device; device->GetImmediateContext(&ctx_); }
+        else if (users_ > 0 && !thread_.joinable()) thread_ = std::thread([this] { Run(); });
+        DLOG(L"desk glass: duplication owner %ls", device ? L"set (pumped on the render thread)" : L"cleared (background thread)");
+        wake_.notify_all(); changed_.notify_all();
+    }
+    bool Owned() const { return owner_; }
+    // Owner: a frame is worth waiting for (consumers exist or the duplication still has to be released).
+    bool OwnerNeedsPump() const { std::lock_guard<std::mutex> lock(mutex_); return owner_ && (users_ > 0 || dup_); }
+    // QueryPerformanceCounter value of the newest frame's LastPresentTime (when DWM showed it); 0 when unknown.
+    std::int64_t LastPresentQpc() const { return lastPresentQpc_; }
+    // Owner thread only: create the duplication if needed, take the next frame waiting at most `timeoutMs`, copy it into
+    // the shared image and notify listeners (the owner is a listener too). True when a new frame was taken.
+    bool PumpOwned(UINT timeoutMs) {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (!owner_ || GetCurrentThreadId() != ownerThread_) return false;
+            if (users_ == 0) {  // released 2 s after the last consumer (same as the background thread)
+                if (dup_) { if (!idleSince_) idleSince_ = GetTickCount64(); else if (GetTickCount64() - idleSince_ >= 2000) { Stop(); history_.clear(); idleSince_ = 0; DLOG(L"desk glass: desktop duplication released"); } }
+                return false;
+            }
+            idleSince_ = 0;
+            if (!dup_) {
+                if (failed_ && GetTickCount64() - failedAt_ < 5000) return false;
+                const bool ok = Ensure(wanted_);
+                changed_.notify_all();
+                if (!ok) { RevertOwnerLocked(); return false; }
+            }
+        }
+        const std::uint64_t before = serial_;
+        Pump(timeoutMs);
+        std::lock_guard<std::mutex> lock(mutex_);
+        const ULONGLONG now = GetTickCount64();
+        for (auto& kv : listeners_) {  // own-window redraws that were held back (as in Run)
+            Listener& l = kv.second;
+            if (l.ownPending && !l.posted && (!l.large || now - l.lastOwnPost >= 33)) { l.ownPending = false; l.posted = true; l.lastOwnPost = now; PostMessageW(l.hwnd, l.msg, 0, 0); }
+        }
+        return serial_ != before;
+    }
+private:
+    // The owner's device cannot duplicate this monitor (another adapter, rotated output, ...): back to the background
+    // thread with its own device. Under mutex_, on the owner thread.
+    void RevertOwnerLocked() {
+        DLOG(L"desk glass: owner device cannot duplicate this monitor; background thread takes over (no low-latency path)");
+        Stop(); image_.Reset(); rtv_.Reset(); shared_ = nullptr; vs_.Reset(); ps_.Reset(); cb_.Reset(); scissor_.Reset();
+        device_.Reset(); ctx_.Reset(); ownerDevice_.Reset(); ownerThread_ = 0; owner_ = false; failed_ = false; ++generation_;
+        if (!thread_.joinable()) thread_ = std::thread([this] { Run(); });
+        wake_.notify_all();
+    }
+public:
+
 private:
     // Duplicates the monitor that contains `area` (background thread). False: unavailable.
     bool Ensure(const RECT& area) {
@@ -82,6 +157,7 @@ private:
         Stop();
         using Microsoft::WRL::ComPtr;
         if (!device_) {
+            if (owner_) return Fail(E_FAIL);
             const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
             if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &device_, nullptr, &ctx_)))
                 return Fail(E_FAIL);
@@ -121,6 +197,8 @@ private:
     void Run() {
         std::unique_lock<std::mutex> lock(mutex_);
         while (true) {
+            if (owner_) { idleSince_ = 0; wake_.wait(lock); continue; }  // the owner's thread takes the frames
+            if (handover_) { idle_.notify_all(); wake_.wait_for(lock, std::chrono::milliseconds(5)); continue; }  // SetOwner pending
             if (users_ == 0) {
                 // Kept 2 s after the last consumer stops (no frames taken meanwhile): a backdrop that restarts right away
                 // (the Dock after Launchpad, a menu reopened) finds it running instead of waiting for a new duplication.
@@ -140,6 +218,7 @@ private:
                 changed_.notify_all();
                 if (!ok) continue;
             }
+            pumping_ = true;  // SetOwner waits until the frame below is finished
             lock.unlock();
             LARGE_INTEGER a{}, b{}, f{}; QueryPerformanceCounter(&a);
             const std::uint64_t before = serial_;
@@ -162,6 +241,7 @@ private:
             }
             if (GetTickCount64() - statSince_ >= 2000) { DLOG_DEBUG(L"desk glass: duplication %.1f frames/s, %.2f ms work per frame, %zu own windows", statFrames_ / 2.0, statFrames_ ? statMs_ / statFrames_ : 0.0, own_.size()); statFrames_ = 0; statMs_ = 0; statSince_ = GetTickCount64(); }
             lock.lock();
+            pumping_ = false; idle_.notify_all();
         }
     }
     // Takes the next frame if there is one (waits up to `timeoutMs`); copies the changed rectangles into the shared image.
@@ -173,18 +253,49 @@ private:
         LARGE_INTEGER w0{}, w1{}, wf{}; QueryPerformanceCounter(&w0);
         const HRESULT hr = dup_->AcquireNextFrame(timeoutMs, &info, &res);
         QueryPerformanceCounter(&w1);
-        if (SUCCEEDED(hr)) frameQpc_ = w1.QuadPart; QueryPerformanceFrequency(&wf); lastWaitMs_ = (w1.QuadPart - w0.QuadPart) * 1000.0 / wf.QuadPart;
+        if (SUCCEEDED(hr)) { frameQpc_ = w1.QuadPart; if (info.LastPresentTime.QuadPart) { lastPresentQpc_ = info.LastPresentTime.QuadPart; ++acquired_; accumulated_ += info.AccumulatedFrames; } }
+        QueryPerformanceFrequency(&wf); lastWaitMs_ = (w1.QuadPart - w0.QuadPart) * 1000.0 / wf.QuadPart;
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;
         if (FAILED(hr)) { DLOG(L"desk glass: duplication lost (0x%08X)", static_cast<unsigned>(hr)); std::lock_guard<std::mutex> lock(mutex_); Stop(); changed_.notify_all(); return; }
-        if (GetTickCount64() - excludedAt_ >= 100) RefreshExcluded();  // at most 10 times a second
+        // Dev fault injection (--dev-isolated + DOCKY_TEST_DUP_LOST_AFTER=n): after n frames, behave as if Windows had
+        // taken the duplication away (secure desktop, UAC, lock screen, mode change: DXGI_ERROR_ACCESS_LOST), once.
+        static const unsigned long long lostAfter = [] { wchar_t v[16]{}; return wcsstr(GetCommandLineW(), L"--dev-isolated") && GetEnvironmentVariableW(L"DOCKY_TEST_DUP_LOST_AFTER", v, 16) ? _wtoi64(v) : 0; }();
+        static bool injected = false;
+        if (lostAfter && !injected && acquired_ >= lostAfter) {
+            injected = true; dup_->ReleaseFrame();
+            DLOG(L"desk glass: duplication lost (0x%08X) [test fault]", static_cast<unsigned>(DXGI_ERROR_ACCESS_LOST));
+            std::lock_guard<std::mutex> lock(mutex_); Stop(); changed_.notify_all(); return;
+        }
+        if (docky::capture_visible::Frozen()) {  // glass windows visible to a screenshot: this frame may contain them
+            { std::lock_guard<std::mutex> lock(mutex_); needFull_ = true; needFullSince_ = GetTickCount64(); }
+            dup_->ReleaseFrame(); return;
+        }
         if (info.LastPresentTime.QuadPart != 0 || !valid_) {
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(res.As(&tex))) {
                 std::vector<RECT> changed;
-                const bool full = !valid_ || !Changes(info, changed);
+                bool full = !valid_ || needFull_ || !Changes(info, changed);
+                // Per-monitor instances (the Dock, its menus and panels) copy only what some consumer looks at: a video or
+                // a scrolling page elsewhere on the screen then costs no GPU copy at all. Changes nobody watches are kept
+                // as stale areas; a consumer that later looks at one waits for the next full copy (Fresh).
+                if (!full && listenersOnly_) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    std::vector<RECT> kept;
+                    for (const RECT& r : changed) {
+                        RECT s = r; OffsetRect(&s, outputRect_.left, outputRect_.top);
+                        bool watched = false;
+                        for (const auto& kv : listeners_) { RECT area = kv.second.area, hit{}; InflateRect(&area, 8, 8); if (IntersectRect(&hit, &s, &area)) { watched = true; break; } }
+                        if (watched) kept.push_back(r); else stale_.push_back(s);
+                    }
+                    if (stale_.size() > 32) { RECT u{}; for (const RECT& s : stale_) UnionRect(&u, &u, &s); stale_.assign(1, u); }
+                    changed.swap(kept);
+                    if (changed.empty()) { if (dup_) dup_->ReleaseFrame(); return; }
+                }
+                if (GetTickCount64() - excludedAt_ >= 100) RefreshExcluded();  // at most 10 times a second, only when copying
                 if (full) { changed.assign(1, RECT{0, 0, outputRect_.right - outputRect_.left, outputRect_.bottom - outputRect_.top}); }
                 if (Copy(tex.Get(), changed)) {
                     std::lock_guard<std::mutex> lock(mutex_);
+                    if (full) { stale_.clear(); needFull_ = false; }
                     const bool first = !valid_;
                     valid_ = true; ++serial_;
                     const size_t firstNew = history_.size();
@@ -213,7 +324,9 @@ public:
         return false;
     }
     // Like Changed, for a consumer whose own window (`own`, excluded from the image) lies over `area`: 0 nothing changed,
-    // 1 only changes inside the own window (usually its own redraw: the pixels behind it may be unchanged), 2 a real change.
+    // 1 only changes inside the own window (usually its own redraw: the pixels behind it may be unchanged), 3 only changes
+    // inside windows excluded from capture, at least one of them another window (another docky window redrawing, such as
+    // the animating Dock under Control Center: compare before publishing), 2 a real change.
     int ChangedKind(const RECT& area, std::uint64_t since, const RECT& own) const {
         std::lock_guard<std::mutex> lock(mutex_);
         if (serial_ <= since) return 0;
@@ -222,7 +335,9 @@ public:
         for (auto it = history_.rbegin(); it != history_.rend() && it->serial > since; ++it) {
             RECT hit{};
             if (!IntersectRect(&hit, &it->rect, &area)) continue;
-            if (it->self || Inside(it->rect, own)) kind = 1; else return 2;
+            if (Inside(it->rect, own)) { if (kind == 0) kind = 1; }
+            else if (it->self) kind = 3;
+            else return 2;
         }
         return kind;
     }
@@ -230,6 +345,7 @@ public:
     // Changes only inside `own` (the listener's own excluded window) wake it at most every 33 ms.
     void Listen(const void* key, HWND hwnd, UINT msg, const RECT& area, const RECT& own) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!needFull_) for (const RECT& s : stale_) { RECT hit{}; if (IntersectRect(&hit, &s, &area)) { needFull_ = true; needFullSince_ = GetTickCount64(); break; } }
         Listener& l = listeners_[key];
         l.hwnd = hwnd; l.msg = msg; l.area = area; l.own = own; l.posted = false;
         // A large area (Launchpad) wakes for self-only changes at most every 33 ms: comparing a whole screen at the display
@@ -239,6 +355,15 @@ public:
         l.large = o > 0 && a * 4 > o;
     }
     void Unlisten(const void* key) { std::lock_guard<std::mutex> lock(mutex_); listeners_.erase(key); }
+    // False while `area` holds changes nobody watched when they happened: the next frame copies the whole screen (and
+    // notifies everyone), so the caller waits for it instead of showing old pixels. A newly shown window always produces
+    // that frame; after 200 ms without one the image is used as it is.
+    bool Fresh(const RECT& area) const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!needFull_ || GetTickCount64() - needFullSince_ > 200) return true;
+        for (const RECT& s : stale_) { RECT hit{}; if (IntersectRect(&hit, &s, &area)) return false; }
+        return true;
+    }
 private:
 
 private:
@@ -264,6 +389,9 @@ private:
         }
     }
     std::map<const void*, Listener> listeners_;
+    bool listenersOnly_ = false;               // ForMonitor: copy only changes inside listener areas (see Pump)
+    std::vector<RECT> stale_;                  // screen areas changed but not copied (nobody watched them)
+    std::atomic<bool> needFull_{false}; ULONGLONG needFullSince_ = 0;  // a listener looks at a stale area: copy everything next frame
     // Windows excluded from capture (docky's Dock, menus, panels, in any process): Windows reports their redraws as changed
     // regions although the image behind them is unchanged. A change entirely inside one is "self" (checked with a GPU
     // comparison by the consumer); any other change is real and published at once (comparing every change added
@@ -279,9 +407,22 @@ private:
             return TRUE;
         }, reinterpret_cast<LPARAM>(&found));
         std::lock_guard<std::mutex> lock(mutex_);
+        // A window covering (nearly) the whole monitor, such as the Dock's Genie overlay (shown all the time, transparent,
+        // drawing only while a window minimizes), contains every change, so "inside an excluded window" says nothing
+        // about it; counting it sent every real change through the consumers' GPU comparison, about 9 ms (2 refreshes at
+        // 240 Hz) before publication (measured 2026-11-20). Both paths; DOCKY_KEEP_FULLSCREEN_EXCLUDED=1 restores the old
+        // classification (A/B test, fallback).
+        static const bool keepOld = [] { wchar_t v[4]{}; return GetEnvironmentVariableW(L"DOCKY_KEEP_FULLSCREEN_EXCLUDED", v, 4) && v[0] == L'1'; }();
+        if (!keepOld) {
+            const long long screen = static_cast<long long>(outputRect_.right - outputRect_.left) * (outputRect_.bottom - outputRect_.top);
+            found.erase(std::remove_if(found.begin(), found.end(), [&](const RECT& r) {
+                RECT in{}; if (!IntersectRect(&in, &r, &outputRect_)) return false;
+                return screen > 0 && static_cast<long long>(in.right - in.left) * (in.bottom - in.top) * 10 >= screen * 9;
+            }), found.end());
+        }
         excluded_.swap(found); excludedAt_ = GetTickCount64();
     }
-    SharedDesktop() = default;
+    SharedDesktop() { docky::capture_visible::Watch(); }  // screenshots: glass windows shown, frames held (capture_visible.h)
     bool Fail(HRESULT why) {
         if (!failed_) DLOG(L"desk glass: desktop duplication unavailable (0x%08X); GDI screen copy", static_cast<unsigned>(why));
         failed_ = true; failedAt_ = GetTickCount64(); Stop();
@@ -364,6 +505,7 @@ private:
         }
         ID3D11ShaderResourceView* none = nullptr; ctx_->PSSetShaderResources(0, 1, &none);
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+        ctx_->RSSetState(nullptr);  // owner mode shares this context with the renderer: leave no scissor state behind
         return true;
     }
     bool BuildShaders() {
@@ -410,8 +552,18 @@ private:
     RECT wanted_{};
     std::map<const void*, RECT> own_;
     mutable std::mutex mutex_;
-    std::condition_variable wake_, changed_;
+    std::condition_variable wake_, changed_, idle_;
     std::thread thread_;
+    Microsoft::WRL::ComPtr<ID3D11Device> ownerDevice_;  // owner mode: the render device the duplication lives on
+    DWORD ownerThread_ = 0;
+    std::atomic<bool> owner_{false};
+    bool pumping_ = false;                             // background thread inside Pump (under mutex_)
+    bool handover_ = false;                            // SetOwner waiting: the background thread takes no new frame
+    std::atomic<std::int64_t> lastPresentQpc_{0};
+public:
+    // Desktop frames taken / frames Windows composed meanwhile (AccumulatedFrames): their ratio shows skipped frames.
+    std::atomic<std::uint64_t> acquired_{0}, accumulated_{0};
+private:
     ULONGLONG idleSince_ = 0;  // when the last consumer stopped (0: in use)
     unsigned statFrames_ = 0; double statMs_ = 0, lastWaitMs_ = 0; ULONGLONG statSince_ = 0;  // debug statistics
 public:

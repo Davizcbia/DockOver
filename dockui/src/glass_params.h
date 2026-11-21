@@ -16,7 +16,10 @@ namespace dock {
 enum class MaterialKind : int { Liquid = 0, Smoked = 1 };
 enum class BackdropKind : int { Wallpaper = 0, Grid = 1, Gradient = 2, Dark = 3, None = 4, Live = 5 };
 
+enum class SettingsGlassShape { Standard, Sidebar, Capsule };
+
 struct GlassParameters {
+    SettingsGlassShape settingsShape = SettingsGlassShape::Standard; // Per draw, never persisted.
     // --- Glass Lab parameters (Lab key in comments where it differs) ---
     float radius = 22.0f;           // Lab "radius"/"corners"; Dock geometry default (macOS-measured)
     float bevelWidth = 16.0f;
@@ -72,7 +75,8 @@ struct GlassParameters {
 // Surface roles. Every glass surface is the shared base material (the Glass Studio tuning in a
 // process that loads it, Glass Lab defaults elsewhere) plus the few values its size and job need.
 // Callers still set per-instance geometry (radius) themselves.
-enum class GlassRole { Dock, DockLabel, Panel, Menu, ControlModule, PopupModule, FanCapsule, BackdropBlur };
+// Notification: Notification Center cards and banners (their own Glass Studio category).
+enum class GlassRole { Dock, DockLabel, Panel, Menu, ControlModule, PopupModule, FanCapsule, BackdropBlur, Notification };
 GlassParameters RoleGlass(GlassRole role, const GlassParameters& base);
 // Base = GlassSettingsStore::Get().Current(); Menu, ControlModule and PopupModule use their user-tunable categories.
 GlassParameters RoleGlass(GlassRole role);
@@ -84,8 +88,9 @@ GlassParameters RoleGlass(GlassRole role);
 //   MenuBarPanels - popups opened from menu bar items (Wi-Fi, Bluetooth, sound, battery) and the widget gallery / settings
 //   ControlCenter - the Control Center panel and its modules
 // The non-Dock sets live under "surfaces" in glass.json and fall back to GlassSurfaceDefault until edited.
-enum class GlassSurface : int { Dock = 0, Menus = 1, MenuBarPanels = 2, ControlCenter = 3, Controls = 4 };
-constexpr int kGlassSurfaceCount = 5;
+enum class GlassSurface : int { Dock = 0, Menus = 1, MenuBarPanels = 2, ControlCenter = 3, Controls = 4, SettingsSearch = 5, SettingsNavigation = 6,
+                                Notifications = 7 };
+constexpr int kGlassSurfaceCount = 8;
 const wchar_t* GlassSurfaceName(GlassSurface s);
 const char* GlassSurfaceKey(GlassSurface s);  // glass.json key
 // Built-in defaults: the tuning the user settled on (glass.json, 2026-11-12).

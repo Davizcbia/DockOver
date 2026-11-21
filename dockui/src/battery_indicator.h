@@ -24,7 +24,7 @@ inline void Draw(Gdiplus::Graphics& g, float cx, float cy, float scale, int perc
     body.AddArc(x,y,2*r,2*r,180,90); body.AddArc(x+w-2*r,y,2*r,2*r,270,90);
     body.AddArc(x+w-2*r,y+h-2*r,2*r,2*r,0,90); body.AddArc(x,y+h-2*r,2*r,2*r,90,90); body.CloseFigure();
     SolidBrush white(onLight?Color(217,0,0,0):Color(255,247,247,248)), grey(onLight?Color(255,168,168,171):Color(255,150,150,153)),
-               ink(onLight?Color(255,250,250,250):Color(255,10,10,12));
+               ink(onLight?Color(255,186,186,190):Color(255,10,10,12));
     g.FillPath(&grey,&body);
     auto saved=g.Save(); g.SetClip(&body,CombineModeIntersect);
     if(fill>0.f) g.FillRectangle(&white,x,y,fill,h);

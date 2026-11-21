@@ -66,6 +66,7 @@ Config LoadConfig(const std::wstring& path) {
     if (const Value* b = root.Find("builtins"); b && b->IsObject()) {
         c.wifi = Bool(*b, "wifi", true); c.sound = Bool(*b, "sound", true);
         c.battery = Bool(*b, "battery", true); c.control = Bool(*b, "controlCenter", true);
+        c.bluetooth = Bool(*b, "bluetooth", true); c.input = Bool(*b, "inputMenu", true);
     }
     c.hiddenIcons = Bool(root, "hiddenIcons", true);
     c.trayHost = Bool(root, "trayHost", true);
@@ -84,6 +85,7 @@ bool SaveConfig(const std::wstring& path, const Config& c) {
     Value b = Value::MakeObject();
     b.Set("wifi", Value::MakeBool(c.wifi)); b.Set("sound", Value::MakeBool(c.sound));
     b.Set("battery", Value::MakeBool(c.battery)); b.Set("controlCenter", Value::MakeBool(c.control));
+    b.Set("bluetooth", Value::MakeBool(c.bluetooth)); b.Set("inputMenu", Value::MakeBool(c.input));
     root.Set("builtins", std::move(b));
     root.Set("hiddenIcons", Value::MakeBool(c.hiddenIcons));
     root.Set("trayHost", Value::MakeBool(c.trayHost));
@@ -106,6 +108,8 @@ bool IsShown(const Config& c, const std::wstring& id) {
     if (id == L"builtin:sound") return c.sound;
     if (id == L"builtin:battery") return c.battery;
     if (id == L"builtin:control") return c.control;
+    if (id == L"builtin:bluetooth") return c.bluetooth;
+    if (id == L"builtin:input") return c.input;
     if (id.rfind(L"tray:", 0) == 0) return std::find(c.shown.begin(), c.shown.end(), id) != c.shown.end();
     if (id.rfind(L"ext:", 0) == 0) return std::find(c.hidden.begin(), c.hidden.end(), id) == c.hidden.end();
     return false;
@@ -116,6 +120,8 @@ void SetShown(Config& c, const std::wstring& id, bool shown) {
     else if (id == L"builtin:sound") c.sound = shown;
     else if (id == L"builtin:battery") c.battery = shown;
     else if (id == L"builtin:control") c.control = shown;
+    else if (id == L"builtin:bluetooth") c.bluetooth = shown;
+    else if (id == L"builtin:input") c.input = shown;
     else if (id.rfind(L"tray:", 0) == 0) {
         c.shown.erase(std::remove(c.shown.begin(), c.shown.end(), id), c.shown.end());
         if (shown) c.shown.push_back(id);

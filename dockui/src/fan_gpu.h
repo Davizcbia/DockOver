@@ -4,6 +4,7 @@
 // Only the Dock links it (it registers a factory); test executables keep the GDI+ layered fallback.
 #include <windows.h>
 #include <d2d1_1.h>
+#include <d3d11.h>
 
 #include <climits>
 #include <cstdint>
@@ -41,7 +42,9 @@ public:
 using FanRendererFactory = std::function<std::unique_ptr<IFanRenderer>()>;
 void SetFanRendererFactory(FanRendererFactory factory);
 
-// Dock side: creates the factory and pre-creates the D3D11 device on a background thread.
+// Dock side: creates the factory. The Fan draws with the device given to SetFanDevice (the Dock's own: the Fan runs on
+// the Dock's thread), or with one of its own made on first use when none was given.
 FanRendererFactory MakeGpuFanRendererFactory();
+void SetFanDevice(ID3D11Device* device);
 
 }  // namespace dock::downloads

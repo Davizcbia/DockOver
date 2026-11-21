@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <memory>
+#include <cstdint>
 
 namespace liquid::controls {
 
@@ -38,6 +40,18 @@ inline void MergeNetwork(std::vector<Network>& networks,const Network& item) {
     networks.push_back(item);
 }
 
+// A paired Bluetooth device as the menu bar's Bluetooth menu lists it (macOS: every paired device, connected ones
+// highlighted, a battery level where Windows knows one).
+enum class BtKind { Other, Keyboard, Mouse, Trackpad, Headphones, Speaker, Gamepad, Phone };
+struct BtDevice {
+    std::wstring name;
+    bool connected = false;
+    BtKind kind = BtKind::Other;
+    int battery = -1;  // 0..100, -1 unknown
+};
+// Device kind from the Bluetooth Class of Device (classic) and the name (LE / unknown classes). Pure, unit tested.
+BtKind BtKindOf(unsigned classOfDevice, const std::wstring& name);
+
 struct State {
     // Wi-Fi (WLAN API; radio switch through Windows.Devices.Radios)
     bool wifiAdapter = false, wifiConnected = false;
@@ -49,6 +63,7 @@ struct State {
     Radio btRadio = Radio::Unavailable;
     bool btSwitchable = false;
     std::vector<std::wstring> btDevices;  // currently connected devices
+    std::vector<BtDevice> btPaired;       // every paired device, sorted by name (filled with the device list)
     // Audio (Core Audio default render endpoint)
     bool audio = false, muted = false;
     int volume = 0;
@@ -62,6 +77,9 @@ struct State {
     // Media (GlobalSystemMediaTransportControls)
     bool media = false, playing = false, canPlayPause = false, canNext = false, canPrevious = false;
     std::wstring title, artist, source;
+    std::shared_ptr<const std::vector<uint32_t>> artwork;
+    uint32_t artworkWidth=0, artworkHeight=0;
+    uint64_t artworkHash=0;
     // Notifications / Focus: read-only hint from SHQueryUserNotificationState
     int notificationState = 0;
 };

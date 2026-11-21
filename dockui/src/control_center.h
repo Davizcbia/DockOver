@@ -18,6 +18,11 @@ void Toggle(const RECT& anchor, HWND notify, UINT notifyMessage);
 void ToggleSound(const RECT& anchor, HWND notify, UINT notifyMessage);
 // Wi-Fi detail uses the same state, rendering and controls as Control Center.
 void ToggleWifi(const RECT& anchor, HWND notify, UINT notifyMessage);
+// The menu bar's Bluetooth menu: the Bluetooth detail page on its own (paired devices, switch, settings link).
+void ToggleBluetooth(const RECT& anchor, HWND notify, UINT notifyMessage);
+// Where the next Toggle* call opens its panel: false (default) below the anchor (Menu Bar), true above it, centred on
+// the anchor (a Dock status cell). Applies to panels opened afterwards; the Menu Bar never sets it.
+void SetOpenAbove(bool above);
 // Updates an already-open panel after Menu Bar slot widths change.
 void UpdateAnchor(const RECT& anchor);
 bool IsOpen();

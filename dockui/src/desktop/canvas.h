@@ -35,6 +35,13 @@ struct Prefs {
     float glass = 0.6f;     // glass style only: tint strength 0..1
     bool menuBattery = true;               // accessory batteries as Menu Bar items (when docky's Menu Bar runs)
     bool fahrenheit = LocaleFahrenheit();  // weather units; default from the Windows measurement system
+    bool clockDark = false;                // digital Clock: white digits on a black plate (else black on white)
+    bool batteryGlass = true;              // Batteries: the whole plate is liquid glass over the wallpaper
+    // Liquid glass, tuned in the widget settings (Widgets & Stacks: edge highlight; Batteries: the glass plate)
+    float glassRim = 0.6f;                 // rim highlight on every widget edge (the Dock's fixed reflection), 0..1.5
+    float glassRefraction = 0.6f;          // lens along the edge of a glass plate, 0..1
+    float glassFrost = 0.3f;               // 0 sharp wallpaper .. 1 fully blurred
+    float glassTint = 0.35f;               // dark body tone, 0..1
     std::vector<std::wstring> batteryWidgetOff, batteryMenuOff;  // devices unticked in Settings > Batteries (by name)
 };
 inline bool NameListed(const std::vector<std::wstring>& list, const std::wstring& name) {
@@ -92,6 +99,11 @@ class Wallpaper {
 public:
     static Wallpaper& Get();
     void Invalidate();
+    // True when the desktop wallpaper differs from the one last built (another file, the same file rewritten, a new
+    // position or background colour). Windows does not always broadcast WM_SETTINGCHANGE for a new wallpaper (Settings
+    // app, slideshow, third-party changers), so the glass kept showing the old one; Desktop checks this every 2 s.
+    bool Stale();
+    bool RefreshMusic();
     // Premultiplied BGRA crop of the blurred wallpaper covering `screen` (physical px), at outW x outH.
     bool Sample(const RECT& screen, int outW, int outH, std::vector<std::uint32_t>& out);
     // Full-resolution (unblurred) wallpaper pixels for `screen`, opaque BGRA, one texel per physical pixel.
@@ -99,7 +111,9 @@ public:
 private:
     struct Monitor { RECT rect{}; int w = 0, h = 0; std::vector<std::uint32_t> pixels, sharp; };
     bool Build();
+    static std::wstring Signature();
     bool built_ = false;
+    std::wstring signature_;
     std::vector<Monitor> monitors_;
 };
 
@@ -107,9 +121,16 @@ private:
 void PaintGlass(ID2D1RenderTarget* rt, D2D1_RECT_F shape, float radius, const RECT& screen, const Theme& theme, float strength = 1.f);
 
 // Widget plate for the current style. Solid: an opaque rounded plate (light plate for `lightPlate` kinds such as the
-// digital clock, else the theme's dark or light surface) with a hairline edge and soft shadow. Returns the theme the
-// content should use on that plate.
-Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, const Theme& theme, bool lightPlate);
+// digital clock, a black one for `darkPlate`, else the theme's dark or light surface) with the liquid glass rim and a
+// soft shadow. Returns the theme the content should use on that plate.
+enum class PlateTone { Theme, Light, Black, Glass };
+Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, const Theme& theme, PlateTone tone);
+
+// The liquid glass rim (Prefs::glassRim; the Dock shader's fixed reflection): `outline` is a closed clockwise polygon.
+// On a light surface the highlight is mostly invisible, so a faint dark hairline keeps the edge.
+void PaintGlassRim(ID2D1RenderTarget* rt, const std::vector<D2D1_POINT_2F>& outline, bool lightSurface, float scale = 1.f);
+// A whole plate of liquid glass over the wallpaper (PlateTone::Glass): lens along the edge, frost, dark tint, rim.
+Theme PaintLiquidPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, const Theme& theme);
 
 // Premultiplied BGRA -> D2D bitmap for this render target.
 ComPtr<ID2D1Bitmap> MakeBitmap(ID2D1RenderTarget* rt, const std::uint32_t* pixels, UINT w, UINT h);

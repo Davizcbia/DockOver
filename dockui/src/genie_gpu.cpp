@@ -93,8 +93,7 @@ struct Renderer {
         try {
             auto pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(winrtDevice, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, item.Size());
             auto session = pool.CreateCaptureSession(item);
-            try { session.IsCursorCaptureEnabled(false); } catch (...) {}
-            try { session.IsBorderRequired(false); } catch (...) {}
+            if(!dock::PrepareCleanCaptureSession(session)){session.Close();pool.Close();return false;}
             session.StartCapture();
             const ULONGLONG t0 = GetTickCount64();
             while (!ok && GetTickCount64() - t0 < 400) {
@@ -232,8 +231,14 @@ struct Renderer {
                 winrt::check_hresult(interop->CreateForWindow(host, winrt::guid_of<wgc::GraphicsCaptureItem>(), winrt::put_abi(item)));
                 auto pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(winrtDevice, winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized, 1, item.Size());
                 auto session = pool.CreateCaptureSession(item);
-                try { session.IsCursorCaptureEnabled(false); } catch (...) {}
-                try { session.IsBorderRequired(false); } catch (...) {}
+                // The host is our own window parked 20000 px off every monitor, so Windows' yellow capture frame (and
+                // the cursor) can never show on screen: a clean session is preferred but not required here. Requiring
+                // it sent every Genie to the thumbnail-band fallback (visible horizontal strips) whenever borderless
+                // capture was not granted.
+                if (!dock::PrepareCleanCaptureSession(session)) {
+                    try { session.IsCursorCaptureEnabled(false); } catch (...) {}
+                    DLOG(L"minimize: Genie captures its off-screen host without borderless access");
+                }
                 session.StartCapture();
                 const ULONGLONG t0 = GetTickCount64();
                 while (!ok && GetTickCount64() - t0 < 400) {

@@ -18,7 +18,7 @@ std::wstring DecodeSsid(const DOT11_SSID& id){
  for(auto& ch:value)if(ch<32||ch==127)ch=L' ';return value;
 }
 }
-Snapshot Query(){
+Snapshot Query(bool listNetworks){
  Snapshot s;DWORD negotiated=0;HANDLE wlan=nullptr;
  if(WlanOpenHandle(2,nullptr,&negotiated,&wlan)==ERROR_SUCCESS){
   PWLAN_INTERFACE_INFO_LIST list=nullptr;const DWORD rc=WlanEnumInterfaces(wlan,nullptr,&list);
@@ -29,7 +29,7 @@ Snapshot Query(){
      if(WlanQueryInterface(wlan,&iface.InterfaceGuid,wlan_intf_opcode_current_connection,nullptr,&bytes,reinterpret_cast<PVOID*>(&info),&kind)==ERROR_SUCCESS&&info){
       if(s.ssid.empty())s.ssid=DecodeSsid(info->wlanAssociationAttributes.dot11Ssid);WlanFreeMemory(info);}}
     PWLAN_AVAILABLE_NETWORK_LIST networks=nullptr;
-    if(WlanGetAvailableNetworkList(wlan,&iface.InterfaceGuid,0,nullptr,&networks)==ERROR_SUCCESS&&networks){
+    if(listNetworks&&WlanGetAvailableNetworkList(wlan,&iface.InterfaceGuid,0,nullptr,&networks)==ERROR_SUCCESS&&networks){
      s.wifiListAvailable=true;for(DWORD j=0;j<networks->dwNumberOfItems && s.wifiNetworks.size()<32;++j){
       auto name=DecodeSsid(networks->Network[j].dot11Ssid);if(!name.empty()&&std::find(s.wifiNetworks.begin(),s.wifiNetworks.end(),name)==s.wifiNetworks.end())s.wifiNetworks.push_back(std::move(name));}
      WlanFreeMemory(networks);}

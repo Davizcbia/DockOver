@@ -22,10 +22,13 @@ bool Init(HWND dock, std::function<void(HWND, bool)> changed);
 void Shutdown();
 // Each Dock frame: the tile's icon rectangle in screen pixels (empty rect = not visible).
 void SetTileRect(HWND window, const RECT& screen);
+bool SuppressFallbackTile(HWND window);
 // Tile clicked: reverse Genie, then restore and activate the window.
 void Restore(HWND window);
 // Drops tiles of windows that were closed or restored elsewhere (call about once a second).
 void Prune();
+// Keeps the overlay directly above the Dock while it shows tiles (each frame is fine: checked at most every 100 ms).
+void KeepAbove();
 void SetGenie(bool enabled);
 bool Animating();
 // A full-screen app (game) owns the monitor: drop the low-level mouse hook (every mouse packet of the game went through

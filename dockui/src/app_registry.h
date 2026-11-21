@@ -27,6 +27,12 @@ std::wstring ExtraAppsDir();
 // Enumerates on the calling thread (COM must be initialised). Sorted by display name, duplicates and
 // obvious non-applications (uninstallers, documents, web links) removed. Returns false on failure.
 bool DiscoverApps(std::vector<AppEntry>& out, std::wstring& error);
+// Native Shell application entries, filtered to exclude visible maintenance
+// shortcuts and documents. Excludes Launchpad-only imports.
+bool DiscoverStartMenuApps(std::vector<AppEntry>& out, std::wstring& error);
+// Creates independent launch links/copies shortcuts; never moves or executes a source.
+// A stable source-path suffix makes repeated drops idempotent. Explicit directory supports tests.
+int AddFilesToLaunchpad(const std::vector<std::wstring>& paths, const std::wstring& directory, std::wstring& error);
 
 // Pure filter used by DiscoverApps; exposed for tests.
 bool IsLaunchableEntry(const std::wstring& name, const std::wstring& parsingName);

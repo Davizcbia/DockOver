@@ -37,7 +37,7 @@
 
 例外：自带深色方形背景的图标（如 6565732…）底色为其背景延伸。浅色模式没有缓存样本，规则未知。
 
-## 3. docky 的实现
+## 3. DockOver 的实现
 
 - `main.cpp` `App::UpdateDockAppBar`：底部 AppBar，厚度 = Dock 板上沿到屏幕底；同一边已有任务栏时只补差额；自动隐藏时不预留；退出与窗口销毁时 ABM_REMOVE；ABN_POSCHANGED 0.5 s 节流。替换了上一轮“松手后把窗口抬到 Dock 上沿”的 WinEvent 钩子。
 - `icon_mask.h` `MaskBackingColor`：深色 = 平均色 × 0.37（实测）；浅色 = 255 − (255 − 平均色) × 0.37（推测，非实测）。

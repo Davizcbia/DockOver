@@ -11,6 +11,14 @@ inline void Wifi(Gdiplus::Graphics& g,float cx,float cy,float k,Gdiplus::Color c
  const float by=cy+5.f*k;for(float rad:{4.2f,7.6f,11.f}){const float r=rad*k;g.DrawArc(&pen,cx-r,by-r,2*r,2*r,225.f,90.f);}
  SolidBrush brush(color);g.FillEllipse(&brush,cx-1.5f*k,by-1.5f*k,3.f*k,3.f*k);
 }
+// Bluetooth rune: a vertical stem with two arrowheads on the right, crossed by the two diagonals (15 x 7.6 DIP);
+// round caps and joins, 1.65 DIP stroke.
+inline void Bluetooth(Gdiplus::Graphics& g,float cx,float cy,float k,Gdiplus::Color color){
+ using namespace Gdiplus;g.SetSmoothingMode(SmoothingModeAntiAlias);Pen pen(color,1.65f*k);
+ pen.SetStartCap(LineCapRound);pen.SetEndCap(LineCapRound);pen.SetLineJoin(LineJoinRound);
+ const float x=cx-0.5f*k,t=cy-7.f*k,b=cy+7.f*k,w=3.8f*k;
+ const PointF p[]={{x-w,cy-3.7f*k},{x+w,cy+3.5f*k},{x,b},{x,t},{x+w,cy-3.5f*k},{x-w,cy+3.7f*k}};g.DrawLines(&pen,p,6);
+}
 inline void Speaker(Gdiplus::Graphics& g,float cx,float cy,float k,Gdiplus::Color color,bool available,bool muted,int volume){
  using namespace Gdiplus;g.SetSmoothingMode(SmoothingModeAntiAlias);
  const float x=cx-3.8f*k,y=cy;PointF p[]={{x-5.f*k,y-2.6f*k},{x-2.2f*k,y-2.6f*k},{x+2.2f*k,y-7.f*k},{x+2.2f*k,y+7.f*k},{x-2.2f*k,y+2.6f*k},{x-5.f*k,y+2.6f*k}};

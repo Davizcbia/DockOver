@@ -1,4 +1,4 @@
-# Liquid Desktop Design System V0.1
+# DockOver Design System V0.1
 
 共享 C++ 声明：src/design_tokens.h。所有尺寸以 DIP 表示，颜色为 sRGB；Windows 自带 Segoe UI，不依赖 SF Pro。数值是本项目的设计起点，不是 Apple 规范的固定数值。
 

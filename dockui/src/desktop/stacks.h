@@ -48,6 +48,8 @@ Stacks& GetStacks();
 // Hides Explorer's own desktop icons while Stacks are on, so files are not shown twice (restored on exit and on a
 // crash). Session-only: no Explorer setting is changed.
 void HideDesktopIcons(bool hide);
+// The Hide DockOver Desktop shortcut: hides Explorer's desktop icons that are showing, and shows them again afterwards.
+void HideDesktopIconsForShortcut(bool hide);
 void MaintainDesktopIcons();  // re-hide when Explorer recreated or re-showed its icon view
 
 }  // namespace docky::desk

@@ -36,3 +36,7 @@
 /local_private_packs/
 /dockui/examples/replica-v19/
 *.dockypack
+
+# Local experiments and generated outputs (large, not part of DockOver)
+/experiments/
+/outputs/

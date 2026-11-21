@@ -2,7 +2,8 @@
 // Menu Bar extras (V0.1): which items the right side of the menu bar shows, and third-party status items.
 //
 // Item ids:
-//   builtin:wifi | builtin:sound | builtin:battery | builtin:control  - docky's own status items
+//   builtin:wifi | builtin:sound | builtin:battery | builtin:control |
+//   builtin:bluetooth | builtin:input                                  - docky's own status items
 //   tray:<exe name>#<uid or guid>                                     - a Windows notification-area icon (tray_host.h)
 //   ext:<id>                                                          - a status item from the extension protocol
 // Visibility rules: built-ins are shown unless switched off; tray icons are hidden (they live in the Hidden Icons
@@ -36,7 +37,7 @@ struct StatusItem {
 };
 
 struct Config {
-    bool wifi = true, sound = true, battery = true, control = true;
+    bool wifi = true, sound = true, battery = true, control = true, bluetooth = true, input = true;
     bool hiddenIcons = true;  // the Hidden Icons chevron
     bool trayHost = true;     // collect notification-area icons (needed for Hidden Icons and promoted tray icons)
     std::vector<std::wstring> shown;   // promoted tray ids, in bar order (right to left)

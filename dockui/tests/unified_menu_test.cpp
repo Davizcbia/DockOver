@@ -63,6 +63,54 @@ int FallbackTest(){
  UINT dpi=GetDpiForWindow(owner);SendMessageW(h,WM_LBUTTONUP,0,MAKELPARAM(20,MulDiv(20,dpi,96)));Pump(250);
  if(IsWindowVisible(h)||selected!=77||closed!=1)return 52;DestroyWindow(owner);puts("PASS GDI fallback creation, selection and close");fflush(stdout);return 0;
 }
+int DismissalTest() {
+ popup::SetVisualCaptureTest(true);
+ const auto instance=GetModuleHandleW(nullptr);
+ const HWND owner=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"STATIC",L"Menu dismissal owner",WS_POPUP,80,80,600,340,nullptr,nullptr,instance,nullptr);
+ const HWND other=CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,L"STATIC",L"Menu dismissal focus target",WS_POPUP,440,80,200,100,nullptr,nullptr,instance,nullptr);
+ int closed=0;
+ const int result=[&]{
+  if(!owner||!other)return 80;
+  ShowWindow(owner,SW_SHOW);
+  SetForegroundWindow(owner);
+  Pump(120);
+  if(GetForegroundWindow()!=owner)return 81;
+  menu::MenuItem item;
+  item.text=L"Dismissal test";item.enabled=true;
+  auto open=[&]{return popup::Show(owner,POINT{270,195},{item},{},[&]{++closed;});};
+  HWND menu=open();
+  if(!menu)return 82;
+  Pump(350);
+  if(!IsWindowVisible(menu))return 83;
+  ShowWindow(other,SW_SHOW);
+  SetForegroundWindow(other);
+  Pump(400);
+  if(GetForegroundWindow()!=other||IsWindowVisible(menu)||closed!=1)return 87;
+  puts("PASS popup focus-loss dismissal");
+  ShowWindow(other,SW_HIDE);
+  SetForegroundWindow(owner);
+  Pump(120);
+  if(GetForegroundWindow()!=owner)return 81;
+  menu=open();
+  if(!menu)return 86;
+  Pump(350);
+  POINT original{};
+  const POINT outside{120,130};
+  if(WindowFromPoint(outside)!=owner||!GetCursorPos(&original)||!SetCursorPos(outside.x,outside.y))return 84;
+  INPUT click[2]{};
+  click[0].type=click[1].type=INPUT_MOUSE;
+  click[0].mi.dwFlags=MOUSEEVENTF_LEFTDOWN;click[1].mi.dwFlags=MOUSEEVENTF_LEFTUP;
+  const UINT sent=SendInput(ARRAYSIZE(click),click,sizeof(INPUT));
+  Pump(400);
+  SetCursorPos(original.x,original.y);
+  if(sent!=ARRAYSIZE(click)||IsWindowVisible(menu)||closed!=2||GetForegroundWindow()!=owner)return 85;
+  puts("PASS brief outside click with unchanged foreground");return 0;
+ }();
+ popup::Close();
+ if(other)DestroyWindow(other);
+ if(owner)DestroyWindow(owner);
+ return result;
+}
 struct HandleEntry {void* object;ULONG_PTR pid;ULONG_PTR value;ULONG access;USHORT creator;USHORT type;ULONG attributes;ULONG reserved;};
 struct HandleInfo {ULONG_PTR count;ULONG_PTR reserved;HandleEntry entries[1];};
 struct TypeName {USHORT length,maximum;wchar_t* buffer;};
@@ -129,6 +177,7 @@ int main(int argc,char** argv){
  if(argc>1&&std::string(argv[1])=="--visual"){int code=VisualTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
  if(argc>1&&std::string(argv[1])=="--integration"){int code=IntegrationTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
  if(argc>1&&std::string(argv[1])=="--fallback"){int code=FallbackTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
+ if(argc>1&&std::string(argv[1])=="--dismiss"){int code=DismissalTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
  if(argc>1&&std::string(argv[1])=="--stress"){int code=StressTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
  if(argc>1&&std::string(argv[1])=="--isolate"){int code=IsolateTest();if(SUCCEEDED(ro))RoUninitialize();return code;}
  puts("start");fflush(stdout);

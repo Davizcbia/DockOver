@@ -225,7 +225,7 @@ bool Import(const std::wstring& mdfDir, const std::wstring& dataDir, bool replac
     const auto lines = DockLinesFromIcoIni(Decode(bytes), r.dockSkipped);
     if (lines.empty()) { r.error = L"MyDockFinder's Dock list is empty; nothing was changed."; return false; }
     std::wstring dockText =
-        L"# Liquid Dock pinned items. One per line: target | arguments | label (arguments and label optional).\r\n"
+        L"# DockOver pinned items. One per line: target | arguments | label (arguments and label optional).\r\n"
         L"# Imported from MyDockFinder.\r\n";
     for (const auto& l : lines) dockText += l + L"\r\n";
     const std::wstring pinned = dataDir + L"\\pinned.txt";

@@ -1,4 +1,4 @@
-# docky — Windows Dock and Menu Bar
+# DockOver — Windows Dock and Menu Bar
 
 一个原生 Windows 11 Dock（V0.2 按 macOS 实测比例还原，见 `docs/v0.2-visual-gap-report.md`）：屏幕底部居中，显示真实应用图标，悬停时平滑放大并联动相邻图标，点击启动程序。不依赖 Qt，也不修改 `prototype/`（P0 捕获原型）或 Qt Liquid Glass Lab。
 
@@ -10,7 +10,7 @@
 powershell -ExecutionPolicy Bypass -File dockui\build.ps1 -Run
 ```
 
-构建后也可直接运行同一构建目录中的 LiquidDesktopManager.exe。三个程序须来自同一构建；独立 Dock 或 Menu Bar 已运行时，Manager 会提示用户先自行关闭，不接管或结束它们。通过 Menu Bar 的 Quit docky 退出托管组件。Windows 任务栏保持不变；当前生产守护尚未完成，Manager 即使收到 --hide-taskbar 也会拒绝隐藏。现有独立恢复工具仅用于保守处理旧记录，不能保证恢复所有异常状态。构建目录默认按工作树独立生成。工具链要求 Visual Studio 2022 MSVC、CMake 和 Ninja。
+构建后也可直接运行同一构建目录中的 LiquidDesktopManager.exe。三个程序须来自同一构建；独立 Dock 或 Menu Bar 已运行时，Manager 会提示用户先自行关闭，不接管或结束它们。通过 Menu Bar 的 Quit DockOver 退出托管组件。Windows 任务栏保持不变；当前生产守护尚未完成，Manager 即使收到 --hide-taskbar 也会拒绝隐藏。现有独立恢复工具仅用于保守处理旧记录，不能保证恢复所有异常状态。构建目录默认按工作树独立生成。工具链要求 Visual Studio 2022 MSVC、CMake 和 Ninja。
 
 | 操作 | 效果 |
 | --- | --- |

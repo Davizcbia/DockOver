@@ -5,6 +5,7 @@
 #include <d3d11.h>
 #include <dcomp.h>
 #include <dwrite.h>
+#include "status_group.h"
 #include <dxgi1_3.h>
 #include <wrl/client.h>
 
@@ -12,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <array>
 #include <functional>
 
 #include "backdrop.h"
@@ -34,12 +36,18 @@ struct IconVisual {
     float opacity = 1.0f;
     ID2D1Bitmap1* alt = nullptr;  // cross-faded state icon (Downloads while its Fan is open)
     float altBlend = 0.0f;
+    // The status group (status_group.h): drawn live into the tile's body instead of a bitmap.
+    const std::vector<std::wstring>* statusCells = nullptr;
+    const dock::statusgroup::State* statusState = nullptr;
+    int statusHover = -1;
 };
 
 struct MenuRowVisual {
     std::wstring text; bool enabled=false,checked=false,separator=false,submenu=false,hover=false;
-    std::shared_ptr<const liquid::menu::Icon> icon;  // 16 DIP, left of the text
+    std::shared_ptr<const liquid::menu::Icon> icon;  // 16 DIP, left of the text (grid: 26 DIP, centred in its cell)
 };
+// Grid popups (the Dock's Hidden Icons): square cells in rows, the hovered item's name in a footer strip below (DIP).
+inline constexpr float kMenuGridPad = 10.f, kMenuGridCell = 44.f, kMenuGridIcon = 26.f, kMenuGridFooter = 30.f, kMenuGridMinWidth = 200.f;
 // Optional locally sampled overlay, requested by custom UI after its opaque D2D
 // pass. The source is the current window's own pixels, never desktop capture.
 struct LocalGlassOverlay {
@@ -48,6 +56,8 @@ struct LocalGlassOverlay {
     D2D1_RECT_F sampleBounds{};
     GlassParameters params{};
     float pointerX = 0, pointerY = 0;
+    int cacheKey = 0;
+    float press = 1.f;
     float controlScale = 1.f; // full-size Lab control rendered at this output scale
     std::function<void(ID2D1DeviceContext*)> fallback;
     std::function<void(ID2D1DeviceContext*)> after;
@@ -56,6 +66,7 @@ struct Scene {
     // Optional custom content drawn over the material on the same D2D target.
     std::function<void(ID2D1DeviceContext*, bool)> customDraw;
     LocalGlassOverlay* localGlass = nullptr;
+    const std::vector<LocalGlassOverlay>* chromeGlass = nullptr;
     const DockFrame* frame = nullptr;
     const DockMetrics* metrics = nullptr;
     std::vector<IconVisual> icons;
@@ -63,6 +74,8 @@ struct Scene {
     bool opaqueFallback = false;
     COLORREF opaqueBackground = RGB(36,36,40), opaqueForeground = RGB(255,255,255);
     std::vector<MenuRowVisual> menuRows;
+    int menuGridColumns = 0;  // > 0: menuRows are grid cells, this many per row (kMenuGrid* layout)
+    std::wstring menuFooter;  // grid: the text in the footer strip
     int dragIndex = -1;
     bool showInsertion = false;
     float insertionX = 0;
@@ -111,12 +124,25 @@ public:
     void RequestSnapshot(const std::wstring& path) { snapshotPath_ = path; }
     void RequestPngSnapshot() { pngSnapshotRequested_ = true; }
     HRESULT Render(const Scene& scene);  // draws, presents (sync interval 1)
+    // Low-latency layering (opt-in, the Dock; see renderer.cpp): PrepareUi draws the D2D UI into a cached layer before
+    // the desktop frame is taken; Compose then draws only the GPU glass, lays the cached layer over it and presents.
+    // Compose returns S_FALSE when it cannot draw this scene (no cached layer, no backdrop, glass or label glass failed):
+    // the caller then uses Render.
+    bool CanCompose(const Scene& scene) const;
+    HRESULT PrepareUi(const Scene& scene);
+    HRESULT Compose(const Scene& scene);
+    bool UiValid() const { return uiValid_; }
+    void InvalidateUi() { uiValid_ = false; }
+    float LastUiMs() const { return lastUiMs_; }
+    uint64_t ComposedFrames() const { return composedFrames_; }
     HRESULT SetVisualOpacity(float opacity);
     HRESULT SetVisualOffsetY(float px);  // auto-hide slide (DirectComposition only)
     HANDLE Waitable() const { return waitable_; }
     HRESULT CreateIcon(const std::vector<uint32_t>& pixels, UINT w, UINT h, ComPtr<ID2D1Bitmap1>& icon,
                        ComPtr<ID2D1Bitmap1>& shadow, float& shadowPadRatio);
     HRESULT QueryFrameStats(UINT& presentCount, UINT& presentRefreshCount, UINT& syncRefreshCount);
+    // The newest Present's number, and which Present reached the screen at which QPC time (DXGI frame statistics).
+    bool PresentTiming(UINT& lastPresentCount, UINT& shownPresentCount, LONGLONG& shownQpc);
     D3D_FEATURE_LEVEL FeatureLevel() const { return featureLevel_; }
     const wchar_t* MaterialName() const { return material_ ? material_->Name() : L"none"; }
     ID3D11Device* Device() const { return d3d_.Get(); }
@@ -134,6 +160,15 @@ public:
     bool PollGpuTimes(float& frameMs, float& glassMs);
 
 private:
+    void RenderGlassLayers(const Scene& scene);  // GPU plate + label glass; sets lastUsedGpu_ / labelUsedGpu_
+    HRESULT FinishFrame(const Scene& scene, HRESULT drawResult, double t0);
+    HRESULT PresentFrame(const Scene& scene);  // local/chrome glass overlays, snapshots, Present
+    ComPtr<ID2D1Bitmap1> uiBitmap_;              // cached UI layer (low-latency path)
+    UINT uiW_ = 0, uiH_ = 0;
+    float uiDpi_ = 0.0f;
+    bool uiValid_ = false;
+    float lastUiMs_ = 0.0f;
+    uint64_t composedFrames_ = 0;
     HRESULT CreateTarget();
     bool RenderLocalGlass(const LocalGlassOverlay& overlay);
     void DrawScene(const Scene& scene, bool drawPlate);
@@ -171,8 +206,8 @@ private:
     std::unique_ptr<IPlateMaterial> liquid_;    // Liquid Glass (GPU)
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<ID3D11RenderTargetView> rtv_;
-    ComPtr<ID3D11Texture2D> localScene_;
-    UINT localSceneW_ = 0, localSceneH_ = 0;
+    struct LocalGlassCache {ComPtr<ID3D11Texture2D> scene;UINT width=0,height=0;std::unique_ptr<IPlateMaterial> material;};
+    std::array<LocalGlassCache,4> localGlassCaches_;
     uint64_t localSceneFrame_ = 0;
     UINT targetW_ = 0, targetH_ = 0;
     GpuTimer timer_;

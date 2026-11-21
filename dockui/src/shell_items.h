@@ -20,6 +20,8 @@ struct PinnedItem {
     bool isSystemSeparator = false;  // section boundary synthesized at runtime: never saved, never removable
     bool isTransient = false;    // running but not pinned: shown while running, never persisted
     bool isMinimized = false;    // a minimized window's tile (minimize_dock.h); window = that window; never persisted
+    bool isStatusGroup = false;  // the menu bar status items as one Dock tile (status_group.h); from shared settings, never persisted
+    std::vector<std::wstring> statusCells;  // status tiles: the cells this tile shows (one whole-icon cell, or the half-size group)
     std::string stableId;        // Application namespace; independent of display label and icon path.
     // Resolved data:
     std::wstring label;

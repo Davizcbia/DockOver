@@ -29,12 +29,16 @@ using Microsoft::WRL::ComPtr;
 namespace dock::downloads {
 namespace {
 
-// One D3D11 device for every Fan opening (creating one took 165-210 ms in the Control Center measurements).
+// One D3D11 device for every Fan opening (creating one took 165-210 ms in the Control Center measurements). The Dock
+// hands over its own device (SetFanDevice): the Fan runs on the Dock's thread, and every extra hardware device costs
+// about 37 driver threads plus its memory. Without one, a device of its own is made on first use.
 std::mutex g_deviceMutex;
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11DeviceContext> g_context;
+ComPtr<ID3D11Device> g_given;
 HRESULT SharedDevice(ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& context) {
     std::lock_guard<std::mutex> lock(g_deviceMutex);
+    if (g_given && g_given->GetDeviceRemovedReason() == S_OK) { device = g_given; g_given->GetImmediateContext(&context); return S_OK; }
     if (g_device && g_device->GetDeviceRemovedReason() != S_OK) { g_device.Reset(); g_context.Reset(); }
     if (!g_device) {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
@@ -410,14 +414,14 @@ private:
 }  // namespace
 
 FanRendererFactory MakeGpuFanRendererFactory() {
-    std::thread([] {
-        ComPtr<ID3D11Device> d;
-        ComPtr<ID3D11DeviceContext> c;
-        const double t = NowMs();
-        const HRESULT hr = SharedDevice(d, c);
-        DLOG(L"fan gpu: prewarm device hr=0x%08X in %.1f ms", static_cast<unsigned>(hr), NowMs() - t);
-    }).detach();
+    // No prewarm device: the Dock hands over its own (SetFanDevice), which is ready before the first Fan opens.
     return [] { return std::unique_ptr<IFanRenderer>(new GpuFanRenderer()); };
+}
+
+void SetFanDevice(ID3D11Device* device) {
+    std::lock_guard<std::mutex> lock(g_deviceMutex);
+    g_given = device;
+    if (device) { g_device.Reset(); g_context.Reset(); }  // the fallback device is no longer needed
 }
 
 }  // namespace dock::downloads

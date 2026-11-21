@@ -1,6 +1,6 @@
-# docky Workshop V0.19
+# DockOver Workshop V0.19
 
-Workshop stores local static resources in `%LOCALAPPDATA%\docky\workshop`, separately from existing Liquid Desktop settings and program files. Settings > Workshop supports import, export, enable/disable, delete and Restore Default. Multiple installed packs can be selected; imports with an existing ID and exports to an existing file are refused. Selection survives restart. The Menu Bar polls selection changes and loads images in the background; missing, invalid or damaged resources fall back to built-in icons. It checks for damage periodically. No scripts, executables, external URLs or online service are supported.
+Workshop stores local static resources in `%LOCALAPPDATA%\docky\workshop`, separately from existing DockOver settings and program files. Settings > Workshop supports import, export, enable/disable, delete and Restore Default. Multiple installed packs can be selected; imports with an existing ID and exports to an existing file are refused. Selection survives restart. The Menu Bar polls selection changes and loads images in the background; missing, invalid or damaged resources fall back to built-in icons. It checks for damage periodically. No scripts, executables, external URLs or online service are supported.
 
 ## Pack format
 

@@ -5,7 +5,7 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef LIQUID_BUILD_ID)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/liquid_build_id.h" "#pragma once\n#define LIQUID_BUILD_MARKER \"LiquidDesktopBuild:${LIQUID_BUILD_ID}\"\n")
 # Software update (Settings > About): the version is the GitHub release tag; see package_docky.ps1.
-set(DOCKY_VERSION "0.3.0")  # the GitHub release tag of this version; raise it for every release
+set(DOCKY_VERSION "1.0.0")  # the GitHub release tag of this version; raise it for every release
 set(DOCKY_UPDATE_REPO "Davizcbia/DockOver")  # GitHub repository whose releases carry updates (public)
 set(DOCKY_UPDATE_ASSET "DockOver-Windows-Portable")  # name prefix of the release's portable zip
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/docky_version.h.tmp" "#pragma once\n#define DOCKY_VERSION \"${DOCKY_VERSION}\"\n#define DOCKY_UPDATE_REPO \"${DOCKY_UPDATE_REPO}\"\n#define DOCKY_UPDATE_ASSET \"${DOCKY_UPDATE_ASSET}\"\n")
@@ -30,6 +30,8 @@ add_shader(glass.hlsl VSMain vs_5_0 g_GlassVS glass_vs.h)
 add_shader(glass.hlsl PSMain ps_5_0 g_GlassPS glass_ps.h)
 add_shader(blur.hlsl PSDown ps_5_0 g_BlurDownPS blur_down_ps.h)
 add_shader(blur.hlsl PSBlur ps_5_0 g_BlurPS blur_ps.h)
+add_shader(silk.hlsl VSMain vs_5_0 g_SilkVS silk_vs.h)
+add_shader(silk.hlsl PSMain ps_5_0 g_SilkPS silk_ps.h)
 add_shader(roi_compare.hlsl CSMain cs_5_0 g_RoiCompareCS roi_compare_cs.h)
 add_shader(genie.hlsl VSMain vs_5_0 g_GenieVS genie_vs.h)
 add_shader(genie.hlsl PSMain ps_5_0 g_GeniePS genie_ps.h)
@@ -45,7 +47,7 @@ add_executable(LiquidDock WIN32
     src/fan_gpu.cpp
     src/unified_menu.cpp
     src/menu_surface.cpp
-    src/renderer.cpp
+    src/renderer.cpp src/status_group.cpp
     src/shell_items.cpp
     src/custom_icons.cpp
     src/icon_editor.cpp
@@ -58,7 +60,14 @@ add_executable(LiquidDock WIN32
     src/glass_studio.cpp
     src/app_registry.cpp
     src/launchpad_model.cpp
-    src/launchpad.cpp)
+    src/launchpad.cpp
+    src/status_popups.cpp
+    src/status_hosts.cpp
+    src/tray_host.cpp
+    src/menubar_extras.cpp
+    src/control_center.cpp
+    src/system_controls.cpp
+    src/system_status.cpp)
 add_dependencies(LiquidDock LiquidDockShaders)
 target_include_directories(LiquidDock PRIVATE ${SHADER_OUT})
 target_compile_features(LiquidDock PRIVATE cxx_std_20)
@@ -67,7 +76,7 @@ if(MSVC)
     target_compile_options(LiquidDock PRIVATE /utf-8 /W4 /permissive-)
 endif()
 target_link_libraries(LiquidDock PRIVATE gdiplus d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid shell32 ole32 propsys version uuid
-    windowscodecs comctl32 comdlg32 windowsapp runtimeobject bcrypt imm32)
+    windowscodecs comctl32 comdlg32 windowsapp runtimeobject bcrypt imm32 wlanapi oleaut32 wbemuuid advapi32 setupapi)
 
 # Separate read-only diagnostic; does not alter or launch LiquidDock.
 add_library(LiquidTaskbarStatusCore STATIC src/taskbar_status.cpp src/taskbar_snapshot.cpp src/taskbar_ownership.cpp)
@@ -92,6 +101,17 @@ add_executable(DockyFrameReadyTest tests/frame_ready_test.cpp)
 target_compile_features(DockyFrameReadyTest PRIVATE cxx_std_20)
 target_compile_definitions(DockyFrameReadyTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_include_directories(DockyFrameReadyTest PRIVATE src)
+
+add_executable(DockyStatusGroupTest tests/status_group_test.cpp src/status_group.cpp src/custom_icons.cpp src/json_lite.cpp)
+target_compile_features(DockyStatusGroupTest PRIVATE cxx_std_20)
+target_compile_definitions(DockyStatusGroupTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockyStatusGroupTest PRIVATE src)
+target_link_libraries(DockyStatusGroupTest PRIVATE d2d1 dwrite windowscodecs ole32 shell32 shlwapi bcrypt d3d11 dxgi dxguid uuid)
+
+add_executable(DockyCalendarConfigTest tests/calendar_config_test.cpp)
+target_compile_features(DockyCalendarConfigTest PRIVATE cxx_std_20)
+target_compile_definitions(DockyCalendarConfigTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockyCalendarConfigTest PRIVATE src)
 
 add_executable(DockyLaunchpadDensityTest tests/launchpad_density_test.cpp)
 target_compile_features(DockyLaunchpadDensityTest PRIVATE cxx_std_20)
@@ -177,17 +197,44 @@ if(MSVC)
 endif()
 
 # Standalone, non-activating Menu Bar prototype.
-set(LIQUID_MENU_SURFACE_SOURCES src/menu_surface.cpp src/renderer.cpp src/material.cpp src/liquid_glass.cpp src/backdrop_wgc.cpp src/glass_params.cpp src/json_lite.cpp src/dock_model.cpp)
-add_executable(LiquidMenuBar WIN32 src/menu_bar.cpp src/native_menu.cpp src/system_status.cpp src/unified_menu.cpp src/system_controls.cpp src/control_center.cpp ${LIQUID_MENU_SURFACE_SOURCES})
+set(LIQUID_MENU_SURFACE_SOURCES src/menu_surface.cpp src/renderer.cpp src/status_group.cpp src/material.cpp src/liquid_glass.cpp src/backdrop_wgc.cpp src/glass_params.cpp src/json_lite.cpp src/dock_model.cpp)
+add_executable(LiquidMenuBar WIN32 src/menu_bar.cpp src/native_menu.cpp src/system_status.cpp src/unified_menu.cpp src/system_controls.cpp src/control_center.cpp src/status_popups.cpp src/notification_center.cpp src/shell_items.cpp src/custom_icons.cpp ${LIQUID_MENU_SURFACE_SOURCES})
 add_custom_command(TARGET LiquidMenuBar POST_BUILD
  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/assets/user-sound" "$<TARGET_FILE_DIR:LiquidMenuBar>/assets/user-sound")
 add_dependencies(LiquidMenuBar LiquidDockShaders)
 target_include_directories(LiquidMenuBar PRIVATE ${SHADER_OUT})
 target_compile_features(LiquidMenuBar PRIVATE cxx_std_20)
 target_compile_definitions(LiquidMenuBar PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(LiquidMenuBar PRIVATE gdiplus user32 gdi32 shell32 advapi32 wlanapi ole32 oleaut32 wbemuuid uuid d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid windowscodecs windowsapp runtimeobject)
+target_link_libraries(LiquidMenuBar PRIVATE gdiplus user32 gdi32 shell32 shcore propsys version bcrypt advapi32 wlanapi ole32 oleaut32 wbemuuid uuid d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid windowscodecs windowsapp runtimeobject)
 if(MSVC)
     target_compile_options(LiquidMenuBar PRIVATE /utf-8 /W4 /bigobj)
+endif()
+
+# Full-screen Now Playing (Apple Music lock-screen style, still and motion artwork). Opened from the
+# Control Center media card; docs/now-playing-v01.md.
+add_executable(DockyNowPlaying WIN32 src/now_playing/now_playing_main.cpp src/now_playing/artwork_source.cpp src/now_playing/lyrics_source.cpp src/now_playing/audio_beat.cpp)
+set_target_properties(DockyNowPlaying PROPERTIES OUTPUT_NAME docky-now-playing)
+target_compile_features(DockyNowPlaying PRIVATE cxx_std_20)
+target_compile_definitions(DockyNowPlaying PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(DockyNowPlaying PRIVATE LiquidDesktopSettings user32 shell32 ole32 oleaut32 uuid d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid windowscodecs
+    mfplat mfuuid winhttp windowsapp runtimeobject)
+if(MSVC)
+    target_compile_options(DockyNowPlaying PRIVATE /utf-8 /W4 /permissive- /bigobj)
+endif()
+add_dependencies(LiquidMenuBar DockyNowPlaying)
+add_dependencies(DockyNowPlaying LiquidDockShaders)
+target_include_directories(DockyNowPlaying PRIVATE ${SHADER_OUT})
+add_executable(DockyBeatProbe tools/beat_probe.cpp src/now_playing/audio_beat.cpp)  # also: --file <audio> runs the tracker offline (Media Foundation)
+set_target_properties(DockyBeatProbe PROPERTIES OUTPUT_NAME docky-beat-probe)
+target_compile_features(DockyBeatProbe PRIVATE cxx_std_20)
+target_compile_definitions(DockyBeatProbe PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(DockyBeatProbe PRIVATE ole32 mfplat mfreadwrite mfuuid)
+add_executable(DockyNowPlayingHlsTest tests/now_playing_hls_test.cpp src/now_playing/artwork_source.cpp)
+target_compile_definitions(DockyNowPlayingHlsTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(DockyNowPlayingHlsTest PRIVATE LiquidDesktopSettings ole32 uuid windowscodecs winhttp)
+target_compile_features(DockyNowPlayingHlsTest PRIVATE cxx_std_20)
+if(MSVC)
+    target_compile_options(DockyNowPlayingHlsTest PRIVATE /utf-8 /W4)
 endif()
 
 add_executable(LiquidNativeMenuTest tests/native_menu_test.cpp src/native_menu.cpp)
@@ -276,7 +323,13 @@ target_include_directories(LiquidDesktopSettingsApp PRIVATE "${CMAKE_CURRENT_BIN
 target_link_libraries(LiquidDesktopSettingsApp PRIVATE LiquidDesktopSettings d2d1 dwrite dwmapi shell32 advapi32)
 
 # Settings reuses the same GPU material, renderer, shader bytecode and WGC source as menus.
-target_sources(LiquidDesktopSettingsApp PRIVATE ${LIQUID_MENU_SURFACE_SOURCES})
+set(SETTINGS_GLASS_SHADER "${CMAKE_CURRENT_SOURCE_DIR}/../experiments/liquid-glass-27/glass27.hlsl")
+add_custom_command(OUTPUT "${SHADER_OUT}/settings_glass_ps.h"
+    COMMAND ${FXC_EXECUTABLE} /nologo /O3 /WX /T ps_5_0 /E PSSettings /I "${CMAKE_CURRENT_SOURCE_DIR}/shaders"
+            /Vn g_GlassPS /Fh "${SHADER_OUT}/settings_glass_ps.h" "${SETTINGS_GLASS_SHADER}"
+    DEPENDS "${SETTINGS_GLASS_SHADER}" "${CMAKE_CURRENT_SOURCE_DIR}/shaders/glass.hlsl" VERBATIM)
+target_compile_definitions(LiquidDesktopSettingsApp PRIVATE DOCKOVER_SETTINGS_GLASS)
+target_sources(LiquidDesktopSettingsApp PRIVATE ${LIQUID_MENU_SURFACE_SOURCES} "${SHADER_OUT}/settings_glass_ps.h")
 add_dependencies(LiquidDesktopSettingsApp LiquidDockShaders)
 target_include_directories(LiquidDesktopSettingsApp PRIVATE ${SHADER_OUT})
 target_link_libraries(LiquidDesktopSettingsApp PRIVATE d3d11 dxgi dcomp dxguid ole32 propsys version uuid windowscodecs comctl32 comdlg32 windowsapp runtimeobject bcrypt)
@@ -300,6 +353,14 @@ target_include_directories(DockyMotionTest PRIVATE src)
 add_executable(LiquidDockVisualModelTest tests/dock_model_visual_test.cpp src/dock_model.cpp)
 target_compile_features(LiquidDockVisualModelTest PRIVATE cxx_std_20)
 target_include_directories(LiquidDockVisualModelTest PRIVATE src)
+
+add_executable(DockySettingsGlassTest tests/settings_glass_test.cpp src/glass_params.cpp src/json_lite.cpp)
+target_compile_features(DockySettingsGlassTest PRIVATE cxx_std_20)
+target_compile_definitions(DockySettingsGlassTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockySettingsGlassTest PRIVATE src)
+if(MSVC)
+ target_compile_options(DockySettingsGlassTest PRIVATE /utf-8)
+endif()
 
 # Explicit opt-in, read-only diagnostics for windows owned by adjacent docky binaries.
 add_executable(DockyGuiDiagnostics tools/gui_diagnostics.cpp)
@@ -378,7 +439,7 @@ set_target_properties(DockyDesktop PROPERTIES OUTPUT_NAME DockOverDesktop)  # th
 target_include_directories(DockyDesktop PRIVATE src ${SHADER_OUT})
 target_compile_features(DockyDesktop PRIVATE cxx_std_20)
 target_compile_definitions(DockyDesktop PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
-target_link_libraries(DockyDesktop PRIVATE winhttp setupapi hid xinput urlmon user32 gdi32 shell32 shcore ole32 oleaut32 uuid advapi32 d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid windowscodecs windowsapp runtimeobject winmm)
+target_link_libraries(DockyDesktop PRIVATE winhttp setupapi hid xinput urlmon user32 gdi32 comdlg32 shell32 shcore ole32 oleaut32 uuid advapi32 d3d11 dxgi dcomp d2d1 dwrite dwmapi dxguid windowscodecs windowsapp runtimeobject winmm)
 if(MSVC)
   target_compile_options(DockyDesktop PRIVATE /utf-8 /W4 /bigobj)
   target_link_options(DockyDesktop PRIVATE /MAP)
@@ -407,6 +468,7 @@ if(MSVC)
   target_compile_options(docky-updater PRIVATE /utf-8 /W4)
 endif()
 add_dependencies(LiquidDesktopSettingsApp docky-updater)
+add_dependencies(LiquidDesktopManager LiquidDesktopSettingsApp)
 add_executable(DockyUpdateVersionTest tests/update_version_test.cpp src/update_client.cpp src/json_lite.cpp)
 target_compile_features(DockyUpdateVersionTest PRIVATE cxx_std_20)
 target_compile_definitions(DockyUpdateVersionTest PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -445,6 +507,8 @@ BEGIN
   END
 END
 ")
+  file(APPEND "${rc}.tmp" "1 ICON \"${CMAKE_CURRENT_SOURCE_DIR}/assets/dockover.ico\"
+")  # app icon (taskbar, Explorer, Alt+Tab)
   configure_file("${rc}.tmp" "${rc}" COPYONLY)
   target_sources(${target} PRIVATE "${rc}")
 endfunction()
@@ -455,6 +519,7 @@ docky_version_resource(LiquidDesktopSettingsApp "DockOver Settings")
 docky_version_resource(DockyDesktop "DockOver Desktop")
 docky_version_resource(docky-updater "DockOver Updater")
 docky_version_resource(DockyTaskbarGuardian "DockOver Taskbar Guardian")
+docky_version_resource(DockyNowPlaying "DockOver Now Playing")
 
 # ---- Release launcher: DockOver.exe in a release folder starts runtime\LiquidDesktopManager.exe (package_docky.ps1 -Release) ----
 add_executable(DockOverLauncher WIN32 tools/launcher_main.cpp)
@@ -463,3 +528,9 @@ target_compile_features(DockOverLauncher PRIVATE cxx_std_20)
 target_compile_definitions(DockOverLauncher PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_link_libraries(DockOverLauncher PRIVATE user32 shell32)
 docky_version_resource(DockOverLauncher "DockOver")
+
+add_subdirectory(applications)
+add_dependencies(LiquidDock DockOverApplications)
+
+add_executable(DockyApplicationsWinKeyTest tests/applications_win_key_test.cpp)
+target_compile_features(DockyApplicationsWinKeyTest PRIVATE cxx_std_20)

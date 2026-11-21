@@ -184,6 +184,22 @@ bool CustomIconStore::Load(const std::wstring& path,std::wstring& error) {
     for(const auto& kv:root.object)if(kv.first!="format"&&kv.first!="version"&&kv.first!="icons"&&kv.first!="edits")extraRoot_.Set(kv.first,kv.second);
     icons_=std::move(parsed);edits_=std::move(parsedEdits);loadedBytes_=bytes;hadFile_=true;available_=true;return true;
 }
+std::wstring CustomIconStore::Label(const std::string& id) const {
+    const auto* labels=extraRoot_.Find("labels");
+    const auto* entry=labels&&labels->IsObject()?labels->Find(id):nullptr;
+    return entry&&entry->type==json::Value::Type::String?json::FromUtf8(entry->string):std::wstring{};
+}
+bool CustomIconStore::SetLabel(const std::string& id,const std::wstring& label,std::wstring& error){
+    if(!available_||id.empty()){error=L"Icon settings are unavailable.";return false;}
+    const auto previous=extraRoot_;
+    const auto* saved=extraRoot_.Find("labels");
+    auto labels=saved&&saved->IsObject()?*saved:json::Value::MakeObject();
+    labels.Set(id,json::Value::MakeString(json::ToUtf8(label)));
+    extraRoot_.Set("labels",std::move(labels));
+    if(Save(icons_,edits_,error))return true;
+    extraRoot_=previous;
+    return false;
+}
 const std::wstring* CustomIconStore::Find(const std::string& id)const {auto it=icons_.find(id);return it==icons_.end()?nullptr:&it->second;}
 bool CustomIconStore::Set(const std::string& id,const std::wstring& path,std::wstring& error){if(!available_||id.empty()||path.empty()){error=L"Icon settings are unavailable.";return false;}auto next=icons_;next[id]=path;if(!Save(next,edits_,error))return false;icons_=std::move(next);return true;}
 bool CustomIconStore::Remove(const std::string& id,std::wstring& error){if(!available_||id.empty()){error=L"Icon settings are unavailable.";return false;}auto next=icons_;auto nextEdits=edits_;const bool had=next.erase(id)>0;const bool hadEdit=nextEdits.erase(id)>0;if(!had&&!hadEdit)return true;if(!Save(next,nextEdits,error))return false;icons_=std::move(next);edits_=std::move(nextEdits);return true;}
