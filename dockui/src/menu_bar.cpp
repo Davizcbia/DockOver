@@ -376,7 +376,8 @@ void RemoveAppBar(HWND h){if(!appBarRegistered)return;APPBARDATA a{sizeof(a)};a.
 // A drag that starts on a maximized window (Windows restores it under the cursor) gets its limits once it has restored.
 // Apps that move their windows themselves (no system move loop) are corrected when the button is released.
 // Optionally (Settings > Dock) the Windows snap-layout bar that appears at the top during a drag is hidden.
-constexpr UINT_PTR kDragClipTimer=13,kReleaseCheckTimer=15;
+constexpr UINT_PTR kDragClipTimer=13,kReleaseCheckTimer=15,kFullscreenGrowTimer=18,kUnsnapTimer=19;
+extern HWND fullscreenWindow;
 constexpr UINT kDockFullscreenMsg=WM_APP+79;  // to the Dock: wParam 1 = a full-screen app owns the monitor
 bool hideSnapLayouts=false,rawMouseRegistered=false;
 bool gameCompatibility=false,gameSuppressed=false;
@@ -518,6 +519,7 @@ void ClampBelowBar(HWND w,const wchar_t* why){
     SetWindowPos(w,nullptr,frame.left,frame.top+dy,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOOWNERZORDER|SWP_ASYNCWINDOWPOS);
     DLOG(L"menu: window moved below the bar by %d px (%ls)",dy,why);
 }
+bool UnfillForDrag(HWND w,POINT pt);
 void CALLBACK OnMoveSizeStart(HWINEVENTHOOK,DWORD,HWND w,LONG object,LONG,DWORD,DWORD eventTime){
     ReleaseDragClip();
     if(object!=OBJID_WINDOW||!w||!barWindow||GetAncestor(w,GA_ROOT)!=w||!IsWindowVisible(w)||IsIconic(w))return;
@@ -540,6 +542,9 @@ void CALLBACK OnMoveSizeStart(HWINEVENTHOOK,DWORD,HWND w,LONG object,LONG,DWORD,
     auto onBorder=[&](POINT p){return p.x<visible.left+edge||p.x>=visible.right-edge||p.y<visible.top+Px(3)||p.y>=visible.bottom-edge;};
     {wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: move start class=%ls zoomed=%d pt=%ld,%ld press=%ld,%ld visible=%ld,%ld-%ld,%ld",cls,zoomed?1:0,pt.x,pt.y,press.x,press.y,visible.left,visible.top,visible.right,visible.bottom);}
     if(!zoomed&&onBorder(pt)&&onBorder(press)){DLOG(L"menu: drag not limited (resize border)");return;}
+    if(!zoomed&&UnfillForDrag(w,pt)){
+        if(GetWindowRect(w,&frame)&&FAILED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))visible=frame;
+    }
     DragClip c;c.active=true;c.target=w;c.startVisible=visible;c.workTop=mi.rcWork.top;c.workBottom=mi.rcWork.bottom;c.lastPt=pt;
     c.virt={GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
     c.clip=c.virt;c.pending=zoomed;
@@ -573,58 +578,144 @@ void OnLeftDown(){
     captionPress={root,GetTickCount64(),ht==HTMAXBUTTON||(geometric&&ht!=HTCLOSE&&ht!=HTMINBUTTON&&ht!=HTCAPTION)};
     if(captionPress.maxButton)DLOG(L"menu: press on a maximize button (hit %d)",static_cast<int>(ht));
 }
-// Windows keeps a maximized window inside the work area (measured: resizing it to the monitor does not stick), so full
-// screen is a normal window covering the whole monitor; its own size before maximizing is kept and restored when the
-// maximize button (or a title-bar double-click) maximizes it again, which is how full screen is left.
-struct FullscreenWindow{HWND w=nullptr;RECT normal{};};
+// ---- Fill, split and full screen (macOS) --------------------------------------------------------------------------------
+// * Double-click on the title bar, or a window held against the menu bar while dragging: Fill. The window stays a normal
+//   window, resized to the area between the menu bar and the Dock with no margin; its rounded corners stay. Doing it
+//   again, or dragging the window away, gives back its previous size.
+// * Split (Windows Snap: screen edges, Win+arrows, snap layouts) is turned into the same kind of normal window at the
+//   snapped size, so it keeps rounded corners and is not in Windows' arranged state either.
+// * The maximize button (macOS's green button) is real full screen: the window stays maximized (square corners, its own
+//   maximize/restore state), and while it is in front the menu bar and the Dock hide and release their reserved space,
+//   so Windows grows the maximized window to the whole monitor. Restore (button, double-click, Win+Down) leaves it.
+struct FullscreenWindow{HWND w=nullptr;};
 std::vector<FullscreenWindow> buttonFullscreen;
+struct FilledWindow{HWND w=nullptr;RECT normal{};};  // normal: the size to give back, in workspace coordinates
+std::vector<FilledWindow> filledWindows;
 bool fullscreenBusy=false;
-POINT WorkspaceOffset(){  // SetWindowPlacement uses workspace coordinates: origin at the primary monitor's work area
-    MONITORINFO mi{sizeof(mi)};const POINT origin{0,0};GetMonitorInfoW(MonitorFromPoint(origin,MONITOR_DEFAULTTOPRIMARY),&mi);
-    return {mi.rcWork.left-mi.rcMonitor.left,mi.rcWork.top-mi.rcMonitor.top};
-}
 bool CoversMonitor(HWND w){
     MONITORINFO mi{sizeof(mi)};RECT r{};if(!GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi)||!GetWindowRect(w,&r))return false;
     return r.left<=mi.rcMonitor.left&&r.top<=mi.rcMonitor.top&&r.right>=mi.rcMonitor.right&&r.bottom>=mi.rcMonitor.bottom;
 }
-void EnterFullscreen(HWND w){
+// Places the window's visible frame (without the invisible resize borders) on r, in screen coordinates.
+void PlaceVisible(HWND w,const RECT& r){
+    RECT frame{},visible{};if(!GetWindowRect(w,&frame))return;
+    if(FAILED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))visible=frame;
+    SetWindowPos(w,nullptr,r.left-(visible.left-frame.left),r.top-(visible.top-frame.top),(r.right-r.left)+(visible.left-frame.left)+(frame.right-visible.right),
+                 (r.bottom-r.top)+(visible.top-frame.top)+(frame.bottom-visible.bottom),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOOWNERZORDER);
+}
+int FilledIndex(HWND w){for(size_t i=0;i<filledWindows.size();++i)if(filledWindows[i].w==w)return static_cast<int>(i);return -1;}
+bool IsFilled(HWND w){return FilledIndex(w)>=0;}
+// What Fill gives back is the placement's normal rect: the size before maximizing (double-click) or the current size.
+void FillWindow(HWND w,const wchar_t* why){
     WINDOWPLACEMENT wp{sizeof(wp)};if(!GetWindowPlacement(w,&wp))return;
     MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi))return;
+    const RECT normal=wp.rcNormalPosition;
     fullscreenBusy=true;
-    const RECT normal=wp.rcNormalPosition;const POINT o=WorkspaceOffset();const RECT m=mi.rcMonitor;
-    wp.showCmd=SW_SHOWNORMAL;wp.rcNormalPosition={m.left-o.x,m.top-o.y,m.right-o.x,m.bottom-o.y};wp.flags=0;
-    SetWindowPlacement(w,&wp);
-    RECT frame{},visible{};
-    if(GetWindowRect(w,&frame)&&SUCCEEDED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))  // hide the invisible borders
-        SetWindowPos(w,nullptr,m.left-(visible.left-frame.left),m.top-(visible.top-frame.top),(m.right-m.left)+(visible.left-frame.left)+(frame.right-visible.right),
-                     (m.bottom-m.top)+(visible.top-frame.top)+(frame.bottom-visible.bottom),SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOOWNERZORDER);
+    if(IsZoomed(w)){wp.showCmd=SW_SHOWNORMAL;wp.flags=0;SetWindowPlacement(w,&wp);}  // a normal window again, then sized
+    PlaceVisible(w,mi.rcWork);
     fullscreenBusy=false;
-    buttonFullscreen.push_back({w,normal});
-    wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: maximize button -> full screen class=%ls",cls);
+    const int i=FilledIndex(w);if(i>=0)filledWindows[static_cast<size_t>(i)].normal=normal;else filledWindows.push_back({w,normal});
+    wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: window filled between the bar and the Dock (%ls) class=%ls",why,cls);
 }
-bool IsButtonFullscreen(HWND w){for(const auto& f:buttonFullscreen)if(f.w==w)return true;return false;}
-void LeaveFullscreen(size_t i){
-    const FullscreenWindow f=buttonFullscreen[i];buttonFullscreen.erase(buttonFullscreen.begin()+static_cast<std::ptrdiff_t>(i));
+void Unfill(size_t i,const wchar_t* why){
+    const FilledWindow f=filledWindows[i];filledWindows.erase(filledWindows.begin()+static_cast<std::ptrdiff_t>(i));
     WINDOWPLACEMENT wp{sizeof(wp)};if(!IsWindow(f.w)||!GetWindowPlacement(f.w,&wp))return;
     fullscreenBusy=true;wp.showCmd=SW_SHOWNORMAL;wp.rcNormalPosition=f.normal;wp.flags=0;SetWindowPlacement(f.w,&wp);fullscreenBusy=false;
-    DLOG(L"menu: full screen left (maximize button / double-click); previous size restored");
+    DLOG(L"menu: fill left (%ls); previous size restored",why);
+}
+// Dragging a filled window away gives back its size, under the cursor at the same relative position (as Windows does
+// for a maximized window).
+bool UnfillForDrag(HWND w,POINT pt){
+    const int fi=FilledIndex(w);if(fi<0)return false;
+    RECT visible{};if(FAILED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))return false;
+    const RECT normal=filledWindows[static_cast<size_t>(fi)].normal;filledWindows.erase(filledWindows.begin()+fi);
+    const LONG nw=normal.right-normal.left,nh=normal.bottom-normal.top,vw=(std::max)(1L,visible.right-visible.left);
+    const LONG x=pt.x-static_cast<LONG>(static_cast<double>(pt.x-visible.left)*nw/vw);
+    fullscreenBusy=true;PlaceVisible(w,RECT{x,visible.top,x+nw,visible.top+nh});fullscreenBusy=false;
+    DLOG(L"menu: filled window dragged away; previous size restored");
+    return true;
+}
+// A filled window counts as filled while its visible frame still matches the work area; the user resizing or moving it
+// some other way ends that (it then keeps its new size).
+void MaintainFilled(){
+    for(size_t i=0;i<filledWindows.size();){
+        const HWND w=filledWindows[i].w;bool keep=IsWindow(w)&&!IsIconic(w);
+        if(keep&&!IsZoomed(w)){
+            RECT visible{};MONITORINFO mi{sizeof(mi)};
+            if(FAILED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible)))||!GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi))keep=false;
+            else{const LONG t=Px(3);keep=std::abs(visible.left-mi.rcWork.left)<=t&&std::abs(visible.top-mi.rcWork.top)<=t&&std::abs(visible.right-mi.rcWork.right)<=t&&std::abs(visible.bottom-mi.rcWork.bottom)<=t;}
+        }
+        if(!keep){filledWindows.erase(filledWindows.begin()+static_cast<std::ptrdiff_t>(i));continue;}
+        ++i;
+    }
+}
+void SetFullscreenApp(HWND h,bool full);
+void EnterFullscreen(HWND w){
+    if(!IsZoomed(w))return;
+    for(const auto& f:buttonFullscreen)if(f.w==w)return;
+    buttonFullscreen.push_back({w});
+    fullscreenWindow=w;
+    // The bar and the Dock hide and give back their space (SetFullscreenApp / the Dock's kDockFullscreenMsg 2): the work
+    // area becomes the monitor and Windows grows the maximized window over it.
+    if(barWindow){SetFullscreenApp(barWindow,true);SetTimer(barWindow,kFullscreenGrowTimer,300,nullptr);}
+    wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: maximize button -> full screen (maximized, bars released) class=%ls",cls);
+}
+// Normally Windows has already resized the maximized window to the new work area; some apps keep their old size.
+void GrowFullscreen(){
+    for(const auto& f:buttonFullscreen){
+        if(!IsWindow(f.w)||!IsZoomed(f.w)||CoversMonitor(f.w))continue;
+        MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(MonitorFromWindow(f.w,MONITOR_DEFAULTTONEAREST),&mi))continue;
+        if(!EqualRect(&mi.rcWork,&mi.rcMonitor))continue;  // space not released (yet)
+        fullscreenBusy=true;PlaceVisible(f.w,mi.rcMonitor);fullscreenBusy=false;
+        DLOG(L"menu: full-screen window grown to the monitor");
+    }
+}
+bool IsButtonFullscreen(HWND w){for(const auto& f:buttonFullscreen)if(f.w==w)return true;return false;}
+// Snapped (arranged) windows become normal windows at the same size (rounded corners, not in the arranged state).
+using IsWindowArrangedFn=BOOL(WINAPI*)(HWND);
+bool Arranged(HWND w){
+    static const auto fn=reinterpret_cast<IsWindowArrangedFn>(GetProcAddress(GetModuleHandleW(L"user32.dll"),"IsWindowArranged"));
+    return fn&&fn(w)!=FALSE;
+}
+std::vector<HWND> snappedPending;
+void UnsnapPending(){
+    for(HWND w:snappedPending){
+        if(!IsWindow(w)||IsZoomed(w)||IsIconic(w)||!Arranged(w))continue;
+        WINDOWPLACEMENT wp{sizeof(wp)};RECT visible{};
+        if(!GetWindowPlacement(w,&wp)||FAILED(DwmGetWindowAttribute(w,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))))continue;
+        fullscreenBusy=true;
+        wp.showCmd=SW_SHOWNORMAL;wp.flags=0;SetWindowPlacement(w,&wp);  // leaves the arranged state
+        PlaceVisible(w,visible);                                          // at the snapped size
+        fullscreenBusy=false;
+        wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: snapped window kept as a normal window class=%ls",cls);
+    }
+    snappedPending.clear();
 }
 void CALLBACK OnLocationChange(HWINEVENTHOOK,DWORD,HWND w,LONG object,LONG child,DWORD,DWORD){
     if(object!=OBJID_WINDOW||child!=CHILDID_SELF||!w||fullscreenBusy)return;
-    for(size_t i=0;i<buttonFullscreen.size();++i)if(buttonFullscreen[i].w==w){if(IsZoomed(w))LeaveFullscreen(i);return;}
-    if(w!=captionPress.root||!captionPress.maxButton)return;
-    if(GetTickCount64()-captionPress.time>2500){captionPress={};return;}
-    if(!IsZoomed(w))return;
-    captionPress={};
-    EnterFullscreen(w);
+    if(IsButtonFullscreen(w))return;  // left by restoring it (MaintainButtonFullscreen)
+    const bool caption=w==captionPress.root&&GetTickCount64()-captionPress.time<=2500;
+    if(caption&&IsZoomed(w)){
+        const bool button=captionPress.maxButton;captionPress={};
+        if(button){EnterFullscreen(w);return;}
+        // Double-click on the title bar maximized it: Fill instead, or give back the size if it was filled.
+        if(const int i=FilledIndex(w);i>=0)Unfill(static_cast<size_t>(i),L"title-bar double-click");
+        else if(OrdinaryWindow(w))FillWindow(w,L"title-bar double-click");
+        return;
+    }
+    if(OrdinaryWindow(w)&&!IsZoomed(w)&&Arranged(w)&&barWindow){
+        if(std::find(snappedPending.begin(),snappedPending.end(),w)==snappedPending.end())snappedPending.push_back(w);
+        SetTimer(barWindow,kUnsnapTimer,350,nullptr);  // after Snap (and its layout flyout) has settled
+    }
 }
-// Forgets full-screen windows that were closed, minimized or moved/resized off the monitor by the user.
+// Forgets full-screen windows that were closed, minimized or restored (restore leaves full screen).
 void MaintainButtonFullscreen(){
     for(size_t i=0;i<buttonFullscreen.size();){
         HWND w=buttonFullscreen[i].w;
-        if(!IsWindow(w)||IsIconic(w)||(!IsZoomed(w)&&!CoversMonitor(w))){buttonFullscreen.erase(buttonFullscreen.begin()+static_cast<std::ptrdiff_t>(i));DLOG(L"menu: full screen ended (window closed or moved)");continue;}
+        if(!IsWindow(w)||IsIconic(w)||!IsZoomed(w)){buttonFullscreen.erase(buttonFullscreen.begin()+static_cast<std::ptrdiff_t>(i));DLOG(L"menu: full screen ended (window restored, minimized or closed)");continue;}
         ++i;
     }
+    MaintainFilled();
 }
 void OnLeftUp(){
     if(dragClip.active||!barWindow)return;  // system moves end in OnMoveSizeEnd
@@ -658,7 +749,7 @@ void CALLBACK OnMoveSizeEnd(HWINEVENTHOOK,DWORD,HWND w,LONG object,LONG,DWORD,DW
     const bool fill=dragClip.active&&dragClip.fill&&dragClip.target==w;
     ReleaseDragClip();
     if(object!=OBJID_WINDOW||!OrdinaryWindow(w)||fullscreenApp||IsZoomed(w))return;
-    if(fill&&(GetWindowLongW(w,GWL_STYLE)&WS_MAXIMIZEBOX)){ShowWindowAsync(w,SW_MAXIMIZE);DLOG(L"menu: window filled (held against the menu bar)");return;}
+    if(fill&&(GetWindowLongW(w,GWL_STYLE)&WS_MAXIMIZEBOX)){FillWindow(w,L"held against the menu bar");return;}
     ClampBelowBar(w,L"move end");
 }
 // macOS: true full screen (the app covers the whole monitor: F11, a full-screen button, games) hides the menu bar and the
@@ -670,7 +761,6 @@ constexpr UINT_PTR kFullscreenTimer=14;
 // The full-screen window found last: while it stays (visible, not minimized, covering the monitor), opening another,
 // ordinary window on top keeps the bars hidden (macOS: the full-screen app keeps its Space).
 HWND fullscreenWindow=nullptr;
-bool CoversMonitor(HWND w);
 bool FullscreenCandidate(HWND f){
     if(!f||!IsWindow(f)||!IsWindowVisible(f)||IsIconic(f))return false;
     DWORD pid=0,shellPid=0;GetWindowThreadProcessId(f,&pid);GetWindowThreadProcessId(GetShellWindow(),&shellPid);
@@ -680,7 +770,7 @@ bool FullscreenCandidate(HWND f){
     if(GetWindowLongW(f,GWL_EXSTYLE)&WS_EX_TOOLWINDOW)return false;
     BOOL cloaked=FALSE;DwmGetWindowAttribute(f,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));if(cloaked)return false;
     if(MonitorFromWindow(f,MONITOR_DEFAULTTONULL)!=MonitorFromWindow(barWindow,MONITOR_DEFAULTTOPRIMARY))return false;
-    return CoversMonitor(f);
+    return (IsButtonFullscreen(f)&&IsZoomed(f))||CoversMonitor(f);
 }
 // The window actually in front on the bar's monitor, by Z order, when it covers the whole monitor. Used when the
 // foreground is missing, Explorer or DockOver: a game started from Steam can cover the monitor without ever getting
@@ -791,6 +881,7 @@ void SetFullscreenApp(HWND h,bool full){
 
     {wchar_t cls[64]{};if(full)GetClassNameW(fullscreenWindow?fullscreenWindow:GetForegroundWindow(),cls,64);DLOG(L"menu: full-screen app %ls %ls",full?L"on: bar and Dock hidden; window":L"off: bar and Dock shown",cls);}
     if(full){ReleaseDragClip();ClosePopup();if(inputWindow)ShowWindow(inputWindow,SW_HIDE);ShowWindow(h,SW_HIDE);
+        if(IsButtonFullscreen(fullscreenWindow))RemoveAppBar(h);  // Place() registers it again when full screen ends
         // Game mode: EVENT_OBJECT_LOCATIONCHANGE also fires for every pointer move, and raw input for every mouse packet.
         if(locationHook){UnhookWinEvent(locationHook);locationHook=nullptr;}DropRawMouse();}
     else{Place(h);ShowWindow(h,SW_SHOWNOACTIVATE);if(inputWindow)ShowWindow(inputWindow,SW_SHOWNOACTIVATE);Render(h);
@@ -822,11 +913,14 @@ void SyncGameCompatibility(HWND h) {
         if(suppress){if(barRevealed)RevealBar(h,false);DropRawMouse();}
         DLOG(L"menu: game compatibility %ls",suppress?L"on":L"off");
     }
-    static HWND sentWindow=nullptr;static bool sentFull=false,sentSuppressed=false;
+    static HWND sentWindow=nullptr;static WPARAM sentFull=0;static bool sentSuppressed=false;
     HWND dockWindow=FindWindowW(L"LiquidDockV01",nullptr);
-    if(dockWindow&&(dockWindow!=sentWindow||sentFull!=fullscreenApp||sentSuppressed!=gameSuppressed)){
-        if(PostMessageW(dockWindow,kDockFullscreenMsg,fullscreenApp?1:0,gameSuppressed?1:0)){
-            sentWindow=dockWindow;sentFull=fullscreenApp;sentSuppressed=gameSuppressed;
+    // 2: the maximize-button full screen on the Dock's monitor, which also takes the Dock's reserved space.
+    const WPARAM full=!fullscreenApp?0:(IsButtonFullscreen(fullscreenWindow)&&dockWindow&&
+        MonitorFromWindow(dockWindow,MONITOR_DEFAULTTONEAREST)==MonitorFromWindow(fullscreenWindow,MONITOR_DEFAULTTONEAREST))?2:1;
+    if(dockWindow&&(dockWindow!=sentWindow||sentFull!=full||sentSuppressed!=gameSuppressed)){
+        if(PostMessageW(dockWindow,kDockFullscreenMsg,full,gameSuppressed?1:0)){
+            sentWindow=dockWindow;sentFull=full;sentSuppressed=gameSuppressed;
         }
     } else if(!dockWindow) sentWindow=nullptr;
 }
@@ -1554,6 +1648,8 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(w==kHostsRetryTimer){if(StartHosts(h))KillTimer(h,kHostsRetryTimer);return 0;}
         if(w==kInputTimer){const HKL now=ForegroundLayout();if(now!=inputLayout){inputLayout=now;if(extrasConfig.input)Render(h);}return 0;}
         if(w==kTrayTimer){KillTimer(h,kTrayTimer);trayIcons=docky::tray::Get().Snapshot();extraImages.clear();Render(h);return 0;}
+        if(w==kFullscreenGrowTimer){KillTimer(h,kFullscreenGrowTimer);GrowFullscreen();return 0;}
+        if(w==kUnsnapTimer){KillTimer(h,kUnsnapTimer);UnsnapPending();return 0;}
         if(w==kFullscreenTimer){MaintainButtonFullscreen();
             {const bool listed=!menuGameWatch.Poll(themeSettingsPath,gameCompatibility).empty();if(listed!=listedGameMenu){listedGameMenu=listed;DLOG(L"menu: games list %ls",listed?L"program running: bar hidden":L"no listed program running");}}
             SetFullscreenApp(h,FullscreenForeground()||listedGameMenu);SyncGameCompatibility(h);
