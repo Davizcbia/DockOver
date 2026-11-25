@@ -2,6 +2,7 @@
 #include "taskbar_guardian.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <memory>
 
 namespace docky::taskbar {
@@ -28,6 +29,33 @@ Backend Backend::Real(std::function<bool()> guardianReady) {
     b.windowRect = [](ULONG_PTR hwnd, RECT& out) { HWND h = reinterpret_cast<HWND>(hwnd); return IsWindow(h) && GetWindowRect(h, &out); };
     b.now = [] { return GetTickCount64(); };
     return b;
+}
+
+// A <record>.tmp is only written for milliseconds by SaveWindowOperation, and the main record is replaced
+// atomically, so the main record is always the last committed state. Called with the record lock held: a temp
+// file older than a few seconds is left over from an interrupted save (crash, power loss) and would otherwise block
+// every later hide or show. It is moved aside, never deleted or overwritten, so its content stays for review.
+bool SetAsideStaleTempRecord(const std::wstring& path, std::wstring& log) {
+    const std::wstring tmp = path + L".tmp";
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(tmp.c_str(), GetFileExInfoStandard, &a)) {
+        const DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND;
+    }
+    FILETIME nowFt{}; GetSystemTimeAsFileTime(&nowFt);
+    auto ticks = [](const FILETIME& f) { return (static_cast<ULONGLONG>(f.dwHighDateTime) << 32) | f.dwLowDateTime; };
+    const ULONGLONG written = (std::max)(ticks(a.ftLastWriteTime), ticks(a.ftCreationTime)), now = ticks(nowFt);
+    if (now < written || now - written < 10ull * 10000000ull) { log += L"temp record is recent; preserved\n"; return false; }
+    SYSTEMTIME st{}; GetLocalTime(&st);
+    wchar_t stamp[32]{};
+    swprintf_s(stamp, L"%04u%02u%02u-%02u%02u%02u", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    for (int i = 0; i < 20; ++i) {
+        const std::wstring aside = tmp + L".stale-" + stamp + (i ? L"-" + std::to_wstring(i) : L"");
+        if (MoveFileExW(tmp.c_str(), aside.c_str(), MOVEFILE_WRITE_THROUGH)) { log += L"stale temp record moved aside: " + aside + L"\n"; return true; }
+        if (GetLastError() != ERROR_ALREADY_EXISTS && GetLastError() != ERROR_FILE_EXISTS) break;
+    }
+    log += L"stale temp record could not be moved aside; preserved\n";
+    return false;
 }
 
 Controller::Controller(std::wstring recordPath, Backend backend) : path_(std::move(recordPath)), b_(std::move(backend)) {}
@@ -71,7 +99,7 @@ bool Controller::Hide(std::wstring& why) {
     if (!b_.guardianReady || !b_.guardianReady()) { why = L"Recovery guardian is not ready; the taskbar was not hidden."; return false; }
     bool ok = false;
     Locked([&] {
-        if (GetFileAttributesW((path_ + L".tmp").c_str()) != INVALID_FILE_ATTRIBUTES) { why = L"A temporary taskbar record exists; nothing was hidden."; return false; }
+        if (!SetAsideStaleTempRecord(path_, log_)) { why = L"A taskbar record is being written; try again in a few seconds."; return false; }
         TaskbarWindowOperation prev; std::wstring error;
         if (!LoadWindowOperation(path_, prev, error)) { state_ = State::Conflict; why = L"The taskbar record is unreadable (" + error + L"); nothing was hidden."; return false; }
         if (prev.phase == RecordPhase::Conflict) { state_ = State::Conflict; why = L"A taskbar Conflict record needs review; nothing was hidden."; return false; }
@@ -94,6 +122,7 @@ bool Controller::ShowLocked(std::wstring& why) {
     if (b_.work.monitors && b_.work.setWork) RestoreWorkArea(WorkAreaPathFor(path_), b_.work, log_);
     TaskbarWindowOperation op; std::wstring error;
     if (!LoadWindowOperation(path_, op, error)) { state_ = State::Conflict; why = L"The taskbar record is unreadable; use Restore Windows taskbar now."; return false; }
+    if (op.phase != RecordPhase::Closed && !SetAsideStaleTempRecord(path_, log_)) { why = L"A taskbar record is being written; try again in a few seconds."; return false; }
     if (op.phase == RecordPhase::Closed) { state_ = State::Visible; return true; }
     if (op.phase == RecordPhase::Conflict || !IsConservativeRecoveryRecord(op)) { state_ = State::Conflict; why = L"The taskbar record is ambiguous and was preserved; nothing was forced."; return false; }
     if (!RestoreTaskbarWindows(path_, b_.ops, log_)) { state_ = State::Conflict; why = L"A taskbar window could not be confirmed; the record was kept as Conflict."; return false; }

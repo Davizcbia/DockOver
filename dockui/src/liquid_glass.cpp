@@ -199,8 +199,13 @@ public:
         if (scissorRaster_ && g.rotationDeg == 0.0f) {
             const float m = (16.0f + 2.0f * std::max(p.edgeSoftness, 0.0f)) * s + 2.0f;
             const LONG l = static_cast<LONG>(std::floor(g.plateDip.left * s - m)), t = static_cast<LONG>(std::floor(g.plateDip.top * s - m));
-            const LONG r = static_cast<LONG>(std::ceil(g.plateDip.right * s + m)), b = static_cast<LONG>(std::ceil(g.plateDip.bottom * s + m));
-            const D3D11_RECT sc{std::max(0L, l), std::max(0L, t), std::min(static_cast<LONG>(g.targetWidth), r), std::min(static_cast<LONG>(g.targetHeight), b)};
+            const LONG r = static_cast<LONG>(std::ceil(g.plateDip.right * s + m));
+            const LONG bottom = static_cast<LONG>(std::ceil(g.plateDip.bottom * s + m));
+            RECT sc{std::max(0L, l), std::max(0L, t), std::min(static_cast<LONG>(g.targetWidth), r), std::min(static_cast<LONG>(g.targetHeight), bottom)};
+            if (g.clipPx && !IntersectRect(&sc, &sc, g.clipPx)) {
+                ctx->RSSetState(raster_.Get());
+                return true;
+            }
             ctx->RSSetState(scissorRaster_.Get());
             ctx->RSSetScissorRects(1, &sc);
         } else ctx->RSSetState(raster_.Get());

@@ -38,6 +38,12 @@ namespace Gdiplus{using std::min;using std::max;}
 #include <fstream>
 #include "log.h"
 #include "menu_model.h"
+#include <commctrl.h>
+#include <powrprof.h>
+// Power commands (Restart…, Shut Down…, Sign Out…) confirm with a TaskDialog (Common Controls 6); Sleep uses PowrProf.
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "PowrProf.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #include "native_menu.h"
 #include "system_status.h"
 #include "unified_menu.h"
@@ -1405,19 +1411,61 @@ void RequestSettings(){
     DLOG(L"menu: Settings started directly (no Desktop Manager) result=%lld",static_cast<long long>(r));
     if(r<=32)MessageBoxW(nullptr,L"Could not open DockOver Settings.",L"DockOver",MB_OK|MB_ICONWARNING);
 }
+// ---- Power commands (DockOver menu: Sleep, Restart…, Shut Down…, Lock Screen, Sign Out…) ---------------------------------
+// The same calls Windows' own Start menu makes: apps may still ask to save their work (nothing is forced), Shut Down keeps
+// Fast Startup (hybrid), and the commands with "…" ask first, like macOS.
+bool EnableShutdownPrivilege(){
+    HANDLE token=nullptr;if(!OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&token))return false;
+    TOKEN_PRIVILEGES tp{};tp.PrivilegeCount=1;tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
+    const bool ok=LookupPrivilegeValueW(nullptr,SE_SHUTDOWN_NAME,&tp.Privileges[0].Luid)&&AdjustTokenPrivileges(token,FALSE,&tp,0,nullptr,nullptr)&&GetLastError()==ERROR_SUCCESS;
+    CloseHandle(token);return ok;
+}
+bool ConfirmPower(const wchar_t* question,const wchar_t* action){
+    const std::wstring title=docky::ui::Text(question);const std::wstring button=docky::ui::Text(action);
+    TASKDIALOG_BUTTON buttons[]{{IDOK,button.c_str()}};
+    TASKDIALOGCONFIG d{};d.cbSize=sizeof(d);d.hwndParent=barWindow;d.dwFlags=TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW;
+    d.dwCommonButtons=TDCBF_CANCEL_BUTTON;d.pszWindowTitle=L"DockOver";d.pszMainInstruction=title.c_str();
+    d.pszContent=docky::ui::Text(L"Apps that have unsaved work can ask you to save it first.");d.cButtons=1;d.pButtons=buttons;d.nDefaultButton=IDOK;
+    int choice=IDCANCEL;if(barWindow)SetForegroundWindow(barWindow);
+    return SUCCEEDED(TaskDialogIndirect(&d,&choice,nullptr,nullptr))&&choice==IDOK;
+}
+bool SystemPowerCommand(UINT id){
+    using namespace liquid::menu;
+    const DWORD reason=SHTDN_REASON_MAJOR_OTHER|SHTDN_REASON_MINOR_OTHER|SHTDN_REASON_FLAG_PLANNED;
+    auto fail=[](const wchar_t* what){DLOG(L"menu: %ls failed error=%lu",what,GetLastError());MessageBoxW(barWindow,docky::ui::Text(L"Windows did not carry out the command."),L"DockOver",MB_OK|MB_ICONWARNING);};
+    switch(id){
+    case kCmdSleep:{
+        DLOG(L"menu: Sleep");EnableShutdownPrivilege();
+        // Modern Standby PCs have no S3 sleep to request: turning the display off is how Windows enters standby there.
+        if(!SetSuspendState(FALSE,FALSE,FALSE))PostMessageW(HWND_BROADCAST,WM_SYSCOMMAND,SC_MONITORPOWER,2);
+        return true;}
+    case kCmdRestart:
+        if(ConfirmPower(L"Restart your computer now?",L"Restart")){DLOG(L"menu: Restart");EnableShutdownPrivilege();if(!ExitWindowsEx(EWX_REBOOT,reason))fail(L"Restart");}
+        return true;
+    case kCmdShutDown:
+        if(ConfirmPower(L"Shut down your computer now?",L"Shut Down")){DLOG(L"menu: Shut Down");EnableShutdownPrivilege();if(!ExitWindowsEx(EWX_SHUTDOWN|EWX_POWEROFF|EWX_HYBRID_SHUTDOWN,reason))fail(L"Shut Down");}
+        return true;
+    case kCmdLock:
+        DLOG(L"menu: Lock Screen");if(!LockWorkStation())fail(L"Lock Screen");return true;
+    case kCmdSignOut:
+        if(ConfirmPower(L"Sign out of Windows now?",L"Sign Out")){DLOG(L"menu: Sign Out");if(!ExitWindowsEx(EWX_LOGOFF,reason))fail(L"Sign Out");}
+        return true;
+    }
+    return false;
+}
 std::vector<liquid::menu::MenuItem> CustomizeItems();bool HandleCustomize(UINT id);void TogglePanel(HWND h,int selected);constexpr UINT kCmdWidgetsId=0xE6F1;
 void TogglePopup(HWND h,int selected) {
     if(popup){const bool same=activeMenu==selected;ClosePopup();if(same)return;}
     if(selected<0||static_cast<size_t>(selected)>=menus.menus.size()||static_cast<size_t>(selected)>=headings.size())return;
     openMenu=menus.menus[selected];activeMenu=selected;hoverTime=GetTickCount64();RECT r{};GetWindowRect(h,&r);
-    if(openMenu.source==liquid::menu::ProviderKind::Internal){  // before the Quit separator
-        using liquid::menu::ItemKind;auto at=openMenu.items.end();for(auto i=openMenu.items.begin();i!=openMenu.items.end();++i)if(i->kind==ItemKind::Separator)at=i;
+    if(openMenu.source==liquid::menu::ProviderKind::Internal){  // right after Settings (above the power commands)
+        using liquid::menu::ItemKind;auto at=openMenu.items.end();for(auto i=openMenu.items.begin();i!=openMenu.items.end();++i)if(i->commandId==0xF0F2){at=i+1;break;}
         std::vector<liquid::menu::MenuItem> extra;extra.push_back({L"Menu Bar Items",ItemKind::Submenu,true,false,CustomizeItems()});
         if(docky::ext::FindDesktopHost())extra.push_back({L"Edit Desktop Widgets…",ItemKind::Command,true,false,{},kCmdWidgetsId});
         openMenu.items.insert(at,extra.begin(),extra.end());}
     POINT anchor{r.left+headings[selected].left,r.bottom};const auto target=openMenu;
     popup=liquid::popup::Show(h,anchor,openMenu.items,[target](const liquid::menu::MenuItem& item){
-        if(target.source==liquid::menu::ProviderKind::Internal){if(item.commandId==0xF0F1)RequestUnifiedQuit();else if(item.commandId==0xF0F2)RequestSettings();else HandleCustomize(item.commandId);return;}
+        if(target.source==liquid::menu::ProviderKind::Internal){if(item.commandId==0xF0F1)RequestUnifiedQuit();else if(item.commandId==0xF0F2)RequestSettings();else if(!SystemPowerCommand(item.commandId))HandleCustomize(item.commandId);return;}
         const bool queued=liquid::menu::DispatchNativeCommand(target,item);DLOG(L"menu: native command queued=%d id=%u",queued,item.commandId);
     },[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);

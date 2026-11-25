@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "phone_language.h"
+#include "pairing_glass.h"
 #include "trusted_phones.h"
 #include "../desktop_settings.h"
 
@@ -20,6 +21,7 @@ constexpr int kWidth = 520, kDeviceTop = 455, kRowHeight = 56;
 // Window corner: concentric with the 18 DIP cards inset 24 DIP from the edge.
 constexpr int kCornerRadius = 18 + 24, kShadow = 18;
 constexpr int kBackgroundSwitch = 198, kPcBubbleSwitch = 199, kChangeFolder = 200, kOpenFolder = 201, kFirstPhone = 202;
+constexpr int kFolderPath = 197;
 
 struct Palette {
     COLORREF top, bottom, surface, edge, text, secondary, accent, tint, hover, remove;
@@ -54,6 +56,8 @@ struct Window {
     HFONT title{}, body{}, section{}, action{};
     HWND dialog = nullptr;
     HWND frame = nullptr;  // anti-aliased rounded backing and shadow behind the dialog (see PlaceFrame)
+    PairingGlass glass;
+    std::map<UINT, std::vector<uint32_t>> glassPixels;
 
     ~Window() {
         if (frame) DestroyWindow(frame);
@@ -110,8 +114,75 @@ inline void UpdateToggleName(HWND toggle, bool on) {
     SetWindowTextW(toggle, name.c_str());
 }
 
-inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int y, bool folder) {
-    Rounded(canvas, model.Rect(x, y, 40, 40), model.Dip(12), model.color.tint);
+inline bool PaintGlass(HDC dc, Window& model, RECT bounds, UINT id = 0, bool focused = false, bool pressed = false) {
+    const bool toggle = id == kPcBubbleSwitch || id == kBackgroundSwitch;
+    const bool on = toggle && (id == kPcBubbleSwitch ? model.pcBubble : model.background);
+    auto& pixels = model.glassPixels[id * 8 + (on ? 4 : 0) + (focused ? 2 : 0) + (pressed ? 1 : 0)];
+    const float dpi = static_cast<float>(model.scale);
+    if (pixels.empty() && !model.glass.CopyLayers(bounds, pixels, [&](ID3D11RenderTargetView* target) {
+        const auto draw = [&](RECT rect, dock::GlassParameters params, bool interactive = false) {
+            if (rect.right <= bounds.left || rect.left >= bounds.right ||
+                rect.bottom <= bounds.top || rect.top >= bounds.bottom) return true;
+            return model.glass.Draw(target, dpi, {rect.left/dpi, rect.top/dpi, rect.right/dpi, rect.bottom/dpi},
+                params, (rect.left + rect.right) * 0.5f, (rect.top + rect.bottom) * 0.5f,
+                interactive && focused, interactive && pressed, &bounds);
+        };
+        auto card = PairingGlass::PanelMaterial();
+        card.radius = 18;
+        if (!draw(model.Rect(24,115,472,111), card) ||
+            !draw(model.Rect(24,243,472,70), card) ||
+            !draw(model.Rect(24,329,472,70), card) ||
+            !draw(model.Rect(24,kDeviceTop,472,model.Height()-kDeviceTop-25), card)) return false;
+        auto tile = PairingGlass::ControlMaterial(40);
+        tile.radius = 12;
+        if (!draw(model.Rect(43,134,40,40), tile)) return false;
+        for (size_t i = 0; i < model.phones.size(); ++i)
+            if (!draw(model.Rect(43,kDeviceTop+8+static_cast<int>(i)*kRowHeight,40,40), tile)) return false;
+        if (id == 0 || id == kFolderPath) return true;
+        if (!toggle) {
+            auto button = PairingGlass::ControlMaterial((bounds.bottom-bounds.top)/dpi);
+            button.radius = 12;
+            auto plate = bounds;
+            InflateRect(&plate, -1, -1);
+            return draw(plate, button, true);
+        }
+        const auto local = [&](int x,int y,int w,int h) {
+            RECT r = model.Rect(x,y,w,h);
+            OffsetRect(&r,bounds.left,bounds.top);
+            return r;
+        };
+        auto track = PairingGlass::ControlMaterial(24);
+        track.radius = 12;
+        if (on) {
+            track.tintR = GetRValue(model.color.accent) / 255.0f;
+            track.tintG = GetGValue(model.color.accent) / 255.0f;
+            track.tintB = GetBValue(model.color.accent) / 255.0f;
+            track.tintStrength = 1.0f;
+        }
+        auto thumb = PairingGlass::ControlMaterial(18.0f);
+        const int thumbWidth = pressed ? std::clamp(static_cast<int>(std::lround(18 * thumb.switchPressWidth)), 18, 28) : 18;
+        const int thumbHeight = pressed ? std::clamp(static_cast<int>(std::lround(18 * thumb.switchPressHeight)), 18, 32) : 18;
+        thumb.radius = thumbHeight * 0.5f;
+        thumb.tintR = thumb.tintG = thumb.tintB = model.color.top == RGB(39,42,51) ? 1.0f : 0.38f;
+        thumb.tintStrength = pressed ? 0.40f : 1.0f;
+        thumb.glare = pressed ? thumb.glare : 1.2f;
+        const int x = on ? 27 : 6;
+        return draw(local(3,5,46,24), track, true) &&
+            draw(local(x+(18-thumbWidth)/2,(34-thumbHeight)/2,thumbWidth,thumbHeight), thumb, true);
+    })) return false;
+    BITMAPINFO bitmap{};
+    bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmap.bmiHeader.biWidth = bounds.right-bounds.left;
+    bitmap.bmiHeader.biHeight = -(bounds.bottom-bounds.top);
+    bitmap.bmiHeader.biPlanes = 1;
+    bitmap.bmiHeader.biBitCount = 32;
+    bitmap.bmiHeader.biCompression = BI_RGB;
+    return SetDIBitsToDevice(dc, 0, 0, bitmap.bmiHeader.biWidth, -bitmap.bmiHeader.biHeight, 0, 0, 0,
+        -bitmap.bmiHeader.biHeight, pixels.data(), &bitmap, DIB_RGB_COLORS) != 0;
+}
+
+inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int y, bool folder, bool glass) {
+    if (!glass) Rounded(canvas, model.Rect(x, y, 40, 40), model.Dip(12), model.color.tint);
     Gdiplus::GraphicsState state = canvas.Save();
     canvas.TranslateTransform(static_cast<float>(model.Dip(x)), static_cast<float>(model.Dip(y)));
     canvas.ScaleTransform(static_cast<float>(model.scale), static_cast<float>(model.scale));
@@ -137,12 +208,13 @@ inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int 
     canvas.Restore(state);
 }
 
-inline void Paint(HWND window, const Window& model) {
+inline void Paint(HWND window, Window& model) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(window, &ps);
     RECT client{};
     GetClientRect(window, &client);
     const auto& p = model.color;
+    const bool glass = PaintGlass(dc, model, client);
     {
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -151,17 +223,19 @@ inline void Paint(HWND window, const Window& model) {
         const Gdiplus::REAL factors[]{0.0f, 0.0f, 1.0f};
         const Gdiplus::REAL positions[]{0.0f, 78.0f / model.Height(), 1.0f};
         background.SetBlend(factors, positions, ARRAYSIZE(factors));
-        graphics.FillRectangle(&background, bounds);
-        Rounded(graphics, model.Rect(24, 115, 472, 111), model.Dip(18), p.surface, p.edge);
-        IconTile(graphics, model, 43, 134, true);
-        Rounded(graphics, model.Rect(24, 243, 472, 70), model.Dip(18), p.surface, p.edge);
-        Rounded(graphics, model.Rect(24, 329, 472, 70), model.Dip(18), p.surface, p.edge);
-        Rounded(graphics, model.Rect(24, kDeviceTop, 472, model.Height() - kDeviceTop - 25),
-            model.Dip(18), p.surface, p.edge);
+        if (!glass) {
+            graphics.FillRectangle(&background, bounds);
+            Rounded(graphics, model.Rect(24, 115, 472, 111), model.Dip(18), p.surface, p.edge);
+            Rounded(graphics, model.Rect(24, 243, 472, 70), model.Dip(18), p.surface, p.edge);
+            Rounded(graphics, model.Rect(24, 329, 472, 70), model.Dip(18), p.surface, p.edge);
+            Rounded(graphics, model.Rect(24, kDeviceTop, 472, model.Height() - kDeviceTop - 25),
+                model.Dip(18), p.surface, p.edge);
+        }
+        IconTile(graphics, model, 43, 134, true, glass);
         Gdiplus::Pen separator(Color(p.edge));
         for (size_t i = 0; i < model.phones.size(); ++i) {
             const int y = kDeviceTop + static_cast<int>(i) * kRowHeight;
-            IconTile(graphics, model, 43, y + 8, false);
+            IconTile(graphics, model, 43, y + 8, false, glass);
             if (i) graphics.DrawLine(&separator, model.Dip(100), model.Dip(y), model.Dip(476), model.Dip(y));
         }
     }
@@ -190,16 +264,31 @@ inline void Paint(HWND window, const Window& model) {
     EndPaint(window, &ps);
 }
 
-inline void PaintButton(const DRAWITEMSTRUCT& item, const Window& model) {
+inline void PaintButton(const DRAWITEMSTRUCT& item, Window& model) {
     const auto& p = model.color;
     const bool close = item.CtlID == IDCLOSE;
     const bool remove = item.CtlID >= kFirstPhone;
     const bool active = (item.itemState & ODS_SELECTED) != 0;
     const bool focused = (item.itemState & ODS_FOCUS) != 0 && (item.itemState & ODS_NOFOCUSRECT) == 0;
-    const auto brush = CreateSolidBrush(close ? p.top : p.surface);
-    FillRect(item.hDC, &item.rcItem, brush);
-    DeleteObject(brush);
+    RECT bounds{};
+    GetWindowRect(item.hwndItem, &bounds);
+    MapWindowPoints(nullptr, model.dialog, reinterpret_cast<POINT*>(&bounds), 2);
+    const bool glass = PaintGlass(item.hDC, model, bounds, item.CtlID, focused, active);
+    if (!glass) {
+        auto brush = close ? CreateSolidBrush(p.top) : model.cardBrush;
+        FillRect(item.hDC, &item.rcItem, brush);
+        if (close) DeleteObject(brush);
+    }
+    if (item.CtlID == kFolderPath) {
+        Label(item.hDC, model.folder.c_str(), item.rcItem, model.body, p.text,
+            DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS | DT_NOPREFIX);
+        return;
+    }
     if (item.CtlID == kPcBubbleSwitch || item.CtlID == kBackgroundSwitch) {
+        if (glass) {
+            if (focused) DrawFocusRect(item.hDC, &item.rcItem);
+            return;
+        }
         const bool on = item.CtlID == kPcBubbleSwitch ? model.pcBubble : model.background;
         Gdiplus::Graphics graphics(item.hDC);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
@@ -210,12 +299,12 @@ inline void PaintButton(const DRAWITEMSTRUCT& item, const Window& model) {
         graphics.FillEllipse(&thumb, dip(on ? 27 : 6), dip(8), dip(18), dip(18));
         return;
     }
-    {
+    if (!glass) {
         Gdiplus::Graphics graphics(item.hDC);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        auto bounds = item.rcItem;
-        InflateRect(&bounds, -1, -1);
-        Rounded(graphics, bounds, model.Dip(12), active ? p.hover : remove ? p.surface : p.tint,
+        auto plate = item.rcItem;
+        InflateRect(&plate, -1, -1);
+        Rounded(graphics, plate, model.Dip(12), active ? p.hover : remove ? p.surface : p.tint,
             focused ? p.accent : p.edge);
     }
     wchar_t title[128]{};
@@ -223,6 +312,7 @@ inline void PaintButton(const DRAWITEMSTRUCT& item, const Window& model) {
     else GetWindowTextW(item.hwndItem, title, ARRAYSIZE(title));
     Label(item.hDC, title, item.rcItem, model.action, remove ? p.remove : p.accent,
         DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+    if (glass && focused) DrawFocusRect(item.hDC, &item.rcItem);
 }
 
 // A dialog with child controls cannot be a per-pixel-alpha window, and a window region alone is aliased (and turns off
@@ -318,6 +408,16 @@ inline void Init(HWND window, Window& model) {
         std::clamp(static_cast<int>((parent.top + parent.bottom - height) / 2), static_cast<int>(work.top), static_cast<int>(work.bottom) - height),
         width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     model.dialog = window;
+    if (model.color.top != model.color.bottom) {
+        Microsoft::WRL::ComPtr<ID3D11Device> device;
+        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr)) &&
+            model.glass.Init(device.Get())) {
+            RECT client{};
+            GetClientRect(window, &client);
+            model.glass.Prepare(client.right, client.bottom, std::pair{model.color.top, model.color.bottom});
+        }
+    }
     const int radius = model.Dip(kCornerRadius), inset = 2;
     HRGN shape = CreateRoundRectRgn(inset, inset, width - inset + 1, height - inset + 1, 2 * (radius - inset), 2 * (radius - inset));
     if (shape && !SetWindowRgn(window, shape, TRUE)) DeleteObject(shape);
@@ -347,7 +447,7 @@ inline void Init(HWND window, Window& model) {
     const auto button = [&control](const wchar_t* text, int id, int x, int y, int w, int h) {
         return control(L"BUTTON", text, id, WS_TABSTOP | BS_OWNERDRAW, x,y,w,h);
     };
-    model.path = control(L"STATIC", model.folder.c_str(), 0, SS_LEFT | SS_PATHELLIPSIS | SS_NOPREFIX, 100, 141, 365, 28);
+    model.path = control(L"STATIC", model.folder.c_str(), kFolderPath, SS_OWNERDRAW, 100, 141, 365, 28);
     SendMessageW(model.path, WM_SETFONT, reinterpret_cast<WPARAM>(model.body), 0);
     button(Ui(L"更改…"), kChangeFolder, 100, 175, 100, 36);
     button(Ui(L"打开文件夹"), kOpenFolder, 210, 175, 115, 36);

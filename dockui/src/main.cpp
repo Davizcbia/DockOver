@@ -2770,7 +2770,8 @@ void App::TickWindowPreview() {
                       x + static_cast<LONG>((g.left + g.width) * scale_), y + static_cast<LONG>((g.restTop + g.size) * scale_)};
     const size_t count = windows.size();
     if (!windowPreview_.Show(hwnd_, kActivatePreview, anchor, static_cast<UINT>(dpi_),
-                             liquid::theme::IsDark(appearanceMode_, systemDark_), item->label, std::move(windows))) {
+                             liquid::theme::IsDark(appearanceMode_, systemDark_), item->label, std::move(windows),
+                             item->pixels, item->iconW, item->iconH)) {
         DismissWindowPreview();
         return;
     }
@@ -3073,7 +3074,7 @@ void App::OnRButtonUp(float x, float y) {
     }
     AppendMenuW(menu, MF_STRING, kMenuApplications, docky::ui::Text(L"Applications…"));
 #ifdef DOCKY_PHONE_PAIRING
-    AppendMenuW(menu, MF_STRING, kMenuPairPhone, docky::ui::Text(L"Pair a phone…"));
+    AppendMenuW(menu, MF_STRING, kMenuPairPhone, L"DockDrop…");
 #endif
     AppendMenuW(menu, MF_STRING, kMenuTaskManager, docky::ui::Text(L"Task Manager"));
     AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
@@ -3119,7 +3120,7 @@ void App::OnRButtonUp(float x, float y) {
     if (cmd == kMenuPairPhone) {
         if (!pairingExecutable.empty()) {
             const auto result = reinterpret_cast<INT_PTR>(
-                ShellExecuteW(hwnd_, L"open", pairingExecutable.c_str(), L"--pair-phone", nullptr, SW_SHOWNORMAL));
+                ShellExecuteW(hwnd_, L"open", pairingExecutable.c_str(), L"--discover", nullptr, SW_SHOWNORMAL));
             if (result > 32) return;
         }
         MessageBoxW(hwnd_, L"Could not start phone pairing. Check that DockOver is fully installed.", L"DockOver", MB_OK | MB_ICONWARNING);

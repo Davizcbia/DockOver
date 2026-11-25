@@ -4,7 +4,7 @@
 
 DockOver brings a macOS-style Dock, menu bar, Control Center, Launchpad, and desktop widgets to Windows 11. Its Liquid Glass surfaces sample the desktop in real time.
 
-[Download for Windows 11](https://github.com/Davizcbia/DockOver/releases/latest) · [1.2.0 release notes](docs/releases/1.2.0.md#english) · [DockDrop](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player](https://github.com/Davizcbia/DockOver-Music-Player)
+[Download for Windows 11](https://github.com/Davizcbia/DockOver/releases/latest) · [1.3.0 release notes](docs/releases/1.3.0.md#english) · [DockDrop](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player](https://github.com/Davizcbia/DockOver-Music-Player)
 
 ![DockOver on Windows 11](docs/screenshots/overview.jpg)
 

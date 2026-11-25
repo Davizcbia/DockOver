@@ -82,8 +82,72 @@ inline bool SaveTrustedPhone(const TrustedPhone& phone) {
     return saved;
 }
 
+// ---- Doorbell (web/dockdrop-scan/pair.js) ----------------------------------------------------------------------------
+// One secret per computer names its doorbell room, which all remembered phones that can knock share; the computer then
+// keeps one room open instead of one per phone. Each phone that confirmed it keeps the doorbell is flagged (REG_DWORD named
+// by its id): for it the computer waits for a knock; for the others it still holds the phone's own room.
+inline constexpr wchar_t kDoorbellKey[] = L"Software\\DockDrop\\DoorbellV1";
+
+inline std::wstring DoorbellSecret() {
+    HKEY key{};
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kDoorbellKey, 0, nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key,
+            nullptr) != ERROR_SUCCESS) return {};
+    std::wstring secret;
+    BYTE stored[512]{};
+    DWORD size = sizeof(stored), type = 0;
+    if (RegQueryValueExW(key, L"secret", nullptr, &type, stored, &size) == ERROR_SUCCESS && type == REG_BINARY) {
+        DATA_BLOB encoded{size, stored}, decoded{};
+        if (CryptUnprotectData(&encoded, nullptr, nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &decoded)) {
+            if (decoded.cbData == 64 * sizeof(wchar_t))
+                secret.assign(reinterpret_cast<const wchar_t*>(decoded.pbData), 64);
+            SecureZeroMemory(decoded.pbData, decoded.cbData);
+            LocalFree(decoded.pbData);
+        }
+    }
+    if (!TrustHex(secret, 64)) {  // first use (or unreadable): a new doorbell; phones that knew an old one re-learn it
+        BYTE random[32]{};
+        HCRYPTPROV provider = 0;
+        const bool made = CryptAcquireContextW(&provider, nullptr, nullptr, PROV_RSA_AES, CRYPT_VERIFYCONTEXT | CRYPT_SILENT)
+            && CryptGenRandom(provider, sizeof(random), random);
+        if (provider) CryptReleaseContext(provider, 0);
+        secret.clear();
+        if (made) {
+            static constexpr wchar_t digits[] = L"0123456789abcdef";
+            for (BYTE b : random) { secret += digits[b >> 4]; secret += digits[b & 15]; }
+            SecureZeroMemory(random, sizeof(random));
+            DATA_BLOB input{static_cast<DWORD>(secret.size() * sizeof(wchar_t)), reinterpret_cast<BYTE*>(secret.data())}, out{};
+            if (CryptProtectData(&input, L"DockDrop doorbell", nullptr, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
+                RegSetValueExW(key, L"secret", 0, REG_BINARY, out.pbData, out.cbData);
+                LocalFree(out.pbData);
+            } else secret.clear();
+            // Flags from a previous doorbell are void.
+            for (DWORD i = 64; i-- > 0;) {
+                wchar_t name[64]{};
+                DWORD chars = ARRAYSIZE(name);
+                if (RegEnumValueW(key, i, name, &chars, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS
+                    && TrustHex({name, chars}, 32)) RegDeleteValueW(key, name);
+            }
+        }
+    }
+    RegCloseKey(key);
+    return secret;
+}
+
+inline bool PhoneKnocks(const std::wstring& id) {
+    DWORD value = 0, size = sizeof(value);
+    return TrustHex(id, 32) && RegGetValueW(HKEY_CURRENT_USER, kDoorbellKey, id.c_str(), RRF_RT_REG_DWORD, nullptr, &value,
+        &size) == ERROR_SUCCESS && value == 1;
+}
+
+inline bool SetPhoneKnocks(const std::wstring& id) {
+    if (!TrustHex(id, 32)) return false;
+    const DWORD one = 1;
+    return RegSetKeyValueW(HKEY_CURRENT_USER, kDoorbellKey, id.c_str(), REG_DWORD, &one, sizeof(one)) == ERROR_SUCCESS;
+}
+
 inline bool ForgetTrustedPhone(const std::wstring& id) {
     if (!TrustHex(id, 32)) return false;
+    RegDeleteKeyValueW(HKEY_CURRENT_USER, kDoorbellKey, id.c_str());
     const auto result = RegDeleteKeyValueW(HKEY_CURRENT_USER, kTrustedPhonesKey, id.c_str());
     return result == ERROR_SUCCESS || result == ERROR_FILE_NOT_FOUND;
 }

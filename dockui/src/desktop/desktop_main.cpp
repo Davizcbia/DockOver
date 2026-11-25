@@ -356,7 +356,7 @@ bool OpenDockDrop(HWND owner) {
         const auto candidate = dir + executable;
         const DWORD attributes = GetFileAttributesW(candidate.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (reinterpret_cast<INT_PTR>(ShellExecuteW(owner, L"open", candidate.c_str(), L"--pair-phone", nullptr, SW_SHOWNORMAL)) > 32)
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(owner, L"open", candidate.c_str(), L"--discover", nullptr, SW_SHOWNORMAL)) > 32)
             return true;
     }
     return false;

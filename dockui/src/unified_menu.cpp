@@ -128,7 +128,7 @@ std::wstring GridFooter(const Popup* p){const auto* item=ItemAt(p,p->hover);retu
 std::vector<dock::MenuRowVisual> VisualRows(const Popup* p){
  std::vector<dock::MenuRowVisual> rows;const int count=Grid(p)?GridCount(p):VisibleRows(p);
  for(int k=0;k<count;++k){int row=k+(Grid(p)?0:p->scroll);if(row>=RowCount(p))break;const auto* item=ItemAt(p,row);const bool back=!p->path.empty()&&row==0;
-  dock::MenuRowVisual visual;visual.text=back?(docky::ui::chinese?L"‹  返回":L"‹  Back"):(item?item->text:L"");visual.enabled=back||(item&&item->enabled);visual.hover=row==p->hover;
+  dock::MenuRowVisual visual;visual.text=back?(docky::ui::chinese?L"‹  返回":L"‹  Back"):(item?std::wstring(docky::ui::Text(item->text.c_str())):L"");visual.enabled=back||(item&&item->enabled);visual.hover=row==p->hover;
   if(item){visual.checked=item->checked;visual.separator=item->kind==menu::ItemKind::Separator;visual.submenu=item->kind==menu::ItemKind::Submenu;visual.icon=item->icon;}rows.push_back(std::move(visual));}
  return rows;
 }

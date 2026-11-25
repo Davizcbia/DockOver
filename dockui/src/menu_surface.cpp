@@ -40,7 +40,9 @@ bool MenuSurface::Resize(UINT width,UINT height,float dpi){
  const HRESULT hr=renderer_.Resize(width,height,dpi);if(FAILED(hr)){DLOG(L"menu surface: resize failed 0x%08X",hr);return false;}
  width_=width;height_=height;dpi_=dpi;return true;
 }
-bool MenuSurface::Draw(const std::vector<dock::MenuRowVisual>& rows,int gridColumns,const std::wstring& footer){
+bool MenuSurface::Draw(const std::vector<dock::MenuRowVisual>& rows,int gridColumns,const std::wstring& footer){return Render(rows,gridColumns,footer,0.f,nullptr);}
+bool MenuSurface::DrawCustom(float radius,const std::function<void(ID2D1DeviceContext*,bool)>& content){return Render({},0,{},radius,&content);}
+bool MenuSurface::Render(const std::vector<dock::MenuRowVisual>& rows,int gridColumns,const std::wstring& footer,float radius,const std::function<void(ID2D1DeviceContext*,bool)>* content){
  RECT rect{};if(!GetWindowRect(window_,&rect))return false;
  dock::BackdropFrame frame;bool have=false;
  if(backdrop_.Latest(rect,frame)){
@@ -54,8 +56,9 @@ bool MenuSurface::Draw(const std::vector<dock::MenuRowVisual>& rows,int gridColu
  }
  dock::DockFrame geometry;const float scale=dpi_/96.0f;geometry.dockLeft=0;geometry.dockTop=0;geometry.dockRight=width_/scale;geometry.dockBottom=height_/scale;
  dock::DockMetrics metrics;dock::GlassParameters glass=dock::RoleGlass(dock::GlassRole::Menu);
- dock::Materialize(glass,materialize_);glass.opacity=1.f;  // coverage is the visual's opacity, which also carries the text
+ dock::Materialize(glass,materialize_);glass.opacity=1.f;if(radius>0.f)glass.radius=radius;  // coverage is the visual's opacity, which also carries the text
  dock::Scene scene;scene.frame=&geometry;scene.metrics=&metrics;scene.menuMode=true;scene.menuRows=rows;scene.menuGridColumns=gridColumns;scene.menuFooter=footer;scene.windowW=geometry.dockRight;scene.windowH=geometry.dockBottom;scene.windowScreenRect=rect;scene.glass=&glass;scene.opaqueFallback=opaque_;scene.opaqueBackground=background_;scene.opaqueForeground=foreground_;scene.backdrop=have&&!opaque_?&frame:nullptr;
+ if(content)scene.customDraw=*content;
  const HRESULT hr=renderer_.Render(scene);if(FAILED(hr)){DLOG(L"menu surface: render failed 0x%08X",hr);return false;}
  if(have&&!opaque_&&renderer_.LastUsedGpu())backdropSeen_=true;
  DLOG_DEBUG(L"menu surface: rendered material=%ls backdrop=%d",renderer_.LastUsedGpu()?L"liquid":L"smoked",have);  // per frame: debug only

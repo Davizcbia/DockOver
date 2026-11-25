@@ -16,6 +16,7 @@
 //   --snapshot-seq <dir> --snapshot-after <s> --snapshot-interval <s> --snapshot-count <n>   BMP frames (opaque)
 //   --exit-after <s>   quit after this many seconds;  --bench-out <file>  frame statistics on exit
 //   --demo-pc [--demo-pc-tour]   preview the nearby PC and water route states without a network
+//   --demo-devices [--demo-device-count <n>]   preview the shared phone and PC device picker
 // Keys: Esc quits. Drag anywhere to move the window.
 #include "phone_language.h"
 using docky::pairing::Ui;
@@ -35,6 +36,7 @@ using docky::pairing::Ui;
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include "../desktop/duplication.h"
 #include "../vblank.h"
@@ -58,13 +60,13 @@ using docky::pairing::Ui;
 #include "phone_transfer.h"
 #include "widget_queue.h"
 #include "pc_receive_prompt.h"
+#include "device_preview.h"
 #endif
 
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr size_t kQrWordCount = 47 * 4;  // up to 77x77 modules, uint4 aligned
 struct Constants {
     float targetSize[2], center[2];
     float radius, time, mode, opaque;
@@ -75,9 +77,10 @@ struct Constants {
     uint32_t codeBits[8];
     float mouseImpacts[3][4], mouseFronts[4];
     float waterDrops[16][4], splashCount, sinkAge, finishAge, fileCount;
-    uint32_t qrBits[kQrWordCount], qrSize;
-    float rimProgress, rimOpacity, qrPad;
-    docky::pairing::PcBubble pcPeers[docky::pairing::kPcPeerCount];
+    uint32_t poolActive;
+    float rimProgress, rimOpacity, poolDepth;
+    docky::pairing::PcBubble pcPeers[7];
+    float deviceStyle[4], deviceClip[4];
 };
 static_assert(sizeof(Constants) % 16 == 0, "constant buffer");
 
@@ -101,6 +104,7 @@ struct Options {
     std::wstring settingsPath;
     bool registerDockDrop = false;
     bool pcPreview = false, pcTour = false, pcReduced = false;
+    int devicePreviewCount = 0;
 } g_opt;
 
 HWND g_wnd = nullptr;
@@ -122,7 +126,7 @@ constexpr auto kPhoneWindow = L"DockyPhonePairing";
 constexpr auto kPhoneMutex = L"Local\\DockOverPhonePairingWindow";
 #endif
 constexpr auto kScanLink = L"davizcbia.github.io/dockdrop-scan/bubble/?mode=rays";
-constexpr UINT kQrToggle = 101, kClose = 103, kStatus = 104, kGuide = 105;
+constexpr UINT kFallbackToggle = 101, kClose = 103, kStatus = 104, kGuide = 105;
 constexpr UINT kBallSize = 106, kBallSlider = 107;
 constexpr UINT kReceiveSettings = 108, kCopyText = 109, kOpenFolder = 110;
 constexpr UINT kSendFiles = 111, kSendText = 112;
@@ -130,6 +134,7 @@ constexpr UINT kReceivedText = 113, kBack = 114;
 constexpr UINT kConfirmText = 115, kConfirmStay = 116, kConfirmLeave = 117;
 constexpr UINT kPcStatus = 130, kPcDisconnect = 131, kPcFirstPeer = 132;
 constexpr UINT_PTR kSaveRadiusTimer = 11;
+constexpr UINT_PTR kPreviewPhoneTimer = 12;
 constexpr COLORREF kControlText = RGB(237, 244, 255);
 constexpr COLORREF kMutedText = RGB(196, 208, 220);
 
@@ -141,7 +146,7 @@ struct PhonePaintRuntime {
     }
     ~PhonePaintRuntime() { if (token) Gdiplus::GdiplusShutdown(token); }
 };
-HWND g_status = nullptr, g_guide = nullptr, g_qrButton = nullptr, g_close = nullptr, g_back = nullptr;
+HWND g_status = nullptr, g_guide = nullptr, g_fallbackButton = nullptr, g_close = nullptr, g_back = nullptr;
 HWND g_sizeLabel = nullptr, g_slider = nullptr;
 HWND g_receiveSettings = nullptr, g_receivedText = nullptr, g_copyText = nullptr, g_openFolder = nullptr;
 HWND g_sendFiles = nullptr, g_sendText = nullptr;
@@ -159,9 +164,7 @@ double g_pressAt = 0.0;
 HFONT g_uiFont = nullptr;
 int g_uiDpi = 0;
 std::shared_ptr<docky::pairing::PhoneHost> g_phoneHost;
-uint32_t g_qr[kQrWordCount]{};
-int g_qrSize = 0;
-bool g_showQr = false;
+bool g_showFallback = false;
 std::wstring g_receiveFolder, g_lastText, g_activePhone, g_targetPhone, g_shellSendPath;
 constexpr ULONG_PTR kShellSendFile = 0x44444631;
 constexpr UINT kShellSendReady = WM_APP + 42;
@@ -175,7 +178,45 @@ docky::pairing::WidgetDraft g_widgetDraft;
 bool g_manualFiles = false, g_manualText = false;
 unsigned g_filesReceived = 0;
 
+docky::pairing::DevicePreview g_devicePreview;
+docky::pairing::PairingGlass g_phoneGlass;
 constexpr auto kPcWindow = L"DockDropPcPreview";
+constexpr auto kDevicesWindow = L"DockDropDevicePreview";
+double g_previewPhoneOpenedAt = 0;
+bool g_previewSawPhone = false;
+// One window for the picker and the phone page (see EnterPhonePage).
+bool g_unified = false;        // this process may switch between the two pages
+bool g_phoneReady = false;     // the phone page was set up (controls, phone host)
+HANDLE g_phoneMutex = nullptr; // the phone page's single-instance lock, once this process owns it
+int g_pickerCount = -1;
+float g_phoneCodeAmp = 0.07f;
+bool g_parkControls = false;  // the phone controls are parked off the window (the picker is shown)
+std::vector<HWND> PageControls();
+constexpr UINT_PTR kRevealPhoneTimer = 13, kPickerSwitchTimer = 14;
+constexpr ULONG_PTR kShowPicker = 0x44445043;  // WM_COPYDATA from a second --discover launch
+bool EnterPhonePage(bool animate);
+void EnterPickerPage(bool animate);
+void ClosePicker();
+void RevealPhoneControls();
+void SwitchToPicker(bool animate);
+void TickControlFade(double now);
+
+void OpenPhonePairingFromPreview() {
+    if (g_unified && EnterPhonePage(true)) return;
+    wchar_t executable[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, ARRAYSIZE(executable));
+    if (length && length < ARRAYSIZE(executable)) {
+        const auto result = ShellExecuteW(g_wnd, L"open", executable, L"--pair-phone", nullptr, SW_SHOWNORMAL);
+        if (reinterpret_cast<INT_PTR>(result) > 32) {
+            g_previewPhoneOpenedAt = Now();
+            g_previewSawPhone = false;
+            if (SetTimer(g_wnd, kPreviewPhoneTimer, 100, nullptr)) ShowWindow(g_wnd, SW_HIDE);
+            return;
+        }
+    }
+    MessageBoxW(g_wnd, Ui(L"无法启动配对。请关闭后重试。"), L"DockDrop", MB_OK | MB_ICONERROR);
+}
+
 constexpr auto kPcReceiveBallWindow = L"DockDropPcReceiveBubble";
 constexpr auto kPcSendBallWindow = L"DockDropPcSendBubble";
 constexpr int kLivePeer = docky::pairing::kPcPeerCount / 2;
@@ -197,6 +238,17 @@ void CloseOrHide();
 void ShowFromBackground();
 void ApplyBackgroundSetting();
 void PaintPhoneItem(const DRAWITEMSTRUCT& item);
+float g_controlOpacity = 1.0f;  // phone controls during a page change (TickControlFade)
+
+docky::pairing::PcLayout SenderLayout(float width, float height) {
+    auto layout = docky::pairing::LayoutPcBubbles(width, height);
+    if (g_pcOffer && g_pcOffer->sending) {
+        auto& peer = layout.peers[kLivePeer];
+        peer.x = layout.local.x + layout.local.radius + peer.radius * 1.34f;
+        peer.y = layout.local.y + peer.radius * 0.8f;
+    }
+    return layout;
+}
 
 docky::pairing::PcLayout PcLayoutFor(HWND window) {
     RECT rect{};
@@ -510,14 +562,14 @@ LRESULT CALLBACK SliderProc(HWND slider, UINT message, WPARAM wp, LPARAM lp, UIN
     return DefSubclassProc(slider, message, wp, lp);
 }
 
-void UpdateQr() {
-    const bool available = g_qrSize > 0 && g_opt.codeMode == 4;
-    EnableWindow(g_qrButton, available);
-    if (!available) g_showQr = false;
-    const int showSize = g_showQr || g_connectedAt > 0 ? SW_HIDE : SW_SHOW;
+void UpdateFallback() {
+    const bool available = g_connectedAt == 0 && g_opt.codeMode == 4;
+    EnableWindow(g_fallbackButton, available);
+    if (!available) g_showFallback = false;
+    const int showSize = g_showFallback || g_connectedAt > 0 ? SW_HIDE : SW_SHOW;
     ShowWindow(g_sizeLabel, showSize);
     ShowWindow(g_slider, showSize);
-    SetWindowTextW(g_qrButton, g_showQr ? Ui(L"显示玻璃球") : Ui(L"改用二维码"));
+    SetWindowTextW(g_fallbackButton, g_showFallback ? Ui(L"返回水球") : Ui(L"备用光纹"));
 }
 
 void SetReceiveStatus(const wchar_t* status) {
@@ -591,6 +643,17 @@ void ReplyPhone(const std::wstring& reply) {
     docky::pairing::ReplyToPhoneHost(g_phoneHost, reply.c_str());
 }
 
+// The phone page is what the user sees (not hidden in the background, not the PC picker): only then does the phone host
+// keep a room open for the QR code. Remembered phones are listened for either way.
+bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && g_opt.pairPhone; }
+bool g_qrListening = true;
+void SyncQrListening() {
+    const bool shown = PhonePageShown();
+    if (shown == g_qrListening || !g_phoneHost) return;
+    g_qrListening = shown;
+    ReplyPhone(L"trust-refresh");  // the host re-reads the list (with "visible") and opens or drops the QR room
+}
+
 bool HandlePhoneTrust(std::wstring_view message) {
     using namespace docky::pairing;
     namespace json = dock::json;
@@ -603,6 +666,7 @@ bool HandlePhoneTrust(std::wstring_view message) {
             entry.Set("id", json::Value::MakeString(json::ToUtf8(phone.id)));
             entry.Set("secret", json::Value::MakeString(json::ToUtf8(phone.secret)));
             entry.Set("name", json::Value::MakeString(json::ToUtf8(phone.name)));
+            entry.Set("knock", json::Value::MakeBool(PhoneKnocks(phone.id)));  // waits for its knock on the doorbell
             entries.array.push_back(std::move(entry));
         }
         wchar_t hostname[MAX_COMPUTERNAME_LENGTH + 1]{};
@@ -611,7 +675,16 @@ bool HandlePhoneTrust(std::wstring_view message) {
         auto result = json::Value::MakeObject();
         result.Set("computer", json::Value::MakeString(json::ToUtf8(hostname)));
         result.Set("phones", std::move(entries));
+        // The QR code's room is held only while the phone page is on screen (see PhonePageShown).
+        result.Set("visible", json::Value::MakeBool(PhonePageShown()));
+        if (const auto doorbell = DoorbellSecret(); !doorbell.empty())
+            result.Set("doorbell", json::Value::MakeString(json::ToUtf8(doorbell)));
         ReplyPhone(L"ok:" + json::FromUtf8(json::Write(result)));
+    } else if (message.starts_with(L"trust-knock:")) {  // the phone confirmed it keeps the doorbell
+        const auto id = std::wstring(message.substr(12));
+        const auto phones = ReadTrustedPhones();
+        const bool known = std::any_of(phones.begin(), phones.end(), [&id](const auto& item) { return item.id == id; });
+        ReplyPhone(known && SetPhoneKnocks(id) ? L"ok" : L"error");
     } else if (message.starts_with(L"trust-check:")) {
         const auto id = message.substr(12);
         const auto phones = ReadTrustedPhones();
@@ -720,21 +793,7 @@ void ReceivePhoneMessage(std::wstring_view message) {
         if (g_confirming && !g_transferring) ShowBackConfirm(false);
         return;
     }
-    if (message.starts_with(L"qr:")) {
-        const auto payload = message.substr(3);
-        const auto divider = payload.find(L':');
-        if (divider == std::wstring_view::npos || divider != 2 || payload[0] < L'0' || payload[0] > L'9'
-            || payload[1] < L'0' || payload[1] > L'9') return;
-        const int size = (payload[0] - L'0') * 10 + payload[1] - L'0';
-        const auto cells = payload.substr(divider + 1);
-        if (size < 21 || size > 77 || cells.size() != static_cast<size_t>(size * size)
-            || cells.find_first_not_of(L"01") != std::wstring_view::npos) return;
-        ZeroMemory(g_qr, sizeof(g_qr));
-        for (size_t k = 0; k < cells.size(); ++k) {
-            if (cells[k] == L'1') g_qr[k >> 5] |= 1u << (k & 31);
-        }
-        g_qrSize = size;
-    } else if (message.starts_with(L"cells:")) {
+    if (message.starts_with(L"cells:")) {
         const auto cells = message.substr(6);
         if (cells.size() != 168 || cells.find_first_not_of(L"01") != std::wstring_view::npos) return;
         ZeroMemory(g_opt.codeBits, sizeof(g_opt.codeBits));
@@ -742,20 +801,19 @@ void ReceivePhoneMessage(std::wstring_view message) {
             if (cells[k] == L'1') g_opt.codeBits[k >> 5] |= 1u << (k & 31);
         }
         g_opt.codeMode = 4;
-        UpdateQr();
+        UpdateFallback();
     } else if (message.starts_with(L"status:")) {
         SetWindowTextW(g_status, Ui(std::wstring(message.substr(7)).c_str()));
     } else if ((message == L"paired" && g_opt.codeMode == 4) ||
                (message.starts_with(L"paired:") && docky::pairing::TrustHex(message.substr(7), 32))) {
         if (message.starts_with(L"paired:")) g_activePhone.assign(message.substr(7));
+        if (!g_opt.pairPhone && g_phoneReady) { EnterPhonePage(false); RevealPhoneControls(); }  // shown on the picker
         ShowFromBackground();
         g_opt.codeMode = 4;
         g_connectedAt = Now();
-        ZeroMemory(g_qr, sizeof(g_qr));
-        g_qrSize = 0;
-        UpdateQr();
+        UpdateFallback();
         ShowWindow(g_guide, SW_HIDE);
-        ShowWindow(g_qrButton, SW_HIDE);
+        ShowWindow(g_fallbackButton, SW_HIDE);
         LayoutPhoneControls(g_wnd);
         ShowWindow(g_sendFiles, SW_HIDE);
         ShowWindow(g_sendText, SW_HIDE);
@@ -764,9 +822,7 @@ void ReceivePhoneMessage(std::wstring_view message) {
     } else if (message == L"clear" || message == L"error" || message == L"runtime") {
         g_opt.codeMode = 0;
         ZeroMemory(g_opt.codeBits, sizeof(g_opt.codeBits));
-        ZeroMemory(g_qr, sizeof(g_qr));
-        g_qrSize = 0;
-        UpdateQr();
+        UpdateFallback();
         if (message == L"error") SetWindowTextW(g_status, Ui(L"无法启动配对。请关闭后重试。"));
         if (message == L"runtime") SetWindowTextW(g_status, Ui(L"配对需要 Microsoft Edge WebView2 Runtime。"));
     }
@@ -779,12 +835,17 @@ void LayoutPhoneControls(HWND window) {
     GetClientRect(window, &client);
     const int width = client.right, height = client.bottom;
     SetWindowPos(g_surface, HWND_BOTTOM, 0, 0, width, height, SWP_NOACTIVATE);
+    if (g_parkControls) {  // the picker is shown (see HidePhoneControls)
+        for (HWND control : PageControls())
+            SetWindowPos(control, nullptr, -32000, -32000, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return;
+    }
     if (dpi != g_uiDpi) {
         const HFONT next = CreateFontW(-dip(14), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
             DEFAULT_PITCH, L"Segoe UI");
         if (next) {
-            for (HWND child : {g_status, g_guide, g_qrButton, g_close, g_back, g_sizeLabel, g_receiveSettings,
+            for (HWND child : {g_status, g_guide, g_fallbackButton, g_close, g_back, g_sizeLabel, g_receiveSettings,
                  g_receivedText, g_copyText, g_openFolder, g_sendFiles, g_sendText,
                  g_confirmText, g_confirmStay, g_confirmLeave}) {
                 SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(next), TRUE);
@@ -813,12 +874,12 @@ void LayoutPhoneControls(HWND window) {
     MoveWindow(g_slider, (width - sliderWidth) / 2, height - dip(152), sliderWidth, dip(44), TRUE);
     const int guideWidth = std::min(dip(424), width - dip(24));
     MoveWindow(g_guide, (width - guideWidth) / 2, height - dip(102), guideWidth, dip(26), TRUE);
-    MoveWindow(g_qrButton, width / 2 - dip(66), height - inset - button, dip(132), button, TRUE);
+    MoveWindow(g_fallbackButton, width / 2 - dip(66), height - inset - button, dip(132), button, TRUE);
     MoveWindow(g_sendFiles, inset, height - inset - button, dip(112), button, TRUE);
     MoveWindow(g_sendText, width - inset - dip(112), height - inset - button, dip(112), button, TRUE);
     MoveWindow(g_close, width - inset - button, inset, button, button, TRUE);
     MoveWindow(g_back, inset, inset, button, button, TRUE);
-    MoveWindow(g_receiveSettings, inset + (g_connectedAt > 0 ? button + dip(7) : 0), inset, dip(95), button, TRUE);
+    MoveWindow(g_receiveSettings, inset + (g_connectedAt > 0 || g_unified ? button + dip(7) : 0), inset, dip(95), button, TRUE);
     const int receiveWidth = std::min(dip(414), width - dip(36));
     const int textHeight = dip(86);
     MoveWindow(g_receivedText, (width - receiveWidth) / 2, height - dip(166), receiveWidth, textHeight, TRUE);
@@ -896,7 +957,7 @@ void CreatePhoneControls(HWND window) {
     };
     g_status = create(L"STATIC", Ui(L"正在准备手机配对…"), WS_VISIBLE | SS_OWNERDRAW, kStatus);
     g_guide = create(L"STATIC", kScanLink, WS_VISIBLE | SS_OWNERDRAW, kGuide);
-    g_qrButton = create(L"BUTTON", Ui(L"改用二维码"), WS_VISIBLE | WS_TABSTOP | WS_DISABLED | BS_OWNERDRAW, kQrToggle);
+    g_fallbackButton = create(L"BUTTON", Ui(L"备用光纹"), WS_VISIBLE | WS_TABSTOP | WS_DISABLED | BS_OWNERDRAW, kFallbackToggle);
     g_close = create(L"BUTTON", Ui(L"关闭"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kClose);
     g_back = create(L"BUTTON", Ui(L"返回"), WS_TABSTOP | BS_OWNERDRAW, kBack);
     g_receiveSettings = create(L"BUTTON", Ui(L"接收设置"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kReceiveSettings);
@@ -1180,11 +1241,37 @@ void PaintPhoneItem(const DRAWITEMSTRUCT& item) {
     DRAWITEMSTRUCT local = item;
     local.hDC = buffer;
     local.rcItem = {0, 0, width, height};
-    PaintControlBackdrop(item, pixels, width, height);
+    bool painted = false;
+    if (g_opt.pairPhone && item.CtlID != kBallSlider && item.CtlID != kBallSize) {
+        RECT client{};
+        POINT origin{};
+        GetClientRect(g_wnd, &client);
+        MapWindowPoints(item.hwndItem, g_wnd, &origin, 1);
+        const RECT rect{origin.x, origin.y, origin.x + width, origin.y + height};
+        const float scale = GetDpiForWindow(g_wnd) / 96.0f;
+        painted = g_phoneGlass.Prepare(client.right, client.bottom) &&
+            g_phoneGlass.CopyControl(item.CtlID, rect, scale,
+                (item.itemState & ODS_FOCUS) != 0, (item.itemState & ODS_SELECTED) != 0, pixels);
+    }
+    if (!painted) PaintControlBackdrop(item, pixels, width, height);
     if (item.CtlID == kBallSlider) PaintBallSlider(local, pixels, width, height);
     else if (item.CtlID == kReceivedText) PaintReceivedText(local, bitmap);
     else PaintPhoneControl(local);
     GdiFlush();
+    if (g_controlOpacity < 1.0f) {  // page change: the control over the plain panel behind it (TickControlFade)
+        std::vector<uint32_t> behind(static_cast<size_t>(width) * height);
+        PaintControlBackdrop(item, behind.data(), width, height);
+        const uint32_t a = static_cast<uint32_t>(std::clamp(g_controlOpacity, 0.0f, 1.0f) * 256.0f);
+        for (size_t i = 0; i < behind.size(); ++i) {
+            const uint32_t f = pixels[i], b = behind[i];
+            uint32_t out = 0;
+            for (int shift = 0; shift < 24; shift += 8) {
+                const uint32_t fc = (f >> shift) & 0xFF, bc = (b >> shift) & 0xFF;
+                out |= ((bc * (256 - a) + fc * a) >> 8) << shift;
+            }
+            pixels[i] = out;
+        }
+    }
     for (size_t i = 0; i < static_cast<size_t>(width) * height; ++i) pixels[i] |= 0xff000000u;
     const BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     AlphaBlend(item.hDC, item.rcItem.left, item.rcItem.top, width, height,
@@ -1272,7 +1359,7 @@ void TapBall(const float (&normal)[3], double now) {
 }
 
 void SamplePointer(Constants& constants, double now) {
-    if (!g_opt.pairPhone || g_reduceMotion || g_showQr) {
+    if (!g_opt.pairPhone || g_reduceMotion || g_showFallback) {
         g_hoveringBall = false;
         return;
     }
@@ -1325,13 +1412,19 @@ public:
         adapter->GetParent(IID_PPV_ARGS(&factory_));
         if (FAILED(DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&dcomp_)))) return false;
         if (FAILED(dcomp_->CreateTargetForHwnd(g_surface ? g_surface : g_wnd, TRUE, &target_))
-            || FAILED(dcomp_->CreateVisual(&visual_))) return false;
-        target_->SetRoot(visual_.Get());
+            || FAILED(dcomp_->CreateVisual(&root_)) || FAILED(dcomp_->CreateVisual(&visual_))) return false;
+        // root_ holds the page (visual_, the swap chain) and, during a page change, the snapshot of the old page above it.
+        root_->AddVisual(visual_.Get(), FALSE, nullptr);
+        target_->SetRoot(root_.Get());
         if (FAILED(dev_->CreateVertexShader(g_BubbleVS, sizeof(g_BubbleVS), nullptr, &vs_)) ||
             FAILED(dev_->CreatePixelShader(g_BubblePS, sizeof(g_BubblePS), nullptr, &ps_)) ||
             FAILED(dev_->CreatePixelShader(g_BubbleRaysPS, sizeof(g_BubbleRaysPS), nullptr, &psRays_))) return false;
-        if (g_opt.pcPreview && FAILED(dev_->CreatePixelShader(g_PcPairingPS, sizeof(g_PcPairingPS),
-            nullptr, &psPc_))) return false;
+        // The PC picker's shader is always made: the same window can switch from the phone page to the picker.
+        if (FAILED(dev_->CreatePixelShader(g_PcPairingPS, sizeof(g_PcPairingPS), nullptr, &psPc_))) return false;
+#ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.pairPhone) InitPhoneGlass();
+        if (g_opt.devicePreviewCount && !InitPicker(g_opt.devicePreviewCount)) return false;
+#endif
         D3D11_BUFFER_DESC cb{}; cb.ByteWidth = sizeof(Constants); cb.Usage = D3D11_USAGE_DYNAMIC; cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER; cb.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         if (FAILED(dev_->CreateBuffer(&cb, nullptr, &cb_))) return false;
         D3D11_SAMPLER_DESC sd{}; sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP; sd.MaxLOD = D3D11_FLOAT32_MAX;
@@ -1350,19 +1443,58 @@ public:
         if (visual_) { visual_->SetContent(nullptr); dcomp_->Commit(); }
     }
     bool Presented() const { return lastFrame_ > 0; }
+#ifdef DOCKY_PHONE_PAIRING
+    void InitPhoneGlass() {
+        if (phoneGlassReady_) return;
+        g_phoneGlass.Init(dev_.Get());
+        phoneGlassReady_ = true;
+    }
+    bool InitPicker(int count) {
+        if (pickerReady_) return true;
+        BOOL animation = TRUE;
+        SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animation, 0);
+        g_reduceMotion = g_opt.pcReduced || !animation;
+        pickerReady_ = g_devicePreview.Init(dev_.Get(), count, g_reduceMotion, OpenPhonePairingFromPreview);
+        return pickerReady_;
+    }
+    // Page change inside the one window: the next frame of the current page is also copied into a snapshot layer,
+    // `change` switches the page, and the snapshot then fades and scales away over the new page (which settles from
+    // the opposite scale). `forward`: picker -> phone (the old page grows as it fades), back: it shrinks.
+    void SwitchPage(std::function<void()> change, bool forward, bool animate) {
+        if (!animate || !swap_ || !IsWindowVisible(g_wnd)) { change(); return; }
+        pendingSwitch_ = std::move(change);
+        switchForward_ = forward;
+    }
+    bool Switching() const { return pendingSwitch_ != nullptr || snapVisual_ != nullptr; }
+#endif
 
     void Frame() {
         const double now = Now();
 #ifdef DOCKY_PHONE_PAIRING
+        TickControlFade(now);
+#endif
+#ifdef DOCKY_PHONE_PAIRING
         if (g_pcOffer) {
             PollPcBall(now);
             if (g_quit) return;
-        } else if (g_opt.pcPreview && g_pcStarted > 0) TickPcPreview(now);
+        } else if (g_opt.pcPreview && !g_opt.devicePreviewCount && g_pcStarted > 0) TickPcPreview(now);
 #endif
         RECT cr{}; GetClientRect(g_wnd, &cr);
         const UINT w = static_cast<UINT>(std::max<LONG>(cr.right, 1)), h = static_cast<UINT>(std::max<LONG>(cr.bottom, 1));
         if (!EnsureSwap(w, h)) return;
         const float dpi = static_cast<float>(GetDpiForWindow(g_wnd)) / 96.f;
+        ID3D11ShaderResourceView* glassFrame = nullptr;
+#ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.pairPhone && g_phoneGlass.Prepare(w, h)) glassFrame = g_phoneGlass.Frame(dpi);
+        if (g_opt.devicePreviewCount) {
+            if (g_devicePreview.Closed()) { if (g_unified) ClosePicker(); else g_quit = true; return; }
+            g_devicePreview.Frame(w, h, dpi, now);
+            g_finishedAt = g_devicePreview.FinishedAt();
+            g_transferProgress = g_devicePreview.Progress();
+            if (!g_devicePreview.PrepareBackdrop(w, h) || !EnsurePass1(w, h)) return;
+            g_devicePreview.PaintGlass(ctx_.Get(), pass1Rtv_.Get());
+        }
+#endif
         if (g_opt.mode == 0) UpdateDesktop();
         if (g_opt.demoProgress > 0 && g_finishedAt < 0)
             g_transferProgress = static_cast<float>(std::clamp((now - start_) / g_opt.demoProgress, 0.001, 0.995));
@@ -1402,6 +1534,7 @@ public:
         c.dpi = dpi; c.showBubbles = g_opt.bubbles ? 1.f : 0.f; c.rippleAmp = g_opt.ripple;
         c.codeAmp = g_opt.codeAmp;
         c.phonePanel = g_opt.pairPhone ? 1.0f : 0.0f;
+        c.deviceStyle[2] = glassFrame ? 1.0f : 0.0f;
         c.sinkAge = static_cast<float>(now - g_sinkAt);
         const double finishStart = std::max(g_finishedAt, g_connectedAt + 0.98) + 0.20;
         c.finishAge = g_finishedAt < 0 ? -1.0f
@@ -1422,12 +1555,29 @@ public:
 #endif
         c.reducedMotion = g_reduceMotion ? 1.0f : 0.0f;
 #ifdef DOCKY_PHONE_PAIRING
-        if (g_opt.pcPreview) {
-            const auto layout = docky::pairing::LayoutPcBubbles(static_cast<float>(w), static_cast<float>(h));
+        if (g_opt.devicePreviewCount) {
+            const auto ball = g_devicePreview.MainBall();
+            c.center[0] = ball.x;
+            c.center[1] = ball.y;
+            c.radius = ball.radius;
+            c.rippleAmp = g_reduceMotion ? 0.0f : 0.010f;
+            c.deviceStyle[0] = 1;
+            c.deviceStyle[1] = g_devicePreview.Browsing() ? 1.0f : 0.0f;
+            const auto& clip = g_devicePreview.Viewport();
+            c.deviceClip[0] = static_cast<float>(clip.left);
+            c.deviceClip[1] = static_cast<float>(clip.top);
+            c.deviceClip[2] = static_cast<float>(clip.right);
+            c.deviceClip[3] = static_cast<float>(clip.bottom);
+            c.deviceStyle[3] = g_devicePreview.MergeProgress();
+            g_devicePreview.Bubbles(c.pcPeers);
+            if (g_reduceMotion) c.time = 0;
+        } else if (g_opt.pcPreview) {
+            const auto layout = SenderLayout(static_cast<float>(w), static_cast<float>(h));
             c.center[0] = layout.local.x;
             c.center[1] = layout.local.y;
             const float merge = g_pcMotion.MergeAmount(now, g_reduceMotion);
-            c.radius = layout.local.radius * (1.0f + 0.065f * std::sin(merge * 3.14159265f));
+            c.deviceStyle[3] = merge;
+            c.radius = layout.local.radius * (1.0f + 0.012f * merge + 0.032f * std::sin(merge * 6.2831853f) * merge * (1.0f-merge));
             c.phonePanel = 1.0f;
             c.rippleAmp = g_reduceMotion ? 0.0f : 0.010f;
             for (int i = 0; i < docky::pairing::kPcPeerCount; ++i)
@@ -1451,11 +1601,18 @@ public:
         }
         c.codeMode = static_cast<float>(g_opt.codeMode);
 #ifdef DOCKY_PHONE_PAIRING
-        if (g_showQr && g_qrSize > 0) {
-            c.codeMode = 0;
-            c.qrSize = static_cast<uint32_t>(g_qrSize);
-            memcpy(c.qrBits, g_qr, sizeof(c.qrBits));
+        const bool available = g_connectedAt == 0 && g_opt.codeMode == 4;
+        const float targetDepth = g_showFallback && available ? 1.0f : 0.0f;
+        const float depthStep = static_cast<float>(std::clamp(now - poolPaintAt_, 0.0, 0.12) / 1.08);
+        poolPaintAt_ = now;
+        poolDepth_ = g_reduceMotion || !available ? targetDepth :
+            std::clamp(targetDepth, poolDepth_ - depthStep, poolDepth_ + depthStep);
+        if (poolDepth_ > 0.0f && available) {
+            c.poolDepth = poolDepth_ * poolDepth_ * (3.0f - 2.0f * poolDepth_);
+            if (poolDepth_ >= 1.0f) c.codeMode = 0;
+            c.poolActive = 1;
         }
+        MorphBall(c.center, c.radius, now);
         SamplePointer(c, now);
 #endif
         memcpy(c.codeBits, g_opt.codeBits, sizeof(c.codeBits));
@@ -1477,6 +1634,10 @@ public:
         ID3D11SamplerState* ss[] = {sampler_.Get()};
         ctx_->PSSetSamplers(0, 1, ss);
         ID3D11ShaderResourceView* srv = g_opt.mode == 1 ? imgSrv_.Get() : deskSrv_.Get();
+#ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.devicePreviewCount) glassFrame = pass1Srv_.Get();
+#endif
+        ctx_->PSSetShaderResources(2, 1, &glassFrame);
         ctx_->PSSetShaderResources(0, 1, &srv);
         ctx_->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         ctx_->VSSetShader(vs_.Get(), nullptr, 0);
@@ -1497,8 +1658,14 @@ public:
         } else {
             ctx_->Draw(3, 0);
         }
-        ID3D11ShaderResourceView* none = nullptr; ctx_->PSSetShaderResources(0, 1, &none);
+        ID3D11ShaderResourceView* none = nullptr;
+        ctx_->PSSetShaderResources(0, 1, &none);
+        ctx_->PSSetShaderResources(2, 1, &none);
 #ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.devicePreviewCount) {
+            ctx_->OMSetRenderTargets(0, nullptr, nullptr);
+            g_devicePreview.PaintText(back.Get());
+        }
         if (g_pcOffer) {
             ctx_->OMSetRenderTargets(0, nullptr, nullptr);
             PaintPcBallText(back.Get(), c);
@@ -1510,7 +1677,26 @@ public:
             wchar_t name[64]; swprintf_s(name, L"\\bubble_%04d.bmp", seqIndex_++);
             SaveBmp(back.Get(), g_opt.seqDir + name);
         }
+#ifdef DOCKY_PHONE_PAIRING
+        const bool snapshot = pendingSwitch_ && CaptureSnapshot(back.Get());
+#endif
         if (FAILED(swap_->Present(0, 0))) return;
+#ifdef DOCKY_PHONE_PAIRING
+        if (pendingSwitch_) {
+            // The old page's last frame is now both on screen and in the snapshot: switch, then animate it away.
+            auto change = std::move(pendingSwitch_);
+            pendingSwitch_ = nullptr;
+            morphFrom_[0] = lastBall_[0]; morphFrom_[1] = lastBall_[1]; morphFrom_[2] = lastBall_[2];
+            morphStart_ = now;
+            morphing_ = lastBall_[2] > 0;
+            change();
+            if (snapshot) StartSnapshotAnimation(static_cast<float>(w), static_cast<float>(h));
+        }
+        if (snapVisual_ && now >= snapEnd_) {
+            root_->RemoveVisual(snapVisual_.Get());
+            snapVisual_.Reset();
+        }
+#endif
         dcomp_->Commit();
         const double t1 = Now();
 #ifdef DOCKY_PHONE_PAIRING
@@ -1581,7 +1767,7 @@ private:
             line(offer.failed ? std::wstring(status) : std::wstring(status) + offer.sender,
                 31 * c.dpi, c.targetSize[0] - 35 * c.dpi, true);
             if (!offer.accepted && !offer.failed) {
-                const auto layout = docky::pairing::LayoutPcBubbles(c.targetSize[0], c.targetSize[1]);
+                const auto layout = SenderLayout(c.targetSize[0], c.targetSize[1]);
                 line(offer.sender, layout.peers[kLivePeer].y + layout.peers[kLivePeer].radius + lineH,
                     c.targetSize[0] * 0.70f, false);
             } else if (offer.accepted && !offer.Terminal() && g_pcMotion.MergeAmount(Now(), g_reduceMotion) >= 1.0f) {
@@ -1689,6 +1875,7 @@ private:
     bool EnsureSwap(UINT w, UINT h) {
         if (swap_ && w == swapW_ && h == swapH_) return true;
 #ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.devicePreviewCount) g_devicePreview.Resize();
         pcBrush_.Reset();
         pcInk_.Reset();
 #endif
@@ -1721,6 +1908,95 @@ private:
         return true;
     }
 
+#ifdef DOCKY_PHONE_PAIRING
+    // The old page without its ball: the ball itself is not faded but carried over (MorphBall), so the snapshot gets a
+    // soft-edged hole where the ball is and only the rest of the page fades away above the new one.
+    bool CaptureSnapshot(ID3D11Texture2D* back) {
+        if (snapVisual_) { root_->RemoveVisual(snapVisual_.Get()); snapVisual_.Reset(); }
+        D3D11_TEXTURE2D_DESC d{};
+        back->GetDesc(&d);
+        D3D11_TEXTURE2D_DESC sd = d;
+        sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+        ComPtr<ID3D11Texture2D> staging;
+        if (FAILED(dev_->CreateTexture2D(&sd, nullptr, &staging))) return false;
+        ctx_->CopyResource(staging.Get(), back);
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (FAILED(ctx_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return false;
+        std::vector<uint32_t> pixels(static_cast<size_t>(d.Width) * d.Height);
+        for (UINT y = 0; y < d.Height; ++y)
+            memcpy(&pixels[static_cast<size_t>(y) * d.Width], static_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch, d.Width * 4);
+        ctx_->Unmap(staging.Get(), 0);
+        const float dpi = static_cast<float>(GetDpiForWindow(g_wnd)) / 96.f;
+        const float inner = lastBall_[2] * 1.03f + 2.0f * dpi, feather = 14.0f * dpi;
+        const int x0 = std::max(0, static_cast<int>(lastBall_[0] - inner - feather)), x1 = std::min(static_cast<int>(d.Width), static_cast<int>(lastBall_[0] + inner + feather) + 1);
+        const int y0 = std::max(0, static_cast<int>(lastBall_[1] - inner - feather)), y1 = std::min(static_cast<int>(d.Height), static_cast<int>(lastBall_[1] + inner + feather) + 1);
+        for (int y = y0; y < y1; ++y) for (int x = x0; x < x1; ++x) {
+            const float dist = std::hypot(x + 0.5f - lastBall_[0], y + 0.5f - lastBall_[1]);
+            const float keep = std::clamp((dist - inner) / feather, 0.0f, 1.0f);
+            if (keep >= 1.0f) continue;
+            const float m = keep * keep * (3.0f - 2.0f * keep);
+            uint32_t& p = pixels[static_cast<size_t>(y) * d.Width + x];
+            const auto ch = [&](int shift) { return static_cast<uint32_t>(((p >> shift) & 0xFF) * m + 0.5f) << shift; };
+            p = ch(0) | ch(8) | ch(16) | ch(24);  // premultiplied: scale every channel
+        }
+        ComPtr<IDCompositionSurface> surface;
+        if (FAILED(dcomp_->CreateSurface(d.Width, d.Height, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &surface)))
+            return false;
+        ComPtr<ID3D11Texture2D> target;
+        POINT offset{};
+        if (FAILED(surface->BeginDraw(nullptr, IID_PPV_ARGS(&target), &offset))) return false;
+        const D3D11_BOX box{static_cast<UINT>(offset.x), static_cast<UINT>(offset.y), 0,
+            static_cast<UINT>(offset.x) + d.Width, static_cast<UINT>(offset.y) + d.Height, 1};
+        ctx_->UpdateSubresource(target.Get(), 0, &box, pixels.data(), d.Width * 4, 0);
+        surface->EndDraw();
+        if (FAILED(dcomp_->CreateVisual(&snapVisual_))) return false;
+        snapVisual_->SetContent(surface.Get());
+        root_->AddVisual(snapVisual_.Get(), FALSE, nullptr);  // above the page
+        return true;
+    }
+    // value(t) = from + (to - from) * easeOutCubic(t / duration)
+    ComPtr<IDCompositionAnimation> EaseOut(float from, float to, float duration) {
+        ComPtr<IDCompositionAnimation> a;
+        if (FAILED(dcomp_->CreateAnimation(&a))) return nullptr;
+        const float k = to - from, d = duration;
+        a->AddCubic(0.0, from, 3.0f * k / d, -3.0f * k / (d * d), k / (d * d * d));
+        a->End(d, to);
+        return a;
+    }
+    // The rest of the old page fades out above the new one (no zoom: the page itself stays put, only the ball moves).
+    void StartSnapshotAnimation(float, float) {
+        if (!snapVisual_) return;
+        const float duration = g_reduceMotion ? 0.16f : 0.30f;
+        snapEnd_ = Now() + duration + 0.02;
+        ComPtr<IDCompositionEffectGroup> effect;
+        if (SUCCEEDED(dcomp_->CreateEffectGroup(&effect))) {
+            if (auto fade = EaseOut(1.0f, 0.0f, duration)) effect->SetOpacity(fade.Get());
+            snapVisual_->SetEffect(effect.Get());
+        }
+    }
+public:
+    // The ball is the one element both pages share: across a page change it moves and scales from where the old page
+    // drew it to where the new page draws it (ease-in-out), instead of fading. Also remembers the drawn ball.
+    void MorphBall(float* center, float& radius, double now) {
+        if (morphing_) {
+            const double duration = g_reduceMotion ? 0.0 : kMorphSeconds;
+            const float t = duration > 0 ? static_cast<float>(std::clamp((now - morphStart_) / duration, 0.0, 1.0)) : 1.0f;
+            const float e = t < 0.5f ? 4.0f * t * t * t : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+            center[0] = std::lerp(morphFrom_[0], center[0], e);
+            center[1] = std::lerp(morphFrom_[1], center[1], e);
+            radius = std::lerp(morphFrom_[2], radius, e);
+            if (t >= 1.0f) morphing_ = false;
+        }
+        lastBall_[0] = center[0]; lastBall_[1] = center[1]; lastBall_[2] = radius;
+    }
+    bool Morphing() const { return morphing_; }
+    float MorphProgress(double now) const {
+        return morphing_ && kMorphSeconds > 0 ? static_cast<float>(std::clamp((now - morphStart_) / kMorphSeconds, 0.0, 1.0)) : 1.0f;
+    }
+private:
+    static constexpr double kMorphSeconds = 0.46;
+#endif
+
     void WriteBench(UINT w, UINT h) {
         if (g_opt.benchOut.empty() || frameIv_.size() < 10) return;
         std::vector<double> v(frameIv_.begin() + static_cast<long long>(frameIv_.size() / 10), frameIv_.end());
@@ -1734,7 +2010,11 @@ private:
     }
 
     ComPtr<ID3D11Device> dev_; ComPtr<ID3D11DeviceContext> ctx_; ComPtr<IDXGIFactory2> factory_;
-    ComPtr<IDCompositionDevice> dcomp_; ComPtr<IDCompositionTarget> target_; ComPtr<IDCompositionVisual> visual_;
+    ComPtr<IDCompositionDevice> dcomp_; ComPtr<IDCompositionTarget> target_; ComPtr<IDCompositionVisual> root_, visual_, snapVisual_;
+    std::function<void()> pendingSwitch_;
+    bool switchForward_ = true, phoneGlassReady_ = false, pickerReady_ = false, morphing_ = false;
+    double snapEnd_ = 0, morphStart_ = 0;
+    float lastBall_[3]{}, morphFrom_[3]{};
     ComPtr<IDXGISwapChain1> swap_; UINT swapW_ = 0, swapH_ = 0;
     ComPtr<ID3D11VertexShader> vs_; ComPtr<ID3D11PixelShader> ps_, psRays_, psPc_;
     ComPtr<ID3D11Texture2D> pass1_; ComPtr<ID3D11RenderTargetView> pass1Rtv_; ComPtr<ID3D11ShaderResourceView> pass1Srv_; UINT pass1W_ = 0, pass1H_ = 0;
@@ -1747,6 +2027,8 @@ private:
     double successPaintAt_ = 0, successAge_ = 0;
     double progressPaintAt_ = 0.0;
     float rimProgress_ = 0.0f;
+    float poolDepth_ = 0.0f;
+    double poolPaintAt_ = 0.0;
     int seqIndex_ = 0;
     std::vector<double> frameIv_;
 #ifdef DOCKY_PHONE_PAIRING
@@ -1865,16 +2147,15 @@ void ResetPairing() {
     SetWindowTextW(g_receivedText, L"");
     g_opt.codeMode = 0;
     ZeroMemory(g_opt.codeBits, sizeof(g_opt.codeBits));
-    ZeroMemory(g_qr, sizeof(g_qr));
-    g_qrSize = 0;
-    g_showQr = false;
+    g_showFallback = false;
     if (GetFocus() == g_back) SetFocus(g_wnd);
-    for (HWND hide : {g_back, g_receivedText, g_copyText, g_openFolder}) ShowWindow(hide, SW_HIDE);
-    for (HWND show : {g_guide, g_qrButton, g_receiveSettings, g_sendFiles, g_sendText}) ShowWindow(show, SW_SHOW);
+    for (HWND hide : {g_receivedText, g_copyText, g_openFolder}) ShowWindow(hide, SW_HIDE);
+    ShowWindow(g_back, g_unified ? SW_SHOW : SW_HIDE);  // one window with the picker: Back returns to it
+    for (HWND show : {g_guide, g_fallbackButton, g_receiveSettings, g_sendFiles, g_sendText}) ShowWindow(show, SW_SHOW);
     SetWindowTextW(g_sendFiles, Ui(L"选择发送文件"));
     SetWindowTextW(g_sendText, Ui(L"加入剪贴板文字"));
     SetReceiveStatus(Ui(L"正在准备手机配对…"));
-    UpdateQr();
+    UpdateFallback();
     LayoutPhoneControls(g_wnd);
     g_phoneHost = docky::pairing::StartPhoneHost(g_wnd, ReceivePhoneMessage);
 }
@@ -1913,7 +2194,7 @@ void ApplyBackgroundSetting() {
 void CloseOrHide() {
     if (!g_opt.pairPhone || !g_background || !g_opt.demoSession.empty()) { g_quit = true; return; }
     if (g_connectedAt > 0 || g_transferring) { ResetPairing(); LoadWidgetDraft(); }  // end the session, listen again
-    if (g_showQr) { g_showQr = false; UpdateQr(); }
+    if (g_showFallback) { g_showFallback = false; UpdateFallback(); }
     ShowWindow(g_wnd, SW_HIDE);
 }
 void ShowFromBackground() {
@@ -1958,11 +2239,208 @@ void PrepareShellSend(HWND owner, const std::wstring& path) {
 }
 #endif
 
+#ifdef DOCKY_PHONE_PAIRING
+// ---- One window for the PC picker and the phone page -------------------------------------------------------------------
+// The picker ("DockDrop", --discover) and the phone page (--pair-phone, --background) are two pages of the same window:
+// Pair phone switches to the phone page and its Back button returns to the picker, with a snapshot transition
+// (App::SwitchPage). The phone page is set up the first time it is shown and keeps listening while the picker is shown,
+// so remembered phones still connect (the window then switches to the phone page by itself).
+void InitPhoneSession() {
+    g_opt.mode = 3;
+    g_opt.codeMode = 0;
+    g_opt.codeAmp = 0.07f;
+    wchar_t localAppData[MAX_PATH]{};
+    const DWORD localLength = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData));
+#ifdef DOCKDROP_STANDALONE
+    if (g_opt.settingsPath.empty() && localLength && localLength < ARRAYSIZE(localAppData))
+        g_opt.settingsPath = std::wstring(localAppData) + L"\\DockDrop\\settings.json";
+#else
+    if (localLength && localLength < ARRAYSIZE(localAppData)) {
+        dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(localAppData, localLength) + L"\\LiquidDock\\glass.json");
+    }
+    if (g_opt.settingsPath.empty()) g_opt.settingsPath = liquid::settings::DefaultPath();
+#endif
+    const auto settings = liquid::settings::Load(g_opt.settingsPath).value;
+    g_background = settings.phoneBackground;
+    if (g_opt.demoSession.empty()) SyncAutostart(g_background);
+    g_preferredRadius = settings.phoneBallRadius;
+    g_receiveFolder = settings.phoneReceiveFolder;
+    if (g_receiveFolder.empty()) g_receiveFolder = docky::pairing::DownloadFolder();
+    g_opt.radius = static_cast<float>(g_preferredRadius);
+    g_opt.sizeW = 610;
+    g_opt.sizeH = 780;
+}
+
+std::vector<HWND> PageControls() {
+    std::vector<HWND> controls;
+    for (HWND child = GetWindow(g_wnd, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
+        if (child != g_surface) controls.push_back(child);
+    return controls;
+}
+
+// The phone page's controls are child windows above the composition surface. While the picker is shown they are
+// parked off the window (g_parkControls, LayoutPhoneControls) rather than hidden: the phone page keeps running there and
+// shows or hides its own controls as its state changes, so their visibility always stays its own. Across a page change
+// they fade: each control already paints a copy of the panel behind it (PaintControlBackdrop) and then itself, opaque,
+// so the fade blends the finished control over that plain backdrop by g_controlOpacity (PaintPhoneItem) and repaints the
+// controls every frame. (Layered child windows cannot be used: they blend against the parent's empty GDI surface, not
+// the composed glass.)
+struct ControlFade { std::vector<HWND> controls; double start = 0, duration = 0; bool in = false; };
+ControlFade g_controlFade;
+
+std::vector<HWND> ShownControls() {
+    std::vector<HWND> shown;
+    for (HWND control : PageControls()) if (IsWindowVisible(control)) shown.push_back(control);
+    return shown;
+}
+
+void EndControlFade() {
+    const bool parkAfter = !g_controlFade.controls.empty() && !g_controlFade.in;
+    std::vector<HWND> controls = std::move(g_controlFade.controls);
+    g_controlFade = {};
+    g_controlOpacity = 1.0f;
+    if (parkAfter) { g_parkControls = true; LayoutPhoneControls(g_wnd); }
+    else for (HWND control : controls) RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+}
+
+void StartControlFade(bool in, double duration) {
+    EndControlFade();
+    g_controlFade.controls = ShownControls();
+    if (duration <= 0 || g_controlFade.controls.empty()) {
+        g_controlFade.controls.clear();
+        if (!in) { g_parkControls = true; LayoutPhoneControls(g_wnd); }
+        return;
+    }
+    g_controlFade.start = Now();
+    g_controlFade.duration = duration;
+    g_controlFade.in = in;
+    g_controlOpacity = in ? 0.0f : 1.0f;
+}
+
+void TickControlFade(double now) {
+    if (g_controlFade.controls.empty()) return;
+    const float t = static_cast<float>(std::clamp((now - g_controlFade.start) / g_controlFade.duration, 0.0, 1.0));
+    const float e = t * t * (3.0f - 2.0f * t);
+    g_controlOpacity = g_controlFade.in ? e : 1.0f - e;
+    for (HWND control : g_controlFade.controls)
+        RedrawWindow(control, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    if (t >= 1.0f) EndControlFade();
+}
+
+// Fades the phone controls out and parks them (instantly without `fade` or with Reduce motion).
+void HidePhoneControls(bool fade = false) {
+    KillTimer(g_wnd, kRevealPhoneTimer);
+    if (GetFocus() && GetFocus() != g_wnd && IsChild(g_wnd, GetFocus())) SetFocus(g_wnd);
+    StartControlFade(false, fade && !g_reduceMotion ? 0.14 : 0.0);
+}
+
+// Brings the parked controls back into the phone page and fades them in.
+void RevealPhoneControls(bool fade) {
+    KillTimer(g_wnd, kRevealPhoneTimer);
+    if (!g_opt.pairPhone) return;
+    EndControlFade();
+    const bool animate = fade && !g_reduceMotion;
+    if (animate) g_controlOpacity = 0.0f;  // first paint in place is already transparent
+    g_parkControls = false;
+    LayoutPhoneControls(g_wnd);
+    if (animate) StartControlFade(true, 0.26);
+}
+void RevealPhoneControls() { RevealPhoneControls(false); }
+
+// Picker -> phone page. Fails only when another DockDrop process owns the phone page.
+bool EnterPhonePage(bool animate) {
+    if (g_opt.pairPhone) return true;
+    if (!g_app) return false;
+    if (!g_phoneMutex) {
+        HANDLE mutex = CreateMutexW(nullptr, FALSE, kPhoneMutex);
+        if (!mutex || GetLastError() == ERROR_ALREADY_EXISTS) { if (mutex) CloseHandle(mutex); return false; }
+        g_phoneMutex = mutex;
+    }
+    const bool first = !g_phoneReady;
+    if (first) InitPhoneSession();
+    g_app->SwitchPage([first, animate] {
+        g_opt.devicePreviewCount = 0;
+        g_opt.pcPreview = false;
+        g_opt.pairPhone = true;
+        g_opt.mode = 3;
+        g_opt.codeAmp = g_phoneCodeAmp;
+        g_opt.radius = static_cast<float>(g_preferredRadius);
+        g_app->InitPhoneGlass();
+        SetWindowTextW(g_wnd, Ui(L"DockDrop · 配对手机"));
+        if (first) {
+            g_phoneReady = true;
+            g_parkControls = true;  // created parked; revealed below
+            CreatePhoneControls(g_wnd);
+            ShowWindow(g_back, SW_SHOW);
+            DragAcceptFiles(g_wnd, TRUE);
+            LoadWidgetDraft();
+            g_phoneHost = docky::pairing::StartPhoneHost(g_wnd, ReceivePhoneMessage);
+        }
+        LayoutPhoneControls(g_wnd);
+        // The controls are windows above the composition surface: they appear halfway through the page change.
+        if (animate && !g_reduceMotion) SetTimer(g_wnd, kRevealPhoneTimer, 170, nullptr);
+        else RevealPhoneControls();
+    }, true, animate);
+    return true;
+}
+
+// Phone page -> picker (Back).
+void EnterPickerPage(bool animate) {
+    if (!g_unified || !g_app || !g_opt.pairPhone) return;
+    g_phoneCodeAmp = g_opt.codeAmp;
+    SaveRadius();
+    const bool fade = animate && !g_reduceMotion;
+    HidePhoneControls(fade);
+    // The phone controls fade out first; then the ball shrinks back into the picker while its UI appears (the
+    // controls' plain backdrop would otherwise cover the picker's buttons below them mid-fade).
+    if (fade) { SetTimer(g_wnd, kPickerSwitchTimer, 140, nullptr); return; }
+    SwitchToPicker(animate);
+}
+
+void SwitchToPicker(bool animate) {
+    KillTimer(g_wnd, kPickerSwitchTimer);
+    if (g_opt.devicePreviewCount) return;
+    if (g_connectedAt > 0 || g_transferring) { RevealPhoneControls(false); return; }  // a phone connected meanwhile
+    g_app->SwitchPage([] {
+        g_opt.pairPhone = false;
+        g_opt.pcPreview = true;
+        g_opt.devicePreviewCount = g_pickerCount;
+        g_opt.mode = 3;
+        if (!g_app->InitPicker(g_pickerCount)) { g_quit = true; return; }
+        g_devicePreview.Reopen();
+        SetWindowTextW(g_wnd, L"DockDrop");
+    }, false, animate);
+}
+
+// The picker's close (button, Escape, Alt+F4): with the phone page set up and Run in the background on, the window
+// hides like the phone page does and comes back on the phone page; otherwise DockDrop exits.
+void ClosePicker() {
+    g_devicePreview.Reopen();
+    if (!g_phoneReady || !g_background) { g_quit = true; return; }
+    EnterPhonePage(false);
+    RevealPhoneControls();
+    CloseOrHide();
+}
+#endif
+
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
 #ifdef DOCKY_PHONE_PAIRING
     case WM_COPYDATA: {
         const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lp);
+        if (data && data->dwData == kShowPicker && g_unified) {  // a second "DockDrop" launch: show the picker here
+            const bool visible = IsWindowVisible(h) != FALSE;
+            if (g_opt.pairPhone && !g_transferring && g_connectedAt == 0) EnterPickerPage(visible);
+            if (!visible) ShowWindow(h, SW_SHOW);
+            if (IsIconic(h)) ShowWindow(h, SW_RESTORE);
+            SetForegroundWindow(h);
+            return TRUE;
+        }
+        if (data && !g_opt.pairPhone && g_phoneReady &&
+            (data->dwData == docky::pairing::kLoadWidgetDraft || data->dwData == kShellSendFile)) {
+            EnterPhonePage(false);  // a phone request while the picker is shown
+            RevealPhoneControls();
+        }
         if (g_opt.pairPhone && data && data->dwData == docky::pairing::kLoadWidgetDraft && data->cbData == 0)
             return PostMessageW(h, kWidgetDraftReady, 0, 0);
         if (!g_opt.pairPhone || g_transferring || !IsWindowEnabled(h) || !g_shellSendPath.empty()
@@ -1986,6 +2464,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case kPhoneOffer: {
+        if (!g_opt.pairPhone && g_phoneReady) { EnterPhonePage(false); RevealPhoneControls(); }
         ShowFromBackground();
         const auto host = g_phoneHost;
         const auto id = std::exchange(g_receivePrompt, {});
@@ -2076,6 +2555,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else { ResetPairing(); LoadWidgetDraft(); }
                 return 0;
             }
+            if (LOWORD(wp) == kBack && g_unified && !g_transferring) { EnterPickerPage(true); return 0; }
             if (LOWORD(wp) == kConfirmStay) { ShowBackConfirm(false); return 0; }
             if (LOWORD(wp) == kConfirmLeave) {
                 const bool closing = g_confirmClose;
@@ -2084,7 +2564,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
                 else { ResetPairing(); LoadWidgetDraft(); }
                 return 0;
             }
-            if (LOWORD(wp) == kQrToggle) { g_showQr = !g_showQr; UpdateQr(); return 0; }
+            if (LOWORD(wp) == kFallbackToggle) { g_showFallback = !g_showFallback; UpdateFallback(); return 0; }
             if (LOWORD(wp) == kReceiveSettings && !g_transferring) {
                 ShowPhoneSettings(h);
                 return 0;
@@ -2119,7 +2599,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             PaintPhoneItem(*reinterpret_cast<const DRAWITEMSTRUCT*>(lp)); return TRUE;
         }
         if (wp == kClose || wp == kBack || wp == kConfirmText || wp == kConfirmStay || wp == kConfirmLeave ||
-            wp == kQrToggle || wp == kStatus || wp == kGuide || wp == kBallSize ||
+            wp == kFallbackToggle || wp == kStatus || wp == kGuide || wp == kBallSize ||
             wp == kReceiveSettings || wp == kCopyText || wp == kOpenFolder || wp == kSendFiles || wp == kSendText) {
             PaintPhoneItem(*reinterpret_cast<const DRAWITEMSTRUCT*>(lp)); return TRUE;
         }
@@ -2132,12 +2612,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_NCHITTEST:
 #ifdef DOCKY_PHONE_PAIRING
         if (IsPcReceiveBall()) return HTCLIENT;  // the native ellipse region rejects the transparent corners
+        if (g_opt.devicePreviewCount) {
+            POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(h, &point);
+            return g_devicePreview.InControls(point) ? HTCLIENT : HTCAPTION;
+        }
         if (g_opt.pcPreview) {
             POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(h, &point);
             if (PcPeerAt(point, Now()) >= 0) return HTCLIENT;
         }
-        if (g_opt.pairPhone && !g_showQr) {
+        if (g_opt.pairPhone && !g_showFallback) {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(h, &p);
             float normal[3]{};
@@ -2147,6 +2632,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return HTCAPTION;  // the area around the glass moves the window
 #ifdef DOCKY_PHONE_PAIRING
     case WM_SETCURSOR:
+        if (g_opt.devicePreviewCount && LOWORD(lp) == HTCLIENT) {
+            POINT point{};
+            GetCursorPos(&point);
+            ScreenToClient(h, &point);
+            SetCursor(LoadCursorW(nullptr, g_devicePreview.OnAction(point) ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
         if (IsPcReceiveBall() && LOWORD(lp) == HTCLIENT) {
             POINT point{};
             GetCursorPos(&point);
@@ -2155,7 +2647,18 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         break;
+    case WM_NCMOUSEMOVE:
+        if (g_opt.devicePreviewCount) {
+            POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(h, &point);
+            g_devicePreview.Move(point);
+        }
+        break;
     case WM_MOUSEMOVE:
+        if (g_opt.devicePreviewCount) {
+            g_devicePreview.Move({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            return 0;
+        }
         if (IsPcReceiveBall()) {
             if (g_pcReceivePressed != PcReceiveAction::None && PcReceiveDragExceeded(h, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}))
                 g_pcReceivePressed = PcReceiveAction::None;
@@ -2163,9 +2666,22 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_CAPTURECHANGED:
+        if (g_opt.devicePreviewCount) { g_devicePreview.CancelPress(); return 0; }
         if (IsPcReceiveBall()) { g_pcReceivePressed = PcReceiveAction::None; return 0; }
         break;
+    case WM_MOUSEWHEEL:
+    case WM_MOUSEHWHEEL:
+        if (g_opt.devicePreviewCount) {
+            const float steps = GET_WHEEL_DELTA_WPARAM(wp) / static_cast<float>(WHEEL_DELTA);
+            g_devicePreview.Wheel(msg == WM_MOUSEWHEEL ? -steps : steps);
+            return 0;
+        }
+        break;
     case WM_LBUTTONDOWN:
+        if (g_opt.devicePreviewCount) {
+            g_devicePreview.Press(h, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            return 0;
+        }
         if (IsPcReceiveBall()) {
             g_pcReceivePressPoint = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             g_pcReceivePressed = PcReceiveActionAt(h, g_pcReceivePressPoint);
@@ -2181,13 +2697,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        if (g_opt.pairPhone && !g_showQr && !g_reduceMotion) {
+        if (g_opt.pairPhone && !g_showFallback && !g_reduceMotion) {
             POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             float normal[3]{};
             if (PickBallSurface(p, normal)) TapBall(normal, Now());
         }
         return 0;
     case WM_LBUTTONUP:
+        if (g_opt.devicePreviewCount) {
+            g_devicePreview.Release(h, {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, Now());
+            return 0;
+        }
         if (IsPcReceiveBall()) {
             const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             const auto pressed = g_pcReceivePressed;
@@ -2224,6 +2744,18 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
 #ifdef DOCKY_PHONE_PAIRING
         if (wp == kSaveRadiusTimer) { SaveRadius(); return 0; }
+        if (wp == kRevealPhoneTimer) { RevealPhoneControls(true); return 0; }
+        if (wp == kPickerSwitchTimer) { SwitchToPicker(true); return 0; }
+        if (wp == kPreviewPhoneTimer && g_opt.devicePreviewCount) {
+            const HWND phone = FindWindowW(kPhoneWindow, nullptr);
+            if (phone && IsWindowVisible(phone)) {
+                g_previewSawPhone = true;
+            } else if (g_previewSawPhone || Now() - g_previewPhoneOpenedAt >= 8.0) {
+                KillTimer(h, kPreviewPhoneTimer);
+                ShowWindow(h, SW_SHOW);
+            }
+            return 0;
+        }
 #endif
         if (g_app) g_app->Frame();
         return 0;
@@ -2257,6 +2789,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (g_opt.pairPhone) { CloseOrHide(); return 0; }
+        if (g_unified && g_opt.devicePreviewCount) { ClosePicker(); return 0; }
 #endif
         g_quit = true; return 0;
     case WM_DESTROY:
@@ -2297,8 +2830,11 @@ int RunPcBallSession(HINSTANCE instance, docky::pairing::pc_receive::Offer& offe
     if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &vertical))) dpi = 96;
     const auto rc = mi.rcWork;
     const auto receive = PcReceivePlacement(rc, dpi);
-    const int width = offer.sending ? MulDiv(486, dpi, 96) : receive.right - receive.left;
-    const int height = offer.sending ? MulDiv(530, dpi, 96) : receive.bottom - receive.top;
+    g_opt.sizeW = 610;
+    g_opt.sizeH = 780;
+    const auto senderSize = PhoneWindowSize(rc, dpi / 96.0f);
+    const int width = offer.sending ? senderSize.cx : receive.right - receive.left;
+    const int height = offer.sending ? senderSize.cy : receive.bottom - receive.top;
     const int x = offer.sending ? (rc.left + rc.right - width) / 2 : receive.left;
     const int y = offer.sending ? (rc.top + rc.bottom - height) / 2 : receive.top;
     const DWORD style = WS_EX_NOREDIRECTIONBITMAP | (offer.sending ? 0 : WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
@@ -2369,13 +2905,25 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         return status;
     }
 #endif
+#ifdef DOCKDROP_STANDALONE
+    if (argc == 1) { g_opt.pcPreview = true; g_opt.devicePreviewCount = -1; }
+#endif
     for (int i = 1; i < argc; ++i) {
         const std::wstring a = argv[i];
         auto next = [&]() { return i + 1 < argc ? std::wstring(argv[++i]) : std::wstring(); };
         if (a == L"--studio") g_opt.mode = 2;
 #ifdef DOCKY_PHONE_PAIRING
+        else if (a == L"--discover") { g_opt.pcPreview = true; g_opt.devicePreviewCount = -1; }
         else if (a == L"--demo-pc") g_opt.pcPreview = true;
         else if (a == L"--demo-pc-tour") { g_opt.pcPreview = true; g_opt.pcTour = true; }
+        else if (a == L"--demo-devices") {
+            g_opt.pcPreview = true;
+            if (!g_opt.devicePreviewCount) g_opt.devicePreviewCount = 12;
+        }
+        else if (a == L"--demo-device-count") {
+            g_opt.pcPreview = true;
+            g_opt.devicePreviewCount = std::max(1, _wtoi(next().c_str()));
+        }
         else if (a == L"--reduce-motion") g_opt.pcReduced = true;
         else if (a == L"--pair-phone") g_opt.pairPhone = true;
         else if (a == L"--background") { g_opt.pairPhone = true; g_startHidden = true; }
@@ -2422,14 +2970,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         g_opt.mode = 3;
         g_opt.codeMode = 0;
         if (g_opt.sizeW <= 0) g_opt.sizeW = 610;
-        if (g_opt.sizeH <= 0) g_opt.sizeH = 680;
+        if (g_opt.sizeH <= 0) g_opt.sizeH = g_opt.devicePreviewCount ? 780.f : 680.f;
+        g_pickerCount = g_opt.devicePreviewCount;
+        // DockDrop already runs (the phone page, possibly hidden in the background): show the picker in that window.
+        if (g_opt.devicePreviewCount < 0) {
+            if (HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, kPhoneMutex)) {
+                CloseHandle(running);
+                HWND window = FindWindowW(kPhoneWindow, nullptr);
+                if (!window) window = FindWindowW(kDevicesWindow, nullptr);
+                DWORD process = 0;
+                if (window && GetWindowThreadProcessId(window, &process)) AllowSetForegroundWindow(process);
+                COPYDATASTRUCT message{kShowPicker, 0, nullptr};
+                DWORD_PTR done = 0;
+                if (window && SendMessageTimeoutW(window, WM_COPYDATA, 0, reinterpret_cast<LPARAM>(&message),
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 1500, &done) && done) return 0;
+            }
+        }
     }
     HANDLE singleInstance = nullptr;
     if (g_opt.pairPhone) {
         singleInstance = CreateMutexW(nullptr, FALSE, kPhoneMutex);
         if (singleInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
             if (g_startHidden) { CloseHandle(singleInstance); return 0; }  // already waiting
-            if (HWND window = FindWindowW(kPhoneWindow, nullptr)) {
+            HWND owner = FindWindowW(kPhoneWindow, nullptr);
+            if (!owner) owner = FindWindowW(kDevicesWindow, nullptr);  // a picker window that opened the phone page
+            if (HWND window = owner) {
                 ShowWindow(window, SW_RESTORE);
                 SetForegroundWindow(window);
                 if (!g_shellSendPath.empty()) {
@@ -2450,31 +3015,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             CloseHandle(singleInstance);
             return 0;
         }
-        g_opt.mode = 3;
-        g_opt.codeMode = 0;
-        g_opt.codeAmp = 0.07f;
-        wchar_t localAppData[MAX_PATH]{};
-        const DWORD localLength = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, ARRAYSIZE(localAppData));
-#ifdef DOCKDROP_STANDALONE
-        if (g_opt.settingsPath.empty() && localLength && localLength < ARRAYSIZE(localAppData))
-            g_opt.settingsPath = std::wstring(localAppData) + L"\\DockDrop\\settings.json";
-#else
-        if (localLength && localLength < ARRAYSIZE(localAppData)) {
-            dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(localAppData, localLength) + L"\\LiquidDock\\glass.json");
-        }
-        if (g_opt.settingsPath.empty()) g_opt.settingsPath = liquid::settings::DefaultPath();
-#endif
-        const auto settings = liquid::settings::Load(g_opt.settingsPath).value;
-        g_background = settings.phoneBackground;
-        if (g_opt.demoSession.empty()) SyncAutostart(g_background);
+        InitPhoneSession();
         if (g_startHidden && !g_background) { CloseHandle(singleInstance); return 0; }  // switched off since sign-in
-        g_preferredRadius = settings.phoneBallRadius;
-        g_receiveFolder = settings.phoneReceiveFolder;
-        if (g_receiveFolder.empty()) g_receiveFolder = docky::pairing::DownloadFolder();
-        g_opt.radius = static_cast<float>(g_preferredRadius);
-        g_opt.sizeW = 610;
-        g_opt.sizeH = 780;
+        g_phoneMutex = singleInstance;
+        g_phoneReady = g_opt.demoSession.empty();
+        g_unified = g_opt.demoSession.empty();
     }
+    if (g_opt.pcPreview && g_opt.devicePreviewCount < 0) g_unified = true;  // the live picker
 #endif
     WNDCLASSEXW wc{sizeof(wc)}; wc.lpfnWndProc = WndProc; wc.hInstance = inst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.lpszClassName = L"DockyBubble";
     wc.hIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0,
@@ -2483,7 +3030,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), LR_SHARED));
 #ifdef DOCKY_PHONE_PAIRING
     if (g_opt.pairPhone) wc.lpszClassName = kPhoneWindow;
-    if (g_opt.pcPreview) wc.lpszClassName = kPcWindow;
+    if (g_opt.pcPreview) wc.lpszClassName = g_opt.devicePreviewCount ? kDevicesWindow : kPcWindow;
 #endif
     RegisterClassExW(&wc);
     POINT cursor; GetCursorPos(&cursor);
@@ -2505,7 +3052,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     const DWORD exStyle = g_opt.pcPreview ? WS_EX_CONTROLPARENT :
         g_opt.pairPhone ? 0 : WS_EX_NOREDIRECTIONBITMAP;
     const DWORD style = WS_POPUP | (panel ? WS_CLIPCHILDREN : 0);
-    const wchar_t* title = g_opt.pcPreview ? Ui(L"DockDrop · 电脑互传预览")
+    const wchar_t* title = g_opt.devicePreviewCount ? L"DockDrop"
+        : g_opt.pcPreview ? Ui(L"DockDrop · 电脑互传预览")
         : g_opt.pairPhone ? Ui(L"DockDrop · 配对手机") : L"Optical Bubble";
     g_wnd = CreateWindowExW(exStyle, wc.lpszClassName, title,
         style, x, y, w, h, nullptr, nullptr, inst, nullptr);
@@ -2531,7 +3079,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (!app.Init()) { MessageBoxW(nullptr, L"Direct3D 11 is not available.", L"Optical Bubble", MB_ICONERROR); return 1; }
     if (!g_startHidden) ShowWindow(g_wnd, SW_SHOW);
 #ifdef DOCKY_PHONE_PAIRING
-    if (g_opt.pcPreview) CreatePcControls(g_wnd);
+    if (g_opt.pcPreview && !g_opt.devicePreviewCount) CreatePcControls(g_wnd);
     if (g_opt.pairPhone) {
         CreatePhoneControls(g_wnd);
         DragAcceptFiles(g_wnd, TRUE);
@@ -2561,9 +3109,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             }
 #endif
             if (m.message == WM_QUIT) { g_quit = true; break; }
+#ifdef DOCKY_PHONE_PAIRING
+            if (g_opt.devicePreviewCount && m.message == WM_KEYDOWN && g_devicePreview.Key(m.wParam, Now())) continue;
+#endif
             if (panel && m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
 #ifdef DOCKY_PHONE_PAIRING
                 if (g_opt.pairPhone) { CloseOrHide(); continue; }
+                if (g_unified && g_opt.devicePreviewCount) { ClosePicker(); continue; }
 #endif
                 g_quit = true;
                 break;
@@ -2574,7 +3126,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
         if (g_quit) break;
 #ifdef DOCKY_PHONE_PAIRING
-        if (g_opt.pairPhone && !IsWindowVisible(g_wnd)) {  // hidden: no frames, just wait for messages (phone host, show)
+        if (g_phoneReady || g_opt.pairPhone) SyncQrListening();
+        if ((g_opt.pairPhone || g_opt.devicePreviewCount) && !IsWindowVisible(g_wnd)) {
             MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             continue;
         }
@@ -2584,7 +3137,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     app.Shutdown();
 #ifdef DOCKY_PHONE_PAIRING
-    if (g_opt.pairPhone) SaveRadius();
+    if (g_opt.pairPhone || g_phoneReady) SaveRadius();
     g_incoming.Cancel();
     g_phoneHost.reset();
     if (singleInstance) CloseHandle(singleInstance);

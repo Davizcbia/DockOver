@@ -7,6 +7,8 @@
 #include <cstdint>
 
 namespace liquid::menu {
+// Power commands of the DockOver menu (handled by the Menu Bar).
+inline constexpr UINT kCmdSleep=0xF0F3, kCmdRestart=0xF0F4, kCmdShutDown=0xF0F5, kCmdLock=0xF0F6, kCmdSignOut=0xF0F7;
 enum class ItemKind { Command, Submenu, Separator };
 // Optional row icon (premultiplied BGRA). templ: monochrome artwork drawn in the row's text colour.
 struct Icon { UINT w=0,h=0; std::vector<std::uint32_t> pixels; bool templ=false; };
@@ -19,8 +21,16 @@ class InternalProvider final : public Provider {
 public:
     std::vector<Menu> GetMenus(HWND) const override {
         Menu m; m.title=L"DockOver"; m.source=ProviderKind::Internal;
+        // macOS Apple-menu order: power commands below the app's own items; "..." ones ask first (menu_bar.cpp).
         m.items={{L"About DockOver",ItemKind::Command,false,false,{}},
                  {L"Settings",ItemKind::Command,true,false,{},0xF0F2},
+                 {L"",ItemKind::Separator,false,false,{}},
+                 {L"Sleep",ItemKind::Command,true,false,{},kCmdSleep},
+                 {L"Restart\u2026",ItemKind::Command,true,false,{},kCmdRestart},
+                 {L"Shut Down\u2026",ItemKind::Command,true,false,{},kCmdShutDown},
+                 {L"",ItemKind::Separator,false,false,{}},
+                 {L"Lock Screen",ItemKind::Command,true,false,{},kCmdLock},
+                 {L"Sign Out\u2026",ItemKind::Command,true,false,{},kCmdSignOut},
                  {L"",ItemKind::Separator,false,false,{}},
                  {L"Quit DockOver",ItemKind::Command,true,false,{},0xF0F1}};
         return {std::move(m)};
