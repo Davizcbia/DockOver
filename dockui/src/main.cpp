@@ -72,6 +72,7 @@ constexpr UINT_PTR kTimerExit = 2;
 constexpr UINT_PTR kTimerLaunchpadIcon = 3;  // a Launchpad icon command, run once Launchpad has faded out
 constexpr UINT_PTR kTimerLaunchpadPrewarm = 4;  // app discovery and icon cache for Launchpad, a few seconds after start
 constexpr UINT_PTR kTimerDragRemoval = 5;
+constexpr UINT_PTR kTimerWindowPreview = 6;
 constexpr UINT kDragRemovalDwellMs = 300;
 constexpr UINT_PTR kTimerApplicationsPrewarm = 58;  // the resident Applications window, started hidden after the Dock
 static HWND ApplicationsWindow(HANDLE process);  // the resident Applications window of that process, if any
@@ -357,6 +358,9 @@ private:
     struct DropJob { DropKind kind; std::vector<std::wstring> paths; int item; int insert; };
     std::vector<DropJob> dropJobs_;
     void ActivateItem(int index);
+    void TickWindowPreview();
+    void DismissWindowPreview();
+    void ActivatePreviewWindow(HWND source);
     void Reload();
     void DumpState(const wchar_t* reason);
     bool RecreateDevice();
@@ -438,6 +442,12 @@ private:
     float ptrX_ = 0, ptrY_ = 0, ptrHover_ = 0, ptrPress_ = 0;  // smoothed, window px
     float cpuEma_ = 0;
     std::vector<PinnedItem> items_;
+    static constexpr UINT kActivatePreview = WM_APP + 211;
+    WindowPreview windowPreview_;
+    std::string previewApp_;
+    bool previewPolling_ = false;
+    double previewSince_ = 0.0, previewLastInside_ = 0.0, previewRefresh_ = 0.0;
+    HWND previewForeground_ = nullptr;
     std::vector<ComPtr<ID2D1Bitmap1>> iconBmp_, shadowBmp_;
     ComPtr<ID2D1Bitmap1> downloadsOpenBmp_;  // open-state Downloads icon (V0.9.3)
     std::vector<float> shadowPad_;
@@ -604,6 +614,7 @@ void App::DragLeave() {
 }
 
 DWORD App::DragHover(POINTL screen, DWORD allowed, const std::vector<std::wstring>& paths) {
+    if (previewPolling_) DismissWindowPreview();
     if (paths.empty() || dragging_ || resizing_) return DROPEFFECT_NONE;
     externalDrag_ = true;
     POINT pt{screen.x, screen.y}; ScreenToClient(hwnd_, &pt);
@@ -911,7 +922,11 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_MOUSEMOVE:
-        if (!externalDrag_) OnMouseMove(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
+        if (!externalDrag_) {
+            OnMouseMove(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
+            if (!previewPolling_ && !dragging_ && !GetCapture())
+                previewPolling_ = SetTimer(hwnd_, kTimerWindowPreview, 30, nullptr) != 0;
+        }
         return 0;
     case WM_MOUSELEAVE:
         if (!externalDrag_) OnMouseLeave();
@@ -923,13 +938,18 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if (fullscreenApp_) return MA_NOACTIVATE;
         break;
     case WM_LBUTTONDOWN:
+        if (previewPolling_) DismissWindowPreview();
         OnLButtonDown(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
         return 0;
     case WM_LBUTTONUP:
         OnLButtonUp(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
         return 0;
     case WM_RBUTTONUP:
+        if (previewPolling_) DismissWindowPreview();
         OnRButtonUp(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
+        return 0;
+    case kActivatePreview:
+        ActivatePreviewWindow(reinterpret_cast<HWND>(wp));
         return 0;
     case WM_CAPTURECHANGED:
         sepPress_ = -1;
@@ -1003,6 +1023,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if(next!=downloadsPixels_){downloadsPixels_=std::move(next);for(auto& item:items_)if(item.isDownloads){ResolveItem(item);break;}BuildIcons();}
         return 0;}
     case WM_TIMER:
+        if (wp == kTimerWindowPreview) { TickWindowPreview(); return 0; }
         if (wp == kTimerDragRemoval) {
             if (dragging_) {
                 UpdateDragTarget(mouseX_, mouseY_);
@@ -1210,6 +1231,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd_);
         return 0;
     case WM_DESTROY:
+        DismissWindowPreview();
         docky::statushost::Shutdown();
         RevokeDragDrop(hwnd_);
         dock::minimize::Shutdown(); ApplyGenie(false);  // restores Windows' minimize animation if docky paused it
@@ -1989,6 +2011,7 @@ void App::SyncTiles() {
     model_.SetTiles(separators, widths);
 }
 void App::ApplyWindowLayout(const wchar_t* reason) {
+    if (previewPolling_) DismissWindowPreview();
     if (!hwnd_) return;
     scale_ = dpi_ / 96.0f;
     SyncTiles();
@@ -2101,10 +2124,11 @@ void App::SetSceneRegion(const Scene& scene) {
 bool App::UpdateAutoHide(double dt, double now) {
     // Never hide while the user is working with the Dock or anything it opened.
     const bool busy = !AutoHiding() || resizing_ || dragging_ || pressed_ >= 0 || model_.PointerActive() || dock::downloads::OpenProgress() > 0.0f ||
-                      dock::launchpad::IsOpen() || dock::iconedit::IsOpen() || OwnPopupVisible();
+                      dock::launchpad::IsOpen() || dock::iconedit::IsOpen() || OwnPopupVisible() || windowPreview_.Visible();
     if (AutoHiding()) {  // V0.16 diagnostics: log which condition keeps the Dock shown, only when it changes
         const int reasons = (dragging_ ? 1 : 0) | (pressed_ >= 0 ? 2 : 0) | (model_.PointerActive() ? 4 : 0) | (dock::downloads::OpenProgress() > 0.0f ? 8 : 0) |
-                            (dock::launchpad::IsOpen() ? 16 : 0) | (dock::iconedit::IsOpen() ? 32 : 0) | (OwnPopupVisible() ? 64 : 0);
+                            (dock::launchpad::IsOpen() ? 16 : 0) | (dock::iconedit::IsOpen() ? 32 : 0) | (OwnPopupVisible() ? 64 : 0) |
+                            (windowPreview_.Visible() ? 128 : 0);
         if (reasons != autoHideBusy_) { autoHideBusy_ = reasons; DLOG(L"auto-hide: busy mask 0x%02X", reasons); }
     }
     if (!hideInit_) { hideInit_ = true; hide_.SetRest(0.002, 0.02); }  // normalised 0..1 (about 0.2 px at 100 px travel)
@@ -2349,7 +2373,8 @@ void App::Frame() {
             scene.labelIndex = static_cast<int>(removalFrame.items.size()) - 1;
             scene.frame = &removalFrame;
         }
-    } else if (hovered >= 0 && !dragging_ && !externalDrag_) {
+    } else if (hovered >= 0 && !dragging_ && !externalDrag_ &&
+               !(windowPreview_.Visible() && items_[hovered].stableId == previewApp_)) {
         scene.labelIndex = hovered;
         scene.label = items_[hovered].label;
         if (items_[hovered].isStatusGroup) {  // the label names the hovered cell
@@ -2615,6 +2640,104 @@ void App::OnMouseLeave() {
     if (model_.PointerActive()) DLOG(L"hover end (left window)");
     model_.SetPointer(false, 0, 0);
     StartAnimating();
+}
+
+void App::DismissWindowPreview() {
+    const bool visible = windowPreview_.Visible();
+    windowPreview_.Hide();
+    previewApp_.clear();
+    if (previewPolling_) KillTimer(hwnd_, kTimerWindowPreview);
+    previewPolling_ = false;
+    if (visible && hwnd_) { needsFrame_ = true; StartAnimating(); }
+}
+
+void App::TickWindowPreview() {
+    if (!previewPolling_) return;
+    const bool visible = windowPreview_.Visible();
+    if (fullscreenApp_ || GameMode() || hiddenRegion_ || dragging_ || resizing_ || externalDrag_ ||
+        dock::launchpad::IsOpen() || dock::iconedit::IsOpen() || OwnPopupVisible() ||
+        dock::downloads::OpenProgress() > 0.0f ||
+        (visible && GetForegroundWindow() != previewForeground_) ||
+        ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) && GetCapture() != windowPreview_.Window()) ||
+        (visible && (GetAsyncKeyState(VK_ESCAPE) & 0x8000))) {
+        DismissWindowPreview();
+        return;
+    }
+    POINT cursor{};
+    if (!GetCursorPos(&cursor)) { DismissWindowPreview(); return; }
+    const double now = Now();
+    const HWND under = WindowFromPoint(cursor);
+    const bool inPanel = visible && under == windowPreview_.Window();
+    const POINT screen = cursor;
+    ScreenToClient(hwnd_, &cursor);
+    const int hit = under == hwnd_ ? model_.HitTest(frame_, Dip(cursor.x), Dip(cursor.y)) : -1;
+    const PinnedItem* candidate = hit >= 0 && static_cast<size_t>(hit) < items_.size() ? &items_[hit] : nullptr;
+    if (candidate && (!candidate->running || candidate->stableId.empty() || candidate->isMinimized ||
+                      (candidate->exePath.empty() && candidate->aumid.empty()))) candidate = nullptr;
+
+    if (inPanel) {
+        previewLastInside_ = now;
+    } else if (candidate && candidate->stableId != previewApp_) {
+        windowPreview_.Hide();
+        previewApp_ = candidate->stableId;
+        previewSince_ = previewLastInside_ = now;
+        previewForeground_ = GetForegroundWindow();
+        needsFrame_ = true;
+        return;
+    } else if (candidate) {
+        previewLastInside_ = now;
+    } else {
+        if (visible && now - previewLastInside_ < 0.26) return; // cross the gap from the icon to the panel
+        DismissWindowPreview();
+        return;
+    }
+
+    if (visible && now < previewRefresh_) return;
+    if (!visible && now - previewSince_ < 0.34) return;
+    const auto item = std::find_if(items_.begin(), items_.end(), [this](const PinnedItem& p) {
+        return p.stableId == previewApp_ && !p.isMinimized;
+    });
+    if (item == items_.end()) { DismissWindowPreview(); return; }
+    auto windows = AppWindows(*item, hwnd_);
+    // Cloaked windows on another virtual desktop may have no compositor surface here.
+    std::erase_if(windows, [](HWND w) {
+        DWORD cloaked = 0;
+        return SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
+    });
+    if (windows.empty()) { DismissWindowPreview(); return; }
+    const size_t index = static_cast<size_t>(item - items_.begin());
+    if (index >= frame_.items.size()) { DismissWindowPreview(); return; }
+    const auto& g = frame_.items[index];
+    const LONG x = screen.x - cursor.x;
+    const LONG y = screen.y - cursor.y + static_cast<LONG>(appliedOffset_);
+    const RECT anchor{x + static_cast<LONG>(g.left * scale_), y + static_cast<LONG>(g.restTop * scale_),
+                      x + static_cast<LONG>((g.left + g.width) * scale_), y + static_cast<LONG>((g.restTop + g.size) * scale_)};
+    const size_t count = windows.size();
+    if (!windowPreview_.Show(hwnd_, kActivatePreview, anchor, static_cast<UINT>(dpi_),
+                             liquid::theme::IsDark(appearanceMode_, systemDark_), item->label, std::move(windows))) {
+        DismissWindowPreview();
+        return;
+    }
+    previewRefresh_ = now + 0.8;
+    if (!visible) {
+        DLOG(L"window preview: %zu windows", count);
+        needsFrame_ = true;
+    }
+}
+
+void App::ActivatePreviewWindow(HWND source) {
+    if (!windowPreview_.Visible()) return;
+    const auto item = std::find_if(items_.begin(), items_.end(), [this](const PinnedItem& p) {
+        return p.stableId == previewApp_ && !p.isMinimized;
+    });
+    PinnedItem target;
+    if (item != items_.end()) {
+        target.window = source;
+        target.exePath = item->exePath;
+        target.aumid = item->aumid;
+    }
+    DismissWindowPreview();
+    if (target.window) DLOG(L"window preview: activation %ls", ActivateAppWindow(target) ? L"succeeded" : L"failed");
 }
 
 int App::SeparatorAt(float x, float y) const {
@@ -3043,6 +3166,7 @@ void App::OnKey(WPARAM key) {
     switch (key) {
     case VK_ESCAPE:
         if(dragging_){FinishDrag(false);return;}
+        if(windowPreview_.Visible()){DismissWindowPreview();return;}
         // V0.16: Esc dismisses this Dock's context menu; it must never also quit the Dock.
         if(OwnPopupVisible()){DLOG(L"Escape: closing context menu");liquid::popup::Close();return;}
         // Never quit on Esc: the Dock takes keyboard focus whenever another DockOver window (Applications, a popup)
