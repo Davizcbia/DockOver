@@ -329,6 +329,7 @@ inline const wchar_t* Text(const wchar_t* source) {
         {L"Pinyin – Simplified", L"拼音 · 简体"},
         {L"Place stacks anywhere", L"自由放置叠放"},
         {L"Place widgets directly on the desktop by dragging them from the gallery, or click one to add it. Widgets snap to each other and to the grid.", L"从图库拖动小组件即可将其放到桌面上，也可以点击添加。小组件会吸附到其他小组件和网格。"},
+        {L"Place widgets on the right without Stacks", L"关闭叠放时将小组件放在右侧"},
         {L"Play motion artwork when available in Now Playing and the music wallpaper.", L"有动态封面时，在正在播放和音乐壁纸中播放。"},
         {L"Play music to see its artwork", L"播放音乐后将显示专辑封面"},
         {L"Power Source: Battery", L"电源来源：电池"},

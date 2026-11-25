@@ -33,11 +33,11 @@ public:
     bool Running() const;
     void SetGroupBy(GroupBy by);
     void SetStyle(StackStyle style);
-    // Free placement: stacks can be dragged to any desktop grid cell (x = column from the right edge, y = row). Cells are
-    // keyed by stack name; OnCellsChanged reports them after a drag so the app can save them.
+    // Free placement stores DIP offsets from the work area's right and top edges, keyed by stack name.
+    // Legacy grid positions are used until a free position has been saved for that stack.
     void SetFreePlacement(bool on);
-    void SetCells(const std::map<std::wstring, POINT>& cells);
-    void OnCellsChanged(std::function<void(const std::map<std::wstring, POINT>&)> changed);
+    void SetPositions(const std::map<std::wstring, POINT>& positions, const std::map<std::wstring, POINT>& legacyCells);
+    void OnPositionsChanged(std::function<void(const std::map<std::wstring, POINT>&)> changed);
     void Rescan();
     void Relayout();      // work area / DPI / theme / wallpaper changed
     void Raise(bool raised);  // above the desktop window after "Show desktop", back to the bottom otherwise

@@ -1,11 +1,14 @@
 #include "stacks.h"
 #include "glass_window.h"
+#include "../motion.h"
+#include "../ui_language.h"
 #include "../vblank.h"
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shellapi.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -241,11 +244,19 @@ constexpr float kPanelPad = 14.f, kHeader = 44.f;
 constexpr wchar_t kColumnClass[] = L"DockyDesktopStacks", kPanelClass[] = L"DockyDesktopStackPanel";
 constexpr UINT kThumbReady = WM_APP + 7, kRescanMsg = WM_APP + 8;
 
-struct Entry { int stack = -1, file = -1; D2D1_RECT_F rect{}; POINT cell{}; };  // file -1: the stack tile itself; cell: grid column from the right, row
-// Expand / collapse animation (macOS): files fly out of the stack into their cells (and back in), every other tile
-// glides to its new cell. Rectangles are absolute DIP (screen px / scale) so the window may change size meanwhile.
-struct Flight { D2D1_RECT_F from{}, to{}; float fromAlpha = 1, toAlpha = 1; int entry = -1; FileEntry ghost; bool isGhost = false; };
-constexpr double kFlightSeconds = 0.34;
+struct Entry { int stack = -1, file = -1; D2D1_RECT_F rect{}; };
+// Absolute DIPs keep the same rendered position when the layered window resizes.
+struct Flight {
+    std::wstring key;
+    docky::motion::SpringN<6> motion;  // left, top, width, height, opacity, stack-open mix
+    int entry = -1;
+    FileEntry ghost;
+    double delay = 0;
+    D2D1_RECT_F Rect() const {
+        return D2D1::RectF(motion[0].F(), motion[1].F(), motion[0].F() + motion[2].F(), motion[1].F() + motion[3].F());
+    }
+    float Alpha() const { return std::clamp(motion[4].F(), 0.f, 1.f); }
+};
 struct State {
     HWND host = nullptr, column = nullptr;
     GlassWindow panel;
@@ -254,15 +265,18 @@ struct State {
     std::vector<Entry> entries;               // DIP, column window coordinates
     std::set<std::wstring> expanded;          // in-place mode: stacks open on the desktop (by name, kept across rescans)
     std::set<std::wstring> sel; std::wstring anchor;  // selected file paths (desktop and panel); Shift-click anchor
-    // Free placement (Settings > Stacks > Place stacks anywhere): every stack keeps its own desktop grid cell (x = column
-    // from the right edge, y = row); expanded files flow from their stack's cell into the next free cells.
-    bool freePlace = false; std::map<std::wstring, POINT> cells; std::function<void(const std::map<std::wstring, POINT>&)> cellsChanged;
-    int gridCols = 1, gridRows = 1; RECT work{};
-    bool draggingStack = false; std::wstring dragName;
+    bool freePlace = false;
+    std::map<std::wstring, POINT> positions, legacyCells;
+    std::function<void(const std::map<std::wstring, POINT>&)> positionsChanged;
+    RECT work{};
+    bool draggingStack = false; std::wstring dragName; POINT dragOffset{};
     // Click catcher: an invisible window over the work area below every docky window, so a drag on the bare wallpaper
     // draws a selection rectangle (Explorer's own icon view is hidden while Stacks are on). Right-click shows Explorer's
     // desktop menu and files dropped there land on the desktop.
-    HWND catcher = nullptr, band = nullptr; bool banding = false, bandShown = false; POINT bandStart{}; std::set<std::wstring> bandBase;
+    HWND catcher = nullptr, band = nullptr;
+    bool banding = false, bandShown = false, bandToggle = false, bandTracksButton = false;
+    POINT bandStart{}, bandEnd{};
+    std::set<std::wstring> bandBase;
     int open = -1, hoverTile = -1, scroll = 0; // panel mode
     UINT dpi = 96; RECT columnRect{}, panelRect{};
     Canvas columnCanvas;
@@ -270,7 +284,7 @@ struct State {
     std::thread watcher; HANDLE stopWatch = nullptr;
     bool raised = false, running = false;
     POINT press{}; bool pressed = false; int pressEntry = -1, pressTile = -1; bool mouseWasDown = false;
-    std::vector<Flight> flights; double flightStart = 0; RECT flightWindow{};
+    std::vector<Flight> flights; double flightStart = 0, flightLast = 0; RECT flightWindow{};
     docky::vblank::Ticker flightTicker;  // expand / collapse flight: one step per display frame (was an 8 ms WM_TIMER = 64 Hz)
     docky::vblank::Ticker panelTicker;   // glass panel backdrop: polled every display frame while open
     std::map<const void*, ComPtr<ID2D1Bitmap>> bitmaps;  // thumbnail bitmaps of the column's render target
@@ -304,10 +318,29 @@ bool Opaque(const Image* img) {
     size_t clear = 0; for (auto p : img->px) if ((p >> 24) < 250) ++clear;
     return clear * 50 < img->px.size();
 }
-void LabelShadowed(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* f, D2D1_RECT_F box) {
-    // Desktop labels: white with a soft dark shadow so they read on any wallpaper (like Explorer's desktop icons).
-    Text(rt, text, f, D2D1::RectF(box.left, box.top + 1, box.right, box.bottom + 1), D2D1::ColorF(0, 0, 0, 0.55f));
-    Text(rt, text, f, box, D2D1::ColorF(1, 1, 1, 0.98f));
+void LabelShadowed(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, const std::wstring& text,
+                   IDWriteTextFormat* format, D2D1_RECT_F box, float alpha, bool selected = false) {
+    if (!format || box.right <= box.left || box.bottom <= box.top) return;
+    ComPtr<IDWriteTextLayout> layout;
+    if (FAILED(DWrite()->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), format,
+                                          box.right - box.left, box.bottom - box.top, &layout))) return;
+    if (selected) {
+        DWRITE_TEXT_METRICS metrics{};
+        if (SUCCEEDED(layout->GetMetrics(&metrics))) {
+            const auto bg = D2D1::RectF(std::max(box.left - 2, box.left + metrics.left - 4), box.top + metrics.top - 1,
+                                        std::min(box.right + 2, box.left + metrics.left + metrics.width + 4),
+                                        std::min(box.bottom + 1, box.top + metrics.top + metrics.height + 2));
+            const COLORREF color = GetSysColor(COLOR_HIGHLIGHT);
+            brush->SetColor(D2D1::ColorF(GetRValue(color) / 255.f, GetGValue(color) / 255.f, GetBValue(color) / 255.f, alpha));
+            rt->FillRoundedRectangle(D2D1::RoundedRect(bg, 4, 4), brush);
+        }
+    } else {
+        brush->SetColor(D2D1::ColorF(0, 0, 0, 0.55f * alpha));
+        rt->DrawTextLayout(D2D1::Point2F(box.left, box.top + 1), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+    const COLORREF ink = selected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(255, 255, 255);
+    brush->SetColor(D2D1::ColorF(GetRValue(ink) / 255.f, GetGValue(ink) / 255.f, GetBValue(ink) / 255.f, alpha));
+    rt->DrawTextLayout(D2D1::Point2F(box.left, box.top), layout.Get(), brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 IDWriteTextFormat* TwoLine(float size) {
     static std::map<int, ComPtr<IDWriteTextFormat>> cache;
@@ -339,71 +372,110 @@ void LayoutColumn() {
     MONITORINFO mi{sizeof(mi)};
     GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
     s.dpi = GetDpiForSystem();
-    if (s.column) { const UINT d = GetDpiForWindow(s.column); if (d) s.dpi = d; }
-    const RECT work = mi.rcWork; s.work = work;
-    const float workH = (work.bottom - work.top) / K() - 2 * kMargin, workW = (work.right - work.left) / K() - 2 * kMargin;
-    const int perColumn = (std::max)(1, static_cast<int>(workH / kCellH)), maxColumns = (std::max)(1, static_cast<int>(workW / kCellW));
-    s.gridCols = maxColumns; s.gridRows = perColumn;
+    if (s.column) { const UINT dpi = GetDpiForWindow(s.column); if (dpi) s.dpi = dpi; }
+    s.work = mi.rcWork;
+    const float width = (s.work.right - s.work.left) / K(), height = (s.work.bottom - s.work.top) / K();
+    const float margin = std::max(0.f, kMargin - 8.f);
+    const int rows = std::max(1, static_cast<int>((height - 2 * kMargin) / kCellH));
+    const int columns = std::max(1, static_cast<int>((width - 2 * kMargin) / kCellW));
+    const int capacity = rows * columns;
+    auto rectAt = [&](float right, float top) {
+        const float x = width - kCellW - std::clamp(right, 0.f, std::max(0.f, width - kCellW));
+        const float y = std::clamp(top, 0.f, std::max(0.f, height - kCellH));
+        return D2D1::RectF(x, y, x + kCellW, y + kCellH);
+    };
+    auto gridRect = [&](int cell) { return rectAt(margin + cell / rows * kCellW, margin + cell % rows * kCellH); };
     std::vector<Entry> flat;
-    for (size_t i = 0; i < s.stacks.size(); ++i) {
-        flat.push_back({static_cast<int>(i), -1, {}, {}});
-        if (s.style == StackStyle::InPlace && s.expanded.count(s.stacks[i].name))
-            for (size_t j = 0; j < s.stacks[i].files.size(); ++j) flat.push_back({static_cast<int>(i), static_cast<int>(j), {}, {}});
+    for (int i = 0; i < static_cast<int>(s.stacks.size()); ++i) {
+        flat.push_back({i, -1, {}});
+        if (s.style == StackStyle::InPlace && s.expanded.contains(s.stacks[i].name))
+            for (int j = 0; j < static_cast<int>(s.stacks[i].files.size()); ++j) flat.push_back({i, j, {}});
     }
-    const int capacity = perColumn * maxColumns;
     if (!s.freePlace) {
-        // Column order: top to bottom from the right edge, further columns to the left (macOS desktop order).
-        if (flat.size() > static_cast<size_t>(capacity)) flat.resize(static_cast<size_t>(capacity));
-        for (size_t i = 0; i < flat.size(); ++i) flat[i].cell = POINT{static_cast<LONG>(i) / perColumn, static_cast<LONG>(i) % perColumn};
+        if (flat.size() > static_cast<size_t>(capacity)) flat.resize(capacity);
+        for (int i = 0; i < static_cast<int>(flat.size()); ++i) flat[i].rect = gridRect(i);
     } else {
-        std::vector<char> used(static_cast<size_t>(capacity), 0);
-        auto index = [&](POINT c) { return static_cast<size_t>(c.x) * perColumn + c.y; };
-        auto inGrid = [&](POINT c) { return c.x >= 0 && c.y >= 0 && c.x < maxColumns && c.y < perColumn; };
-        auto cellAt = [&](size_t i) { return POINT{static_cast<LONG>(i / perColumn), static_cast<LONG>(i % perColumn)}; };
-        std::vector<char> placed(flat.size(), 0);
-        // 1. Stacks with a saved cell; 2. the others in column order; 3. expanded files after their stack.
-        for (size_t i = 0; i < flat.size(); ++i) {
-            if (flat[i].file >= 0) continue;
-            auto it = s.cells.find(s.stacks[static_cast<size_t>(flat[i].stack)].name);
-            if (it != s.cells.end() && inGrid(it->second) && !used[index(it->second)]) { flat[i].cell = it->second; used[index(it->second)] = 1; placed[i] = 1; }
+        // Reserve exact custom rectangles before searching for grid slots for the remaining tiles.
+        std::vector<D2D1_RECT_F> grid;
+        std::vector<bool> used(capacity);
+        grid.reserve(capacity);
+        for (int i = 0; i < capacity; ++i) grid.push_back(gridRect(i));
+        auto reserve = [&](const D2D1_RECT_F& r) {
+            for (int i = 0; i < capacity; ++i) {
+                const auto& c = grid[i];
+                used[i] = used[i] || (r.left < c.right && r.right > c.left && r.top < c.bottom && r.bottom > c.top);
+            }
+        };
+        auto slot = [&](int first) {
+            for (int n = 0; n < capacity; ++n) {
+                const int i = (first + n) % capacity;
+                if (!used[i]) return i;
+            }
+            return -1;
+        };
+        auto saved = [&](const std::wstring& name, D2D1_RECT_F& out) {
+            if (const auto pos = s.positions.find(name); pos != s.positions.end()) {
+                out = rectAt(static_cast<float>(pos->second.x), static_cast<float>(pos->second.y));
+                return true;
+            }
+            if (const auto cell = s.legacyCells.find(name); cell != s.legacyCells.end()) {
+                if (cell->second.x < 0 || cell->second.x >= columns || cell->second.y < 0 || cell->second.y >= rows)
+                    return false;
+                out = rectAt(margin + cell->second.x * kCellW, margin + cell->second.y * kCellH);
+                return true;
+            }
+            return false;
+        };
+        for (auto& e : flat) if (e.file < 0 && saved(s.stacks[e.stack].name, e.rect)) reserve(e.rect);
+        for (auto& e : flat) {
+            if (e.file >= 0 || e.rect.right > e.rect.left) continue;
+            if (const int cell = slot(0); cell >= 0) {
+                e.rect = grid[cell];
+                used[cell] = true;
+            }
         }
-        for (size_t i = 0; i < flat.size(); ++i) {
-            if (flat[i].file >= 0 || placed[i]) continue;
-            for (size_t k = 0; k < used.size(); ++k) if (!used[k]) { flat[i].cell = cellAt(k); used[k] = 1; placed[i] = 1; break; }
+        bool hasStack = false;
+        int next = 0;
+        for (auto& e : flat) {
+            if (e.file < 0) {
+                hasStack = e.rect.right > e.rect.left;
+                if (hasStack) {
+                    const int col = std::clamp(static_cast<int>(std::round((width - e.rect.right - margin) / kCellW)), 0, columns - 1);
+                    const int row = std::clamp(static_cast<int>(std::round((e.rect.top - margin) / kCellH)), 0, rows - 1);
+                    next = (col * rows + row + 1) % capacity;
+                }
+            } else if (hasStack) {
+                if (const int cell = slot(next); cell >= 0) {
+                    e.rect = grid[cell];
+                    used[cell] = true;
+                    next = (cell + 1) % capacity;
+                }
+            }
         }
-        POINT stackCell{};
-        for (size_t i = 0; i < flat.size(); ++i) {
-            if (flat[i].file < 0) { stackCell = flat[i].cell; continue; }
-            if (!placed[i - flat[i].file - 1]) continue;  // its stack did not fit
-            const size_t from = index(stackCell);
-            for (size_t n = 1; n < used.size(); ++n) { const size_t k = (from + n) % used.size(); if (!used[k]) { flat[i].cell = cellAt(k); used[k] = 1; placed[i] = 1; break; } }
-        }
-        std::vector<Entry> kept;
-        for (size_t i = 0; i < flat.size(); ++i) if (placed[i]) kept.push_back(flat[i]);
-        flat = std::move(kept);
+        std::erase_if(flat, [](const Entry& e) { return e.rect.right <= e.rect.left; });
     }
-    LONG minCol = 0, maxCol = 0, minRow = 0, maxRow = 0;
-    for (size_t i = 0; i < flat.size(); ++i) {
-        const POINT c = flat[i].cell;
-        if (i == 0) { minCol = maxCol = c.x; minRow = maxRow = c.y; }
-        minCol = (std::min)(minCol, c.x); maxCol = (std::max)(maxCol, c.x); minRow = (std::min)(minRow, c.y); maxRow = (std::max)(maxRow, c.y);
+    D2D1_RECT_F bounds = flat.empty() ? gridRect(0) : flat.front().rect;
+    for (const auto& e : flat) {
+        bounds.left = std::min(bounds.left, e.rect.left); bounds.right = std::max(bounds.right, e.rect.right);
+        bounds.top = std::min(bounds.top, e.rect.top); bounds.bottom = std::max(bounds.bottom, e.rect.bottom);
     }
-    if (!s.freePlace) { minCol = 0; minRow = 0; }
+    const LONG left = static_cast<LONG>(std::floor(bounds.left * K()));
+    const LONG top = static_cast<LONG>(std::floor(bounds.top * K()));
     for (auto& e : flat) {
-        const float x = (maxCol - e.cell.x) * kCellW, y = (e.cell.y - minRow) * kCellH;
-        e.rect = D2D1::RectF(x, y, x + kCellW, y + kCellH);
+        e.rect.left -= left / K(); e.rect.right -= left / K();
+        e.rect.top -= top / K(); e.rect.bottom -= top / K();
     }
-    const float w = (maxCol - minCol + 1) * kCellW, h = (maxRow - minRow + 1) * kCellH;
     s.entries = std::move(flat);
-    const int right = work.right - Px(kMargin - 8) - Px(minCol * kCellW), top = work.top + Px(kMargin - 8) + Px(minRow * kCellH);
-    s.columnRect = RECT{right - Px(w), top, right, top + (std::max)(1, Px(h))};
+    s.columnRect = {s.work.left + left, s.work.top + top,
+                    s.work.left + static_cast<LONG>(std::ceil(bounds.right * K())),
+                    s.work.top + static_cast<LONG>(std::ceil(bounds.bottom * K()))};
 }
-// The desktop grid cell under a screen point (free placement), clamped into the grid.
-POINT CellAtScreen(POINT pt) {
+POINT StackPosition(POINT topLeft) {
     const auto& s = S();
-    const float right = static_cast<float>(s.work.right - Px(kMargin - 8)), top = static_cast<float>(s.work.top + Px(kMargin - 8));
-    const LONG col = static_cast<LONG>(std::floor((right - pt.x) / (kCellW * K()))), row = static_cast<LONG>(std::floor((pt.y - top) / (kCellH * K())));
-    return POINT{std::clamp(col, 0L, static_cast<LONG>(s.gridCols - 1)), std::clamp(row, 0L, static_cast<LONG>(s.gridRows - 1))};
+    const LONG width = std::max(0L, static_cast<LONG>(std::floor((s.work.right - s.work.left) / K() - kCellW)));
+    const LONG height = std::max(0L, static_cast<LONG>(std::floor((s.work.bottom - s.work.top) / K() - kCellH)));
+    return {std::clamp(std::lround((s.work.right - topLeft.x) / K() - kCellW), 0L, width),
+            std::clamp(std::lround((topLeft.y - s.work.top) / K()), 0L, height)};
 }
 RECT EntryScreenRect(const Entry& e) {
     const auto& s = S();
@@ -411,29 +483,41 @@ RECT EntryScreenRect(const Entry& e) {
 }
 
 double Now() { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER c{}; QueryPerformanceCounter(&c); return static_cast<double>(c.QuadPart) / f.QuadPart; }
-D2D1_RECT_F Lerp(const D2D1_RECT_F& a, const D2D1_RECT_F& b, float t) {
-    return D2D1::RectF(a.left + (b.left - a.left) * t, a.top + (b.top - a.top) * t, a.right + (b.right - a.right) * t, a.bottom + (b.bottom - a.bottom) * t);
-}
 D2D1_RECT_F Absolute(const D2D1_RECT_F& r) { const auto& s = S(); return D2D1::RectF(r.left + s.columnRect.left / K(), r.top + s.columnRect.top / K(), r.right + s.columnRect.left / K(), r.bottom + s.columnRect.top / K()); }
 
 // One tile. `c` is the cell in window DIP; `alpha` fades flying files.
-void PaintTile(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, const Stack* st, const FileEntry* file, D2D1_RECT_F c, float alpha, bool interactive) {
+void PaintTile(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, const Stack* st, const FileEntry* file,
+               D2D1_RECT_F c, float alpha, bool interactive, float openMix = -1.f, float captionMix = 1.f) {
     auto& s = S();
     const int pilePx = Px(kPile * 1.25f), iconPx = Px(kIcon * 1.25f);
     if (interactive) { brush->SetColor(D2D1::ColorF(0, 0, 0, 1.f / 255.f)); rt->FillRectangle(c, brush); }  // whole cell clickable
     if (!file) {
-        const bool isOpen = s.style == StackStyle::InPlace ? s.expanded.count(st->name) > 0 : (s.open >= 0 && &s.stacks[static_cast<size_t>(s.open)] == st);
-        if (isOpen) { brush->SetColor(D2D1::ColorF(1, 1, 1, 0.20f * alpha)); rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(c.left + 8, c.top + 2, c.right - 8, c.top + kPile + 12), 10, 10), brush); }
+        const bool isOpen = s.style == StackStyle::InPlace ? s.expanded.contains(st->name) : (s.open >= 0 && &s.stacks[static_cast<size_t>(s.open)] == st);
+        if (openMix < 0) openMix = isOpen ? 1.f : 0.f;
         const D2D1_RECT_F pile = D2D1::RectF((c.left + c.right - kPile) / 2, c.top + 6, (c.left + c.right + kPile) / 2, c.top + 6 + kPile);
-        const float angles[3] = {-7.f, 6.f, 0.f};
+        constexpr float angles[] = {0.f, -8.f, 9.f};
+        constexpr float offsets[] = {0.f, -5.f, 6.f};
         const int layers = (std::min)(3, static_cast<int>(st->files.size()));
         for (int k = layers - 1; k >= 0; --k) {  // back to front; the newest file on top
             const Image* img = s.thumbs.Get(st->files[static_cast<size_t>(k)].path, pilePx);
-            const float shrink = 4.f * k;
-            const D2D1_RECT_F box = D2D1::RectF(pile.left + shrink, pile.top + shrink, pile.right - shrink, pile.bottom - shrink);
-            PaintImage(rt, img, box, (isOpen ? 0.55f : 1.f) * alpha, layers > 1 ? angles[(3 - layers + k) % 3] : 0.f, Opaque(img) && !st->files[static_cast<size_t>(k)].dir, true);
+            const float shrink = 2.f * k, offset = offsets[k] * (1.f - openMix);
+            const D2D1_RECT_F box = D2D1::RectF(pile.left + shrink + offset, pile.top + shrink + 2.f * k,
+                                               pile.right - shrink + offset, pile.bottom - shrink + 2.f * k);
+            PaintImage(rt, img, box, (1.f - openMix) * alpha,
+                       angles[k] * (1.f - openMix),
+                       Opaque(img) && !st->files[static_cast<size_t>(k)].dir, true);
         }
-        LabelShadowed(rt, isOpen && s.style == StackStyle::InPlace ? st->name + L" \u2304" : st->name, TwoLine(12.f), D2D1::RectF(c.left + 2, c.top + kPile + 12, c.right - 2, c.bottom - 2));
+        if (openMix > 0.001f) {
+            const float cx = (pile.left + pile.right) / 2, cy = (pile.top + pile.bottom) / 2;
+            const auto plate = D2D1::RoundedRect(D2D1::RectF(cx - 24, cy - 24, cx + 24, cy + 24), 12, 12);
+            brush->SetColor(D2D1::ColorF(0.08f, 0.09f, 0.11f, 0.72f * alpha * openMix));
+            rt->FillRoundedRectangle(plate, brush);
+            brush->SetColor(D2D1::ColorF(1, 1, 1, alpha * openMix));
+            rt->DrawLine(D2D1::Point2F(cx - 8, cy - 3), D2D1::Point2F(cx, cy + 5), brush, 2.f);
+            rt->DrawLine(D2D1::Point2F(cx, cy + 5), D2D1::Point2F(cx + 8, cy - 3), brush, 2.f);
+        }
+        LabelShadowed(rt, brush, docky::ui::Text(st->name.c_str()), TwoLine(12.f),
+                      D2D1::RectF(c.left + 2, c.top + kPile + 12, c.right - 2, c.bottom - 2), alpha);
         return;
     }
     // A file of an expanded stack: icon or thumbnail plus its name, like a desktop icon. Selection uses the macOS
@@ -444,14 +528,10 @@ void PaintTile(ID2D1RenderTarget* rt, ID2D1SolidColorBrush* brush, const Stack* 
     if (sel) { brush->SetColor(D2D1::ColorF(0, 0, 0, 0.28f)); rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(icon.left - 4, icon.top - 4, icon.right + 4, icon.bottom + 4), 8, 8), brush); }
     const Image* img = s.thumbs.Get(file->path, iconPx);
     PaintImage(rt, img, icon, alpha, 0.f, Opaque(img) && !file->dir, true);
-    if (alpha < 0.6f) return;  // names appear once a flying file has nearly landed
+    const float labelAlpha = std::clamp((alpha - 0.35f) / 0.65f, 0.f, 1.f) * captionMix;
+    if (labelAlpha <= 0.f) return;
     const D2D1_RECT_F label = D2D1::RectF(c.left + 3, c.top + kIcon + 14, c.right - 3, c.bottom - 2);
-    if (sel) {
-        const float tw = (std::min)(TextWidth(DisplayName(*file), Font(12.f)) + 10, c.right - c.left - 6);
-        brush->SetColor(D2D1::ColorF(0.04f, 0.42f, 0.98f, 1.f));
-        rt->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF((c.left + c.right - tw) / 2, label.top - 1, (c.left + c.right + tw) / 2, label.top + 17), 5, 5), brush);
-    }
-    LabelShadowed(rt, DisplayName(*file), TwoLine(12.f), label);
+    LabelShadowed(rt, brush, DisplayName(*file), TwoLine(12.f), label, labelAlpha, sel);
 }
 
 void PaintColumn() {
@@ -464,33 +544,42 @@ void PaintColumn() {
     if (!rt) return;
     ComPtr<ID2D1SolidColorBrush> brush; rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 1.f / 255.f), &brush);
     if (!flying) {
+        auto paint = [&](const Entry& e) {
+            const auto& st = s.stacks[e.stack];
+            PaintTile(rt, brush.Get(), &st, e.file < 0 ? nullptr : &st.files[e.file], e.rect, 1.f, true);
+        };
+        const Entry* dragging = nullptr;
         for (const auto& e : s.entries) {
-            const auto& st = s.stacks[static_cast<size_t>(e.stack)];
-            PaintTile(rt, brush.Get(), &st, e.file < 0 ? nullptr : &st.files[static_cast<size_t>(e.file)], e.rect, 1.f, true);
+            if (s.draggingStack && e.file < 0 && s.stacks[e.stack].name == s.dragName) dragging = &e;
+            else paint(e);
         }
+        if (dragging) paint(*dragging);
     } else {
-        const float t = static_cast<float>(std::clamp((Now() - s.flightStart) / kFlightSeconds, 0.0, 1.0));
-        const float e = 1.f - std::pow(1.f - t, 3.f);  // ease-out
         const float ox = win.left / K(), oy = win.top / K();
-        auto local = [&](D2D1_RECT_F r) { return D2D1::RectF(r.left - ox, r.top - oy, r.right - ox, r.bottom - oy); };
-        // Stack tiles last, so files fly out from under and back into their pile.
-        for (int pass = 0; pass < 2; ++pass)
+        // Stack tiles are drawn above the flying files, so they appear to emerge from the pile.
+        for (int pass = 0; pass < 2; ++pass) {
             for (const auto& f : s.flights) {
-                const Entry* en = f.entry >= 0 ? &s.entries[static_cast<size_t>(f.entry)] : nullptr;
-                const bool stackTile = en && en->file < 0;
-                if ((pass == 0) == stackTile) continue;
-                const float alpha = f.fromAlpha + (f.toAlpha - f.fromAlpha) * e;
-                const D2D1_RECT_F r = local(Lerp(f.from, f.to, e));
-                if (f.isGhost) { PaintTile(rt, brush.Get(), nullptr, &f.ghost, r, alpha, false); continue; }
-                const auto& st = s.stacks[static_cast<size_t>(en->stack)];
-                PaintTile(rt, brush.Get(), &st, en->file < 0 ? nullptr : &st.files[static_cast<size_t>(en->file)], r, alpha, false);
+                const Entry* entry = f.entry >= 0 ? &s.entries[f.entry] : nullptr;
+                const bool stackTile = entry && entry->file < 0;
+                if ((pass == 0) == stackTile || f.Alpha() < 0.004f) continue;
+                const auto r = f.Rect();
+                const auto local = D2D1::RectF(r.left - ox, r.top - oy, r.right - ox, r.bottom - oy);
+                const auto* st = entry ? &s.stacks[entry->stack] : nullptr;
+                const auto* file = entry ? (stackTile ? nullptr : &st->files[entry->file]) : &f.ghost;
+                const double distance = std::hypot(f.motion[0].Target() - r.left, f.motion[1].Target() - r.top);
+                // Long flights fade in the caption near the destination, after the icons have separated.
+                const float caption = entry ? static_cast<float>(std::clamp((36. - distance) / 30., 0., 1.))
+                                            : f.Alpha() * f.Alpha();
+                PaintTile(rt, brush.Get(), st, file, local, f.Alpha(), entry != nullptr,
+                          std::clamp(f.motion[5].F(), 0.f, 1.f), caption);
             }
+        }
     }
     s.columnCanvas.End(s.column, POINT{win.left, win.top});
     if (!DevPngDir().empty() && !flying) s.columnCanvas.SavePng(DevPngDir() + L"\\stacks-column.png");
     if (!DevPngDir().empty() && flying) {  // development: one frame halfway through the flight
-        static bool saved = false; const double t = (Now() - s.flightStart) / kFlightSeconds;
-        if (!saved && t >= 0.35 && t <= 0.7) { saved = true; s.columnCanvas.SavePng(DevPngDir() + L"\\stacks-flight.png"); }
+        static bool saved = false; const double t = Now() - s.flightStart;
+        if (!saved && t >= 0.10 && t <= 0.22) { saved = true; s.columnCanvas.SavePng(DevPngDir() + L"\\stacks-flight.png"); }
     }
 }
 
@@ -569,8 +658,10 @@ void ClosePanel() {
     if (s.panel.Hwnd()) { KillTimer(s.panel.Hwnd(), 1); s.panelTicker.Stop(); s.panel.Hide(); }
     PaintColumn();
 }
+void CatcherToBottom();
 void Place(HWND h, const RECT& r, bool show) {
     SetWindowPos(h, S().raised ? HWND_TOP : HWND_BOTTOM, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : 0));
+    if (h == S().column) CatcherToBottom();
 }
 void OpenPanel(int stack) {
     auto& s = S();
@@ -583,56 +674,134 @@ void OpenPanel(int stack) {
     if (s.panel.Hwnd()) { SetTimer(s.panel.Hwnd(), 1, 50, nullptr); s.panelTicker.Start(s.panel.Hwnd(), docky::vblank::kMsgVBlank); }
 }
 bool ReducedMotion() { BOOL on = TRUE; return SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0) && !on; }
+std::array<double, 6> FlightValues(D2D1_RECT_F r, float alpha, float open) {
+    return {r.left, r.top, r.right - r.left, r.bottom - r.top, alpha, open};
+}
+
+std::wstring EntryKey(const Entry& entry) {
+    const auto& stack = S().stacks[entry.stack];
+    return entry.file < 0 ? L"stack|" + stack.name : L"file|" + stack.files[entry.file].path;
+}
+
+D2D1_RECT_F InsidePile(D2D1_RECT_F tile) {
+    const float cx = (tile.left + tile.right) * .5f;
+    return D2D1::RectF(cx - kCellW * .28f, tile.top, cx + kCellW * .28f, tile.top + kCellH * .72f);
+}
+
 void ToggleInPlace(int stack) {
     auto& s = S();
-    const std::wstring name = s.stacks[static_cast<size_t>(stack)].name;
-    // Old cells by identity (stack name, file path), absolute DIP.
-    std::map<std::wstring, D2D1_RECT_F> before; std::vector<std::pair<FileEntry, D2D1_RECT_F>> oldFiles;
+    const auto& group = s.stacks[stack];
+    const std::wstring stackKey = L"stack|" + group.name;
     const RECT oldWindow = s.flights.empty() ? s.columnRect : s.flightWindow;
-    for (const auto& e : s.entries) {
-        const auto& st = s.stacks[static_cast<size_t>(e.stack)];
-        const std::wstring key = e.file < 0 ? L"stack|" + st.name : L"file|" + st.files[static_cast<size_t>(e.file)].path;
-        before[key] = Absolute(e.rect);
-        if (e.file >= 0 && st.name == name) oldFiles.push_back({st.files[static_cast<size_t>(e.file)], Absolute(e.rect)});
+    std::map<std::wstring, Flight> before;
+    if (s.flights.empty()) {
+        for (const auto& entry : s.entries) {
+            const auto key = EntryKey(entry);
+            auto& f = before[key];
+            f.key = key;
+            const bool open = entry.file < 0 && s.expanded.contains(s.stacks[entry.stack].name);
+            f.motion.SnapTo(FlightValues(Absolute(entry.rect), 1.f, open ? 1.f : 0.f));
+        }
+    } else {
+        for (auto& f : s.flights) {
+            const auto key = f.key;
+            before.emplace(key, std::move(f));
+        }
     }
-    const bool opening = !s.expanded.erase(name);
-    if (opening) s.expanded.insert(name);
-    s.sel.clear(); s.anchor.clear();
-    LayoutColumn();
     s.flights.clear();
-    if (ReducedMotion()) { Place(s.column, s.columnRect, true); PaintColumn(); return; }
-    D2D1_RECT_F stackTo{}, stackFrom{};
-    for (size_t i = 0; i < s.entries.size(); ++i) {
-        const auto& e = s.entries[i];
-        const auto& st = s.stacks[static_cast<size_t>(e.stack)];
-        const std::wstring key = e.file < 0 ? L"stack|" + st.name : L"file|" + st.files[static_cast<size_t>(e.file)].path;
-        Flight f; f.entry = static_cast<int>(i); f.to = Absolute(e.rect);
-        auto old = before.find(key);
-        if (old != before.end()) f.from = old->second;
-        else { f.from = before.count(L"stack|" + name) ? before[L"stack|" + name] : f.to; f.fromAlpha = 0; }  // flies out of the pile
-        if (e.file < 0 && st.name == name) { stackTo = f.to; stackFrom = f.from; }
-        s.flights.push_back(f);
+    auto oldPile = before.find(stackKey);
+    const bool opening = !s.expanded.erase(group.name);
+    if (opening) s.expanded.insert(group.name);
+    else {
+        for (const auto& file : group.files) s.sel.erase(file.path);
+        if (!s.sel.contains(s.anchor)) s.anchor.clear();
     }
-    if (!opening) for (const auto& [file, rect] : oldFiles) {  // closing: the files fly back into the pile and fade
-        Flight f; f.isGhost = true; f.ghost = file; f.from = rect; f.to = stackTo; f.toAlpha = 0; s.flights.push_back(f);
+    LayoutColumn();
+    if (ReducedMotion() || oldPile == before.end()) {
+        s.flightTicker.Stop();
+        Place(s.column, s.columnRect, true);
+        PaintColumn();
+        return;
     }
-    (void)stackFrom;
-    RECT u{}; UnionRect(&u, &oldWindow, &s.columnRect);
-    s.flightWindow = u; s.flightStart = Now();
+    const auto pileFrom = oldPile->second.Rect();
+    auto pileTo = pileFrom;
+    const auto spec = docky::motion::SpringSpec::FromResponse(.26, 1.);
+    auto retarget = [&](Flight& f, D2D1_RECT_F to, float alpha, float open) {
+        f.motion.SetSpec(spec);
+        f.motion.SetRest(.12, 3.);
+        f.motion[4].SetRest(.004, .03);
+        f.motion[5].SetRest(.004, .03);
+        f.motion.SetTarget(FlightValues(to, alpha, open));
+    };
+    for (int i = 0; i < static_cast<int>(s.entries.size()); ++i) {
+        const auto& entry = s.entries[i];
+        const auto key = EntryKey(entry);
+        const auto to = Absolute(entry.rect);
+        Flight f;
+        if (auto old = before.find(key); old != before.end()) {
+            f = std::move(old->second);
+            before.erase(old);
+            f.delay = 0;
+        } else {
+            f.key = key;
+            f.motion.SnapTo(FlightValues(InsidePile(pileFrom), 0.f, 0.f));
+            if (entry.stack == stack && entry.file >= 0) f.delay = std::min(entry.file, 6) * .008;
+        }
+        f.entry = i;
+        const bool open = entry.file < 0 && s.expanded.contains(s.stacks[entry.stack].name);
+        if (key == stackKey) pileTo = to;
+        retarget(f, to, 1.f, open ? 1.f : 0.f);
+        s.flights.push_back(std::move(f));
+    }
+    for (const auto& file : group.files) {
+        if (auto old = before.find(L"file|" + file.path); old != before.end()) {
+            auto& f = old->second;
+            f.ghost = file;
+            f.entry = -1;
+            f.delay = 0;
+            retarget(f, InsidePile(pileTo), 0.f, 0.f);
+            s.flights.push_back(std::move(f));
+        }
+    }
+    UnionRect(&s.flightWindow, &oldWindow, &s.columnRect);
+    s.flightStart = s.flightLast = Now();
     Place(s.column, s.flightWindow, true);
     PaintColumn();
     s.flightTicker.Start(s.column, docky::vblank::kMsgVBlank);
 }
+
 void StepFlights() {
     auto& s = S();
     if (s.flights.empty()) { s.flightTicker.Stop(); return; }
-    if (Now() - s.flightStart >= kFlightSeconds) { s.flights.clear(); s.flightTicker.Stop(); Place(s.column, s.columnRect, true); }
+    const double now = Now(), dt = now - s.flightLast;
+    s.flightLast = now;
+    bool moving = false;
+    for (auto& f : s.flights) {
+        const double step = std::max(0., dt - f.delay);
+        f.delay = std::max(0., f.delay - dt);
+        moving |= f.motion.Step(step) || f.delay > 0;
+    }
+    if (!moving) {
+        s.flights.clear();
+        s.flightTicker.Stop();
+        Place(s.column, s.columnRect, true);
+    }
     PaintColumn();
 }
+
 int EntryAt(POINT client) {
     const auto& s = S();
-    const D2D1_POINT_2F p{client.x / K(), client.y / K()};
-    for (size_t i = 0; i < s.entries.size(); ++i) { const auto& c = s.entries[i].rect; if (p.x >= c.left && p.x < c.right && p.y >= c.top && p.y < c.bottom) return static_cast<int>(i); }
+    const auto hit = [&](D2D1_RECT_F r, float x, float y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; };
+    if (!s.flights.empty()) {
+        const float x = (client.x + s.flightWindow.left) / K(), y = (client.y + s.flightWindow.top) / K();
+        for (int pass = 0; pass < 2; ++pass)
+            for (auto it = s.flights.rbegin(); it != s.flights.rend(); ++it)
+                if (it->entry >= 0 && (s.entries[it->entry].file < 0) == (pass == 0) &&
+                    it->Alpha() > .35f && hit(it->Rect(), x, y)) return it->entry;
+        return -1;
+    }
+    for (int i = static_cast<int>(s.entries.size()) - 1; i >= 0; --i)
+        if (hit(s.entries[i].rect, client.x / K(), client.y / K())) return i;
     return -1;
 }
 int TileAt(POINT client) {
@@ -652,6 +821,28 @@ const FileEntry* FileAt(int tile) {
 }
 bool DragStarted(POINT pt) { const auto& s = S(); return std::abs(pt.x - s.press.x) > GetSystemMetrics(SM_CXDRAG) || std::abs(pt.y - s.press.y) > GetSystemMetrics(SM_CYDRAG); }
 void KeepBottom(LPARAM l) { if (!S().raised) { auto* wp = reinterpret_cast<WINDOWPOS*>(l); if (!(wp->flags & SWP_NOZORDER)) wp->hwndInsertAfter = HWND_BOTTOM; } }
+
+void MoveDraggedStack(POINT cursor) {
+    auto& s = S();
+    const POINT position = StackPosition({cursor.x - s.dragOffset.x, cursor.y - s.dragOffset.y});
+    auto& old = s.positions[s.dragName];
+    if (old.x == position.x && old.y == position.y) return;
+    old = position;
+    LayoutColumn();
+    Place(s.column, s.columnRect, true);
+    PaintColumn();
+    if (s.open >= 0) { LayoutPanel(); s.panel.InvalidateBackdrop(); PaintPanel(); }
+}
+
+void FinishStackDrag() {
+    auto& s = S();
+    if (!s.draggingStack) return;
+    s.draggingStack = false;
+    s.dragName.clear();
+    if (GetCapture() == s.column) ReleaseCapture();
+    if (s.positionsChanged) s.positionsChanged(s.positions);
+    PaintColumn();
+}
 
 // QuickLook (third-party previewer) takes a path on its command line and toggles its preview for it. Found from its
 // running process, else its usual install folders. Without it, Space does nothing.
@@ -798,7 +989,6 @@ bool OnKey(HWND h, WPARAM key) {
 LRESULT CALLBACK ColumnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto& s = S();
     if (m == docky::vblank::kMsgVBlank) { s.flightTicker.Ack(); StepFlights(); return 0; }
-    if (!s.flights.empty() && m >= WM_MOUSEFIRST && m <= WM_MOUSELAST) return 0;  // tiles are moving
     switch (m) {
     case WM_MOUSEACTIVATE: {  // clicking a file takes the keyboard focus (Space for Quick Look); stacks do not
         POINT pt{}; GetCursorPos(&pt); ScreenToClient(h, &pt);
@@ -808,25 +998,26 @@ LRESULT CALLBACK ColumnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_WINDOWPOSCHANGING: KeepBottom(l); break;
     case WM_LBUTTONDOWN: s.press = POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; s.pressEntry = EntryAt(s.press); s.pressed = s.pressEntry >= 0; if (s.pressed) SetCapture(h); return 0;
     case WM_MOUSEMOVE:
-        if (s.draggingStack) {  // free placement: the stack follows the pointer cell by cell
+        if (s.draggingStack) {
             POINT pt{}; GetCursorPos(&pt);
-            const POINT cell = CellAtScreen(pt);
-            bool taken = false;
-            for (const auto& e : s.entries) if (e.file < 0 && s.stacks[static_cast<size_t>(e.stack)].name != s.dragName && e.cell.x == cell.x && e.cell.y == cell.y) taken = true;
-            auto it = s.cells.find(s.dragName);
-            if (!taken && (it == s.cells.end() || it->second.x != cell.x || it->second.y != cell.y)) {
-                s.cells[s.dragName] = cell; LayoutColumn(); Place(s.column, s.columnRect, true); PaintColumn();
-                if (s.open >= 0) { LayoutPanel(); s.panel.InvalidateBackdrop(); PaintPanel(); }
-            }
+            MoveDraggedStack(pt);
             return 0;
         }
         if (s.pressed && (w & MK_LBUTTON) && DragStarted(POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)})) {
             s.pressed = false;
             const int pe = s.pressEntry;
-            if (s.freePlace && pe >= 0 && pe < static_cast<int>(s.entries.size()) && s.entries[static_cast<size_t>(pe)].file < 0) {
-                s.draggingStack = true; s.dragName = s.stacks[static_cast<size_t>(s.entries[static_cast<size_t>(pe)].stack)].name;
-                for (const auto& e : s.entries) if (e.file < 0) s.cells[s.stacks[static_cast<size_t>(e.stack)].name] = e.cell;  // pin every stack where it is
-                return 0;  // keeps the capture
+            if (s.freePlace && s.flights.empty() && pe >= 0 && pe < static_cast<int>(s.entries.size()) && s.entries[pe].file < 0) {
+                s.draggingStack = true;
+                const auto& entry = s.entries[pe];
+                s.dragName = s.stacks[entry.stack].name;
+                s.dragOffset = {s.press.x - Px(entry.rect.left), s.press.y - Px(entry.rect.top)};
+                for (const auto& e : s.entries) if (e.file < 0) {
+                    const RECT box = EntryScreenRect(e);
+                    s.positions.try_emplace(s.stacks[e.stack].name, StackPosition({box.left, box.top}));
+                }
+                POINT pt{}; GetCursorPos(&pt);
+                MoveDraggedStack(pt);
+                return 0;
             }
             ReleaseCapture();
             if (const FileEntry* f = EntryFile(pe)) {
@@ -837,8 +1028,7 @@ LRESULT CALLBACK ColumnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_LBUTTONUP: {
         if (s.draggingStack) {
-            s.draggingStack = false; ReleaseCapture();
-            if (s.cellsChanged) s.cellsChanged(s.cells);
+            FinishStackDrag();
             return 0;
         }
         const bool was = s.pressed; s.pressed = false; ReleaseCapture();
@@ -849,6 +1039,10 @@ LRESULT CALLBACK ColumnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (const FileEntry* f = EntryFile(index)) { ClickSelect(f->path, (w & MK_CONTROL) != 0, (w & MK_SHIFT) != 0, DesktopOrder()); PaintColumn(); }
         return 0;
     }
+    case WM_CAPTURECHANGED:
+        s.pressed = false;
+        FinishStackDrag();
+        return 0;
     case WM_LBUTTONDBLCLK:
         if (const FileEntry* f = EntryFile(EntryAt(POINT{GET_X_LPARAM(l), GET_Y_LPARAM(l)}))) {
             // Like Explorer: double-clicking one of several selected files opens all of them.
@@ -1034,25 +1228,28 @@ LRESULT CALLBACK CatcherProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     auto& s = S();
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_WINDOWPOSCHANGING: { auto* wp = reinterpret_cast<WINDOWPOS*>(l); if (!(wp->flags & SWP_NOZORDER)) wp->hwndInsertAfter = HWND_BOTTOM; break; }
+    case WM_WINDOWPOSCHANGING: KeepBottom(l); break;
     case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); FillRect(dc, &ps.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH))); EndPaint(h, &ps); return 0; }
     case WM_LBUTTONDOWN: {
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; ClientToScreen(h, &pt);
         s.banding = true; s.bandShown = false; s.bandStart = pt;
-        const bool ctrl = (w & MK_CONTROL) != 0;
-        s.bandBase = ctrl ? s.sel : std::set<std::wstring>{};
-        if (!ctrl && !s.sel.empty()) { s.sel.clear(); s.anchor.clear(); PaintColumn(); }
+        s.bandToggle = (w & MK_CONTROL) != 0;
+        const bool extend = (w & (MK_CONTROL | MK_SHIFT)) != 0;
+        s.bandBase = extend ? s.sel : std::set<std::wstring>{};
+        if (!extend && !s.sel.empty()) { s.sel.clear(); s.anchor.clear(); PaintColumn(); }
+        s.bandTracksButton = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (s.bandTracksButton) SetTimer(h, 2, 16, nullptr);
         SetCapture(h); return 0;
     }
     case WM_MOUSEMOVE:
         if (s.banding && (w & MK_LBUTTON)) { POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; ClientToScreen(h, &pt); UpdateBand(pt); }
         return 0;
-    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
-        if (s.banding) {
-            s.banding = false; if (m == WM_LBUTTONUP) ReleaseCapture();
-            if (s.band) ShowWindow(s.band, SW_HIDE);
-            if (!s.sel.empty()) { const int e = SelectedEntry(); if (const FileEntry* f = EntryFile(e)) s.anchor = f->path; if (s.column) SetForegroundWindow(s.column); }
-        }
+    case WM_LBUTTONUP: {
+        if (s.banding) { POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; ClientToScreen(h, &pt); UpdateBand(pt); FinishBand(h); }
+        return 0;
+    }
+    case WM_CAPTURECHANGED:
+        if (!s.bandTracksButton || !(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) FinishBand(h);
         return 0;
     case WM_RBUTTONUP: {
         POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)}; ClientToScreen(h, &pt);
@@ -1060,7 +1257,13 @@ LRESULT CALLBACK CatcherProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         DesktopBackgroundMenu(s.host, pt); GetStacks().Rescan();
         return 0;
     }
-    case WM_TIMER: if (w == 1) CatcherToBottom(); return 0;
+    case WM_TIMER:
+        if (w == 1) CatcherToBottom();
+        else if (w == 2 && s.banding) {
+            POINT pt{}; if (GetCursorPos(&pt)) UpdateBand(pt);
+            if (!(GetAsyncKeyState(VK_LBUTTON) & 0x8000)) FinishBand(h);
+        }
+        return 0;
     case WM_DISPLAYCHANGE: case WM_SETTINGCHANGE: PlaceCatcher(); break;
     }
     return DefWindowProcW(h, m, w, l);
@@ -1073,15 +1276,18 @@ void CreateCatcher(HINSTANCE instance) {
     // Alpha 1 of 255: invisible, but hit-testable, so clicks on the bare wallpaper reach it.
     s.catcher = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kCatcherClass, L"DockOver Desktop Stacks selection", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
     s.band = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kBandClass, L"", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
-    if (s.band) SetLayeredWindowAttributes(s.band, 0, 90, LWA_ALPHA);
+    if (s.band) SetLayeredWindowAttributes(s.band, 0, 100, LWA_ALPHA);
     if (!s.catcher) return;
     SetLayeredWindowAttributes(s.catcher, 0, 1, LWA_ALPHA);
-    RegisterDragDrop(s.catcher, new DesktopDrop());
+    auto* drop = new DesktopDrop();
+    RegisterDragDrop(s.catcher, drop);
+    drop->Release();
     PlaceCatcher();
     SetTimer(s.catcher, 1, 1000, nullptr);
 }
 void DestroyCatcher() {
     auto& s = S();
+    s.banding = s.bandShown = false;
     if (s.catcher) { RevokeDragDrop(s.catcher); DestroyWindow(s.catcher); s.catcher = nullptr; }
     if (s.band) { DestroyWindow(s.band); s.band = nullptr; }
 }
@@ -1111,7 +1317,12 @@ bool Stacks::Start(HWND host, GroupBy by, StackStyle style) {
     WNDCLASSW wc{}; wc.hInstance = instance; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = ColumnProc; wc.lpszClassName = kColumnClass; RegisterClassW(&wc);
     s.column = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, kColumnClass, L"DockOver Desktop Stacks", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, instance, nullptr);
-    if (!s.column || !s.panel.Create(kPanelClass, PanelProc, 0, false)) return false;
+    if (!s.column) return false;
+    if (!s.panel.Hwnd() && !s.panel.Create(kPanelClass, PanelProc, 0, false)) {
+        DestroyWindow(s.column);
+        s.column = nullptr;
+        return false;
+    }
     // The glass panel looks like the menu bar popups (Glass Studio > Menu bar popups) and refracts the live desktop.
     s.panel.SetFrosted(true); s.panel.SetLiveBackdrop(true);
     CreateCatcher(instance);
@@ -1128,6 +1339,10 @@ void Stacks::Stop() {
     auto& s = S();
     if (!s.running) return;
     s.running = false;
+    s.flightTicker.Stop(); s.flights.clear();
+    s.panelTicker.Stop();
+    s.expanded.clear(); s.sel.clear(); s.anchor.clear();
+    s.draggingStack = false; s.dragName.clear(); s.pressed = false;
     if (s.stopWatch) SetEvent(s.stopWatch);
     if (s.watcher.joinable()) s.watcher.join();
     if (s.stopWatch) { CloseHandle(s.stopWatch); s.stopWatch = nullptr; }
@@ -1142,8 +1357,15 @@ bool Stacks::Running() const { return S().running; }
 void Stacks::SetGroupBy(GroupBy by) { S().by = by; if (S().running) { ClosePanel(); S().expanded.clear(); Rescan(); } }
 void Stacks::SetStyle(StackStyle style) { auto& s = S(); s.style = style; if (s.running) { ClosePanel(); s.expanded.clear(); s.sel.clear(); Relayout(); } }
 void Stacks::SetFreePlacement(bool on) { auto& s = S(); if (s.freePlace == on) return; s.freePlace = on; if (s.running) Relayout(); }
-void Stacks::SetCells(const std::map<std::wstring, POINT>& cells) { S().cells = cells; if (S().running && S().freePlace) Relayout(); }
-void Stacks::OnCellsChanged(std::function<void(const std::map<std::wstring, POINT>&)> changed) { S().cellsChanged = std::move(changed); }
+void Stacks::SetPositions(const std::map<std::wstring, POINT>& positions, const std::map<std::wstring, POINT>& legacyCells) {
+    auto& s = S();
+    s.positions = positions;
+    s.legacyCells = legacyCells;
+    if (s.running && s.freePlace) Relayout();
+}
+void Stacks::OnPositionsChanged(std::function<void(const std::map<std::wstring, POINT>&)> changed) {
+    S().positionsChanged = std::move(changed);
+}
 
 void Stacks::Rescan() {
     auto& s = S();
@@ -1161,6 +1383,7 @@ void Stacks::Rescan() {
 void Stacks::Relayout() {
     auto& s = S();
     if (!s.running) return;
+    s.flights.clear(); s.flightTicker.Stop();
     LayoutColumn();
     if (s.stacks.empty()) ShowWindow(s.column, SW_HIDE); else Place(s.column, s.columnRect, true);
     PaintColumn();
@@ -1173,6 +1396,7 @@ void Stacks::Raise(bool raised) {
     s.raised = raised;
     if (!s.running) return;
     for (HWND h : {s.column, s.panel.Hwnd()}) if (h && IsWindowVisible(h)) SetWindowPos(h, raised ? HWND_TOP : HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    PlaceCatcher();
 }
 
 void Stacks::DevOpen(int index) {
@@ -1195,6 +1419,7 @@ HWND DesktopListView() {
 bool g_iconsHidden = false;
 bool g_shortcutHidden = false;  // hidden by the Hide DockOver Desktop shortcut (they were showing before)
 void ApplyIconVisibility() {
+    if (!DevFolder().empty()) return;  // fixture runs never change Explorer's desktop
     if (HWND list = DesktopListView()) {
         const bool hide = g_iconsHidden || g_shortcutHidden, visible = IsWindowVisible(list) != FALSE;
         if (visible == hide) ShowWindow(list, hide ? SW_HIDE : SW_SHOW);

@@ -72,6 +72,7 @@ bool FullscreenAppInFront() {
 bool devMenu = false;
 
 struct WidgetWin {
+    bool automaticPosition = false;
     std::wstring kind;  // clock | calendar | battery | system | ext:<id>
     Size size = Size::Small;
     POINT pos{};        // top-left of the widget shape, physical px
@@ -95,7 +96,8 @@ struct Config {
     std::vector<WidgetWin> widgets;
     // Stacks replace Explorer's desktop icons (macOS); otherwise every file would show twice.
     bool stacks = true, hideIcons = true; GroupBy by = GroupBy::Kind; StackStyle style = StackStyle::InPlace;
-    bool freeStacks = false; std::map<std::wstring, POINT> stackCells;  // Stacks > Place stacks anywhere (grid cells by stack name)
+    bool freeStacks = false, widgetsRightWithoutStacks = true;
+    std::map<std::wstring, POINT> stackPositions, stackCells;  // current DIP offsets and legacy grid cells
     std::vector<std::wstring> seenExt;  // third-party widgets already offered once (auto-placed on first registration)
     std::map<std::wstring, std::map<std::string, int>> extValues;  // third-party widget settings chosen by the user
 };
@@ -180,6 +182,7 @@ void SaveConfig() {
         Value o = Value::MakeObject();
         o.Set("kind", Value::MakeString(U(w.kind))); o.Set("size", Value::MakeString(SizeName(w.size)));
         o.Set("x", Value::MakeNumber(w.pos.x)); o.Set("y", Value::MakeNumber(w.pos.y));
+        o.Set("automaticPosition", Value::MakeBool(w.automaticPosition));
         list.array.push_back(std::move(o));
     }
     root.Set("widgets", std::move(list));
@@ -191,6 +194,13 @@ void SaveConfig() {
     { Value cells = Value::MakeObject();
       for (const auto& [name, c] : config.stackCells) { Value xy; xy.type = Value::Type::Array; xy.array.push_back(Value::MakeNumber(c.x)); xy.array.push_back(Value::MakeNumber(c.y)); cells.Set(U(name), std::move(xy)); }
       st.Set("cells", std::move(cells)); }
+    { Value positions = Value::MakeObject();
+      for (const auto& [name, p] : config.stackPositions) {
+          Value xy; xy.type = Value::Type::Array;
+          xy.array.push_back(Value::MakeNumber(p.x)); xy.array.push_back(Value::MakeNumber(p.y));
+          positions.Set(U(name), std::move(xy));
+      }
+      st.Set("positions", std::move(positions)); }
     root.Set("stacks", std::move(st));
     Value seen; seen.type = Value::Type::Array; for (const auto& s : config.seenExt) seen.array.push_back(Value::MakeString(U(s)));
     root.Set("seenExtensions", std::move(seen));
@@ -199,6 +209,7 @@ void SaveConfig() {
     root.Set("extensionSettings", std::move(ev));
     const auto& pr = CurrentPrefs(); Value pf = Value::MakeObject();
     pf.Set("style", Value::MakeString(pr.style == 1 ? "glass" : "solid")); pf.Set("gap", Value::MakeNumber(pr.gap)); pf.Set("margin", Value::MakeNumber(pr.margin));
+    pf.Set("rightWithoutStacks", Value::MakeBool(config.widgetsRightWithoutStacks));
     pf.Set("snap", Value::MakeNumber(pr.snap)); pf.Set("glass", Value::MakeNumber(pr.glass)); pf.Set("menuBattery", Value::MakeBool(pr.menuBattery)); pf.Set("fahrenheit", Value::MakeBool(pr.fahrenheit));
     pf.Set("clockDark", Value::MakeBool(pr.clockDark)); pf.Set("batteryGlass", Value::MakeBool(pr.batteryGlass));
     pf.Set("glassRim", Value::MakeNumber(pr.glassRim)); pf.Set("glassRefraction", Value::MakeNumber(pr.glassRefraction));
@@ -225,6 +236,7 @@ bool LoadConfig() {
             if (const Value* s = o.Find("size"); s && s->type == Value::Type::String) w.size = ParseSize(s->string);
             if (const Value* x = o.Find("x"); x && x->type == Value::Type::Number) w.pos.x = static_cast<LONG>(x->number);
             if (const Value* y = o.Find("y"); y && y->type == Value::Type::Number) w.pos.y = static_cast<LONG>(y->number);
+            if (const Value* p = o.Find("automaticPosition"); p && p->type == Value::Type::Bool) w.automaticPosition = p->boolean;
             config.widgets.push_back(std::move(w));
         }
     if (const Value* st = root.Find("stacks"); st && st->IsObject()) {
@@ -237,9 +249,15 @@ bool LoadConfig() {
             for (const auto& [name, xy] : v->object)
                 if (xy.type == Value::Type::Array && xy.array.size() == 2 && xy.array[0].type == Value::Type::Number && xy.array[1].type == Value::Type::Number)
                     config.stackCells[W(name)] = POINT{static_cast<LONG>(xy.array[0].number), static_cast<LONG>(xy.array[1].number)};
+        if (const Value* v = st->Find("positions"); v && v->IsObject())
+            for (const auto& [name, xy] : v->object)
+                if (xy.type == Value::Type::Array && xy.array.size() == 2 && xy.array[0].type == Value::Type::Number && xy.array[1].type == Value::Type::Number)
+                    config.stackPositions[W(name)] = POINT{static_cast<LONG>(std::clamp(xy.array[0].number, 0., 100000.)),
+                                                         static_cast<LONG>(std::clamp(xy.array[1].number, 0., 100000.))};
     }
     if (const Value* pf = root.Find("widgetPrefs"); pf && pf->IsObject()) {
         auto& pr = CurrentPrefs();
+        if (const Value* v = pf->Find("rightWithoutStacks"); v && v->type == Value::Type::Bool) config.widgetsRightWithoutStacks = v->boolean;
         if (const Value* v = pf->Find("style"); v && v->type == Value::Type::String) pr.style = v->string == "glass" ? 1 : 0;
         auto num = [&](const char* k, float& out, float lo, float hi) { if (const Value* v = pf->Find(k); v && v->type == Value::Type::Number) out = std::clamp(static_cast<float>(v->number), lo, hi); };
         if (const Value* v = pf->Find("menuBattery"); v && v->type == Value::Type::Bool) pr.menuBattery = v->boolean;
@@ -675,6 +693,7 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         const bool moved = drag.h == h && drag.moving; drag = {}; ReleaseCapture();
         WidgetWin* w = WidgetOf(h); if (!w) return 0;
         if (moved) {
+            w->automaticPosition = false;
             SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             PlaceWidget(*w, true);
             POINT pt{}; GetCursorPos(&pt); RECT gr = galleryRect;
@@ -757,24 +776,48 @@ bool CreateWidgetWindow(WidgetWin& w) {
     return true;
 }
 
-// First free grid slot from the top-left of the primary work area, column by column (macOS fills from the top-left).
-POINT FreeSlot(Size size) {
+RECT WidgetBounds(Size size, POINT point, UINT dpi) {
+    const auto s = SizeDip(size);
+    return {point.x, point.y, point.x + Px(s.width, dpi), point.y + Px(s.height, dpi)};
+}
+
+// Automatic placement fills columns from the chosen edge of the primary work area.
+POINT FreeSlot(Size size, const std::vector<RECT>& occupied) {
     const RECT work = PrimaryWork(); const UINT dpi = DpiAt(POINT{work.left, work.top});
     const auto s = SizeDip(size);
     const int step = Px(kSmall + kGap, dpi) / 2;  // half-cell steps so medium/large fit next to small ones
-    for (int x = work.left + Px(kMargin, dpi); x + Px(s.width, dpi) <= work.right - Px(kMargin + 120, dpi); x += step)
+    const bool right = !config.stacks && config.widgetsRightWithoutStacks;
+    const LONG minX = work.left + Px(kMargin, dpi);
+    const LONG maxX = std::max(minX, work.right - Px(kMargin + (config.stacks ? 120.f : 0.f), dpi) - Px(s.width, dpi));
+    for (LONG x = right ? maxX : minX; x >= minX && x <= maxX; x += right ? -step : step)
         for (int y = work.top + Px(kMargin, dpi); y + Px(s.height, dpi) <= work.bottom - Px(kMargin, dpi); y += step) {
             RECT want{x - Px(kGap / 2, dpi), y - Px(kGap / 2, dpi), x + Px(s.width + kGap / 2, dpi), y + Px(s.height + kGap / 2, dpi)};
-            bool free = true;
-            for (const auto& o : config.widgets) { const auto os = SizeDip(o.size); RECT r{o.pos.x, o.pos.y, o.pos.x + Px(os.width, dpi), o.pos.y + Px(os.height, dpi)}; RECT x2{}; if (IntersectRect(&x2, &want, &r)) { free = false; break; } }
-            if (free) return POINT{x, y};
+            const bool blocked = std::any_of(occupied.begin(), occupied.end(), [&](const RECT& r) {
+                RECT overlap{};
+                return IntersectRect(&overlap, &want, &r) != FALSE;
+            });
+            if (!blocked) return {x, y};
         }
-    return POINT{work.left + Px(kMargin, dpi), work.top + Px(kMargin, dpi)};
+    return {right ? maxX : minX, work.top + Px(kMargin, dpi)};
+}
+
+void ReflowAutomaticWidgets() {
+    std::vector<RECT> occupied;
+    for (const auto& w : config.widgets)
+        if (!w.automaticPosition) occupied.push_back(WidgetBounds(w.size, w.pos, DpiAt(w.pos)));
+    for (auto& w : config.widgets) if (w.automaticPosition) {
+        const POINT next = FreeSlot(w.size, occupied);
+        occupied.push_back(WidgetBounds(w.size, next, DpiAt(next)));
+        if (w.hwnd) MoveWidget(w, next, true);
+        else w.pos = next;
+    }
 }
 
 void AddWidget(const std::wstring& kind, Size size) {
     if (config.widgets.size() >= 40) return;
-    WidgetWin w; w.kind = kind; w.size = size; w.pos = FreeSlot(size);
+    std::vector<RECT> occupied;
+    for (const auto& existing : config.widgets) occupied.push_back(WidgetBounds(existing.size, existing.pos, DpiAt(existing.pos)));
+    WidgetWin w; w.kind = kind; w.size = size; w.automaticPosition = true; w.pos = FreeSlot(size, occupied);
     config.widgets.push_back(std::move(w));
     CreateWidgetWindow(config.widgets.back());
     SaveConfig();
@@ -831,11 +874,16 @@ std::vector<MenuItem> AppItems() {
     return items;
 }
 void ApplyStacks() {
-    GetStacks().SetCells(config.stackCells);
+    GetStacks().SetPositions(config.stackPositions, config.stackCells);
     GetStacks().SetFreePlacement(config.freeStacks);
-    GetStacks().OnCellsChanged([](const std::map<std::wstring, POINT>& cells) { config.stackCells = cells; SaveConfig(); });
+    GetStacks().OnPositionsChanged([](const std::map<std::wstring, POINT>& positions) { config.stackPositions = positions; SaveConfig(); });
     if (config.stacks) { GetStacks().Start(host, config.by, config.style); GetStacks().SetGroupBy(config.by); } else GetStacks().Stop();
     HideDesktopIcons(config.stacks && config.hideIcons);
+}
+void ToggleStacks() {
+    config.stacks = !config.stacks;
+    ApplyStacks();
+    ReflowAutomaticWidgets();
 }
 void EditWidget(HWND widget);
 void Command(UINT id, HWND widget) {
@@ -853,7 +901,7 @@ void Command(UINT id, HWND widget) {
     else if (id == kCmdGallery) { if (gallery) CloseGallery(); else OpenGallery(); }  // Edit Widgets toggles
     else if (id == kCmdSettings) OpenSettings();
     else if (id == kCmdEdit) EditWidget(widget);
-    else if (id == kCmdStacks) { config.stacks = !config.stacks; ApplyStacks(); SaveConfig(); }
+    else if (id == kCmdStacks) { ToggleStacks(); SaveConfig(); }
     else if (id == kCmdGroupKind || id == kCmdGroupDate) { config.by = id == kCmdGroupDate ? GroupBy::Date : GroupBy::Kind; GetStacks().SetGroupBy(config.by); SaveConfig(); }
     else if (id == kCmdInPlace || id == kCmdPanel) { config.style = id == kCmdPanel ? StackStyle::Panel : StackStyle::InPlace; GetStacks().SetStyle(config.style); SaveConfig(); }
     else if (id == kCmdHideIcons) { config.hideIcons = !config.hideIcons; HideDesktopIcons(config.stacks && config.hideIcons); SaveConfig(); }
@@ -1142,7 +1190,7 @@ void OpenGallery() {
 // ---- Widget Settings: a Liquid Glass panel (style, spacing, snap distance, margin, Stacks, calendars) -------------
 GlassWindow settingsWin;
 RECT settingsRect{};
-enum class Ctl { None, Done, Style, Gap, Snap, Margin, Glass, Stacks, Open, Group, Icons, FreeStacks, EditCalendars, RefreshCalendars, MenuBattery, Units, SetCity, RefreshWeather, BatteryWidget, BatteryMenu, ExtSetting,
+enum class Ctl { None, Done, Style, Gap, Snap, Margin, Glass, Stacks, Open, Group, Icons, FreeStacks, WidgetsRight, EditCalendars, RefreshCalendars, MenuBattery, Units, SetCity, RefreshWeather, BatteryWidget, BatteryMenu, ExtSetting,
                  CalColour, CalRemove, CalField, CalAdd, CalFile, CalUndo, CalWheel, CalBright, CalSwatch, CalPickerDone, ClockStyle, BatteryGlass, GlassRim, GlassRefraction, GlassFrost, GlassTint };
 struct Control { Ctl id; D2D1_RECT_F rect; int index = 0; bool on = false; };
 std::vector<Control> controls;
@@ -1199,11 +1247,13 @@ void SaveConfig();
 // New spacing / margin: keep every widget on the same grid cell (the arrangement stays, the spacing changes).
 void Repack(float oldGap, float oldMargin) {
     for (auto& w : config.widgets) {
+        if (!config.stacks && w.automaticPosition) continue;
         const UINT dpi = DpiAt(w.pos); const RECT work = WorkAt(w.pos);
         const float oldUnit = (kSmall + oldGap) / 2, newUnit = (kSmall + kGap) / 2;
         const float cx = ((w.pos.x - work.left) * 96.f / dpi - oldMargin) / oldUnit, cy = ((w.pos.y - work.top) * 96.f / dpi - oldMargin) / oldUnit;
         MoveWidget(w, POINT{work.left + Px(kMargin + std::round(cx) * newUnit, dpi), work.top + Px(kMargin + std::round(cy) * newUnit, dpi)}, true);
     }
+    if (!config.stacks) ReflowAutomaticWidgets();
 }
 // Settings pages: the general page (Widgets & Stacks) and one page per widget that has settings (macOS "Edit
 // Widget"): Weather, Batteries, Calendar, and third-party widgets that declare "settings". A widget's right-click menu
@@ -1365,7 +1415,7 @@ float SettingsHeight() {
     case Page::Clock: return 62 + 22 + 40.f + 16;
     case Page::Calendar: return CalendarPageHeight();
     case Page::Ext: { const ExtWidget* e = SettingsExt(); return 62 + 22 + 40.f * (std::max)(1, e ? static_cast<int>(e->settings.size()) : 1) + 16; }
-    default: return 62 + 22 + (CurrentPrefs().style == 1 ? 6 : 5) * 40.f + 14 + 22 + 5 * 40.f + 16;
+    default: return 62 + 22 + (CurrentPrefs().style == 1 ? 7 : 6) * 40.f + 14 + 22 + 5 * 40.f + 16;
     }
 }
 std::wstring SettingsTitle() {
@@ -1482,14 +1532,16 @@ void PaintSettings() {
         float top = y;
         switch (settingsPage) {
         case Page::General:
-            section(L"WIDGETS", p.style == 1 ? 6 : 5); top = y;
+            section(L"WIDGETS", p.style == 1 ? 7 : 6); top = y;
             label(L"Style", 0, top); segmented(Ctl::Style, 0, top, {L"Solid", L"Glass"}, p.style);
             label(L"Spacing", 1, top); slider(Ctl::Gap, 1, top, L" pt");
             label(L"Snap distance", 2, top); slider(Ctl::Snap, 2, top, L" pt");
             label(L"Edge margin", 3, top); slider(Ctl::Margin, 3, top, L" pt");
             label(L"Edge highlight", 4, top); slider(Ctl::GlassRim, 4, top, L"");  // the liquid glass rim on every widget
-            if (p.style == 1) { label(L"Glass tint", 5, top); slider(Ctl::Glass, 5, top, L""); }
-            y = top + (p.style == 1 ? 6 : 5) * 40.f + 14;
+            Text(dc, L"Place widgets on the right without Stacks", Font(13.f), D2D1::RectF(30, top + 200, W - 105, top + 240), ink);
+            toggle(Ctl::WidgetsRight, 5, top, config.widgetsRightWithoutStacks);
+            if (p.style == 1) { label(L"Glass tint", 6, top); slider(Ctl::Glass, 6, top, L""); }
+            y = top + (p.style == 1 ? 7 : 6) * 40.f + 14;
             section(L"STACKS", 5); top = y;
             label(L"Use Stacks", 0, top); toggle(Ctl::Stacks, 0, top, config.stacks);
             label(L"Open stacks", 1, top); segmented(Ctl::Open, 1, top, {L"On Desktop", L"Glass Panel"}, config.style == StackStyle::Panel ? 1 : 0);
@@ -1741,7 +1793,7 @@ void SendExtSetting(const ExtWidget& e, const ExtSetting& s, int value) {
 }
 bool IsLabSwitch(const Control& c) {
     switch (c.id) {
-    case Ctl::Stacks: case Ctl::Icons: case Ctl::FreeStacks: case Ctl::MenuBattery: case Ctl::BatteryGlass: case Ctl::BatteryWidget: case Ctl::BatteryMenu: return true;
+    case Ctl::Stacks: case Ctl::Icons: case Ctl::FreeStacks: case Ctl::WidgetsRight: case Ctl::MenuBattery: case Ctl::BatteryGlass: case Ctl::BatteryWidget: case Ctl::BatteryMenu: return true;
     case Ctl::ExtSetting: { const ExtWidget* e = SettingsExt(); const int row = c.index / 64;
         return e && row >= 0 && row < static_cast<int>(e->settings.size()) && e->settings[static_cast<size_t>(row)].type == "toggle"; }
     default: return false;
@@ -1800,11 +1852,15 @@ void ActivateControl(const Control& c) {
         switch (c.id) {
         case Ctl::Done: settingsWin.Hide(); SaveConfig(); return;
         case Ctl::Style: CurrentPrefs().style = c.index; RepaintAll(); break;
-        case Ctl::Stacks: config.stacks = !config.stacks; ApplyStacks(); break;
+        case Ctl::Stacks: ToggleStacks(); break;
         case Ctl::Open: config.style = c.index ? StackStyle::Panel : StackStyle::InPlace; GetStacks().SetStyle(config.style); break;
         case Ctl::Group: config.by = c.index ? GroupBy::Date : GroupBy::Kind; GetStacks().SetGroupBy(config.by); break;
         case Ctl::Icons: config.hideIcons = !config.hideIcons; HideDesktopIcons(config.stacks && config.hideIcons); break;
         case Ctl::FreeStacks: config.freeStacks = !config.freeStacks; GetStacks().SetFreePlacement(config.freeStacks); break;
+        case Ctl::WidgetsRight:
+            config.widgetsRightWithoutStacks = !config.widgetsRightWithoutStacks;
+            if (!config.stacks) ReflowAutomaticWidgets();
+            break;
         case Ctl::ClockStyle: CurrentPrefs().clockDark = c.index == 1; for (auto& wdg : config.widgets) if (wdg.kind == L"clock") PaintWidgetWin(wdg); break;
         case Ctl::BatteryGlass: CurrentPrefs().batteryGlass = !CurrentPrefs().batteryGlass; for (auto& wdg : config.widgets) if (wdg.kind == L"battery") PaintWidgetWin(wdg); break;
         case Ctl::Units: CurrentPrefs().fahrenheit = c.index == 1; WeatherService().SetFahrenheit(CurrentPrefs().fahrenheit); break;
@@ -2457,11 +2513,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     const bool firstRun = !LoadConfig();
     if (firstRun) {  // a clock and a calendar side by side at the top-left, like a fresh macOS desktop
         const RECT work = PrimaryWork(); const UINT dpi = DpiAt(POINT{work.left, work.top});
-        WidgetWin clock; clock.kind = L"clock"; clock.pos = POINT{work.left + Px(kMargin, dpi), work.top + Px(kMargin, dpi)};
-        WidgetWin cal; cal.kind = L"calendar"; cal.pos = POINT{clock.pos.x + Px(kSmall + kGap, dpi), clock.pos.y};
+        WidgetWin clock; clock.kind = L"clock"; clock.automaticPosition = true; clock.pos = POINT{work.left + Px(kMargin, dpi), work.top + Px(kMargin, dpi)};
+        WidgetWin cal; cal.kind = L"calendar"; cal.automaticPosition = true; cal.pos = POINT{clock.pos.x + Px(kSmall + kGap, dpi), clock.pos.y};
         config.widgets.push_back(std::move(clock)); config.widgets.push_back(std::move(cal));
         SaveConfig();
     }
+    if (!config.stacks) ReflowAutomaticWidgets();
     Calendars().Start(host, kCalendarReady);
     Devices().Start(host, kDevicesReady);
     WeatherService().SetFahrenheit(CurrentPrefs().fahrenheit);
