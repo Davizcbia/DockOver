@@ -313,7 +313,6 @@ private:
     // Bar (always registered) with kDockFullscreenMsg.
     static constexpr UINT kDockFullscreenMsg = WM_APP + 79;
     bool fullscreenApp_ = false;
-    bool fullscreenRelease_ = false;  // the maximize-button full screen is on this monitor: the Dock's reserved space is given back
     bool gameSuppressed_ = false;
     // A full-screen app makes the Dock auto-hide (macOS): hidden, revealed over the app by moving to the bottom edge,
     // without changing the work area or the app's size.
@@ -1192,7 +1191,6 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case kDockFullscreenMsg:
         SetFullscreenApp(wp != 0);
-        if (fullscreenRelease_ != (wp == 2)) { fullscreenRelease_ = wp == 2; UpdateDockAppBar(); }
         menuBarGame_ = lp != 0;  // the Menu Bar's full-screen game detection
         SetGameSuppressed(menuBarGame_ || listedGame_);
         return 0;
@@ -2259,7 +2257,7 @@ void App::ApplyGameMode() {
 }
 
 void App::UpdateDockAppBar() {
-    const bool want = hwnd_ && !autoHide_ && dockAppBarEnabled_ && !fullscreenRelease_;
+    const bool want = hwnd_ && !autoHide_ && dockAppBarEnabled_;
     if (!want) {
         if (dockAppBar_) { APPBARDATA a{sizeof(a)}; a.hWnd = hwnd_; SHAppBarMessage(ABM_REMOVE, &a); dockAppBar_ = false; dockAppBarRect_ = {}; DLOG(L"dock: appbar removed"); }
         return;
