@@ -929,7 +929,11 @@ void Place(HWND h) {
     if(!GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi))return;
     const UINT monitorDpi=GetDpiForWindow(h);
     dpi=MulDiv(monitorDpi?monitorDpi:96,menuScalePercent,100);
-    ApplyAppBar(h,mi.rcMonitor);
+    // The maximize-button full screen keeps the bar's space released. Releasing it changes the work area, which calls
+    // Place() again (WM_SETTINGCHANGE / ABN_POSCHANGED): registering here then took the space back 0.3 s later and the
+    // maximized window shrank above the bar's height, leaving a strip at the bottom of the screen.
+    if(fullscreenApp&&IsButtonFullscreen(fullscreenWindow))RemoveAppBar(h);
+    else ApplyAppBar(h,mi.rcMonitor);
     if(fullscreenApp)return;  // hidden while a full-screen app owns the monitor
     SetWindowPos(h,HWND_TOPMOST,mi.rcMonitor.left,mi.rcMonitor.top,mi.rcMonitor.right-mi.rcMonitor.left,Px(30),SWP_NOACTIVATE|SWP_SHOWWINDOW);
 }
