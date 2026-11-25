@@ -952,6 +952,8 @@ constexpr UINT_PTR kInputTimer=31;
 HKL inputLayout=nullptr;HWND inputTarget=nullptr;
 HKL ForegroundLayout(){return docky::statuspopup::ForegroundLayout(inputLayout,inputTarget);}
 using docky::statuspopup::InputBadge;
+// Input badge size (DIP) and the even gap between status items' ink (see the layout in Render).
+constexpr float kImeBadgeW=22.f,kImeBadgeWide=26.f,kImeBadgeH=16.f,kStatusGap=17.f;
 void StatusIcons(HDC dc){
     static ULONG_PTR token=0;if(!token){Gdiplus::GdiplusStartupInput in;Gdiplus::GdiplusStartup(&token,&in,nullptr);}
     Gdiplus::Graphics g(dc);g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -973,13 +975,17 @@ void StatusIcons(HDC dc){
     if(shown(5)&&!HasWorkshop("bluetooth")){const auto c=mid(statusRects[5]);docky::statusart::Bluetooth(g,c.X,c.Y,k,grey(255));}
     if(shown(6)){  // input menu: the layout's badge in a rounded outline (macOS: "拼" for Pinyin), or its language code
         const auto c=mid(statusRects[6]);const std::wstring badge=InputBadge(inputLayout);const bool wide=badge.size()>1;
-        const float bw=(wide?20.f:16.f)*k,bh=15.f*k,r=3.5f*k;auto p=pen(255,1.2f);Gdiplus::GraphicsPath box;
+        // Proportions of the macOS input badge (user reference): box 1.38:1, corner 0.28 of its height, outline about
+        // 1/11 of it, bold glyph filling about 60% of the height, centred on its ink rather than on font metrics.
+        const float bw=(wide?kImeBadgeWide:kImeBadgeW)*k,bh=kImeBadgeH*k,r=4.5f*k;auto p=pen(255,1.45f);Gdiplus::GraphicsPath box;
         box.AddArc(c.X-bw/2,c.Y-bh/2,2*r,2*r,180,90);box.AddArc(c.X+bw/2-2*r,c.Y-bh/2,2*r,2*r,270,90);box.AddArc(c.X+bw/2-2*r,c.Y+bh/2-2*r,2*r,2*r,0,90);box.AddArc(c.X-bw/2,c.Y+bh/2-2*r,2*r,2*r,90,90);box.CloseFigure();
         g.DrawPath(p.get(),&box);
-        Gdiplus::FontFamily family(wide?L"Segoe UI":L"Microsoft YaHei UI");Gdiplus::Font font(&family,(wide?8.f:10.f)*k,wide?Gdiplus::FontStyleBold:Gdiplus::FontStyleRegular,Gdiplus::UnitPixel);
-        Gdiplus::StringFormat fmt;fmt.SetAlignment(Gdiplus::StringAlignmentCenter);fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);Gdiplus::SolidBrush ink(grey(255));
-        g.DrawString(badge.c_str(),static_cast<INT>(badge.size()),&font,Gdiplus::RectF(c.X-bw/2,c.Y-bh/2+0.5f*k,bw,bh),&fmt,&ink);}
+        Gdiplus::FontFamily family(wide?L"Segoe UI":L"Microsoft YaHei UI");Gdiplus::GraphicsPath glyphs;
+        glyphs.AddString(badge.c_str(),static_cast<INT>(badge.size()),&family,Gdiplus::FontStyleBold,(wide?9.f:11.5f)*k,Gdiplus::PointF(0,0),Gdiplus::StringFormat::GenericTypographic());
+        Gdiplus::RectF ib;glyphs.GetBounds(&ib);
+        const float target=bh*(wide?0.50f:0.62f),fit=ib.Height>0.01f?(std::min)(1.f,target/ib.Height):1.f;  // never taller than ~60%
+        Gdiplus::Matrix place;place.Translate(c.X,c.Y);place.Scale(fit,fit);place.Translate(-(ib.X+ib.Width*0.5f),-(ib.Y+ib.Height*0.5f));
+        glyphs.Transform(&place);Gdiplus::SolidBrush ink(grey(255));g.FillPath(&ink,&glyphs);}
     if(shown(3)&&!HasWorkshop("control-center")) {   // Control Center: two stacked switches with knobs on opposite ends (no gear).
         const auto c=mid(statusRects[3]);const float w=15.f*k,h=6.6f*k;auto p=pen(255,1.4f);Gdiplus::SolidBrush knob(grey(255));
         for(int i=0;i<2;++i){const float y=c.Y+(i?3.9f:-3.9f)*k;Gdiplus::GraphicsPath cap;cap.AddArc(c.X-w/2,y-h/2,h,h,90,180);cap.AddArc(c.X+w/2-h,y-h/2,h,h,270,180);cap.CloseFigure();
@@ -1027,17 +1033,43 @@ void Render(HWND h) {
     {
         const bool batterySlot=systemStatus.batteryPresent||systemStatus.batteryKnown;
         // Right to left: Control Center, battery, Wi-Fi, Bluetooth (macOS order), sound, then the input menu.
+        // Spaced by what is drawn, not by centres: every icon's ink (the extents below, DIP from the point it is drawn
+        // at) is kStatusGap from its neighbours and from the clock text, so a narrow Bluetooth rune and a wide battery
+        // read as evenly spaced. The sound icon keeps the width of its loudest state so it does not shift with volume.
+        // Slots stay symmetric about the drawing point (icons are drawn at the slot middle) and reach about half a gap
+        // past the ink, so hover pills and hit areas still centre on the icon.
         constexpr int kOrdered=6;
-        const int order[kOrdered]={3,2,0,5,1,6};const float lead[kOrdered]={29.75f,43.5f,38.5f,35.25f,35.25f,35.25f};
+        const int order[kOrdered]={3,2,0,5,1,6};
         const bool visible[kOrdered]={extrasConfig.control,extrasConfig.battery&&batterySlot,extrasConfig.wifi,extrasConfig.bluetooth,extrasConfig.sound,extrasConfig.input};
-        int centers[kOrdered]{};int prev=clockLeft;bool first=true;
-        for(int k=0;k<kOrdered;++k){if(!visible[k]){statusRects[order[k]]={0,0,0,0};continue;}centers[k]=prev-pt(first?29.75f:lead[k]);prev=centers[k];first=false;}
-        for(int k=0;k<kOrdered;++k){if(!visible[k])continue;int next=-1;for(int j=k+1;j<kOrdered;++j)if(visible[j]){next=j;break;}
-            int half=next>=0?(centers[k]-centers[next])/2:pt(35.25f)/2;
-            if(order[k]==2){if(systemStatus.batteryPresent){wchar_t pct[32]{};if(systemStatus.batteryPercent>=0)_snwprintf_s(pct,_TRUNCATE,L"%d%%",systemStatus.batteryPercent);else wcscpy_s(pct,L"?");
-                    const bool customBattery=HasWorkshop(BatteryBolt()?"battery.charging":"battery.discharging");const int natural=customBattery?textW(pct,false)+Px(38):Px(48);half=(std::max)(half,natural/2);}
-                else half=(std::max)(half,textW(L"Power",false)/2+Px(8));}
-            statusRects[order[k]]=slot(centers[k],half);edge=(std::min)(edge,static_cast<int>(statusRects[order[k]].left));}
+        const float dip=static_cast<float>(Px(1000))/1000.0f, gap=kStatusGap*dip;
+        auto ink=[&](int index,float& inkL,float& inkR){  // DIP; negative left = to the left of the drawing point
+            inkL=-9.f;inkR=9.f;  // Workshop art and anything unmeasured
+            switch(index){
+            case 3: if(!HasWorkshop("control-center")){inkL=-8.2f;inkR=8.2f;} break;          // two 15 DIP switches, 1.4 stroke
+            case 0: if(!HasWorkshop(WifiArtKey())){inkL=-8.6f;inkR=8.6f;} break;              // 11 DIP arcs over 90 degrees
+            case 5: if(!HasWorkshop("bluetooth")){inkL=-5.1f;inkR=4.1f;} break;               // rune 7.6 wide, left of centre
+            case 1: if(!HasWorkshop(SoundKey())){inkL=-8.8f;inkR=9.9f;} break;                // body + three waves
+            case 6: {const float half=(InputBadge(inputLayout).size()>1?kImeBadgeWide:kImeBadgeW)*0.5f+0.7f;inkL=-half;inkR=half;} break;
+            case 2:
+                if(systemStatus.batteryPresent){
+                    if(HasWorkshop(BatteryBolt()?"battery.charging":"battery.discharging")){
+                        wchar_t pct[32]{};if(systemStatus.batteryPercent>=0)_snwprintf_s(pct,_TRUNCATE,L"%d%%",systemStatus.batteryPercent);else wcscpy_s(pct,L"?");
+                        inkR=(textW(pct,false)+Px(28))*0.5f/dip;inkL=-inkR;
+                    }else{inkL=-14.75f;inkR=14.75f;}                                                // 27 DIP body + terminal
+                }else{inkR=textW(L"Power",false)*0.5f/dip;inkL=-inkR;}
+                break;
+            }
+        };
+        float x=static_cast<float>(clockLeft)-gap;  // the right edge the next icon's ink may reach
+        for(int k=0;k<kOrdered;++k){
+            if(!visible[k]){statusRects[order[k]]={0,0,0,0};continue;}
+            float inkL=0,inkR=0;ink(order[k],inkL,inkR);
+            const float centre=x-inkR*dip;
+            const int half=static_cast<int>(std::lround(((std::max)(-inkL,inkR)*dip)+gap*0.5f));
+            statusRects[order[k]]=slot(static_cast<int>(std::lround(centre)),half);
+            edge=(std::min)(edge,static_cast<int>(std::lround(centre+inkL*dip-gap*0.5f)));
+            x=centre+inkL*dip-gap;
+        }
         {static RECT logged{};RECT now=statusRects[3];if(!EqualRect(&now,&logged)){logged=now;RECT wr{};GetWindowRect(h,&wr);DLOG(L"menu: control center icon at %ld,%ld",wr.left+(now.left+now.right)/2,wr.top+(now.top+now.bottom)/2);}}
     }
     { static RECT previous[4]{}; bool changed=false;for(int i=0;i<4;++i)if(!EqualRect(&previous[i],&statusRects[i]))changed=true;
@@ -1053,7 +1085,9 @@ void Render(HWND h) {
             Extra e;e.kind=ExtraKind::Tray;e.id=t.key;e.serial=t.serial;e.hasIcon=!t.pixels.empty();e.contentW=iconSide;extras.push_back(std::move(e));}
         if(extrasConfig.hiddenIcons&&AnythingHidden()){Extra e;e.kind=ExtraKind::Chevron;e.id=L"chevron";e.contentW=Px(10);extras.push_back(std::move(e));}
         int at=edge;
-        for(auto& e:extras){const int w=(std::max)(step,e.contentW+Px(16));e.rect={at-w,0,at,height};at-=w;}
+        // Same spacing as the built-ins: content (drawn centred in its rect) plus one gap.
+        const int gapPx=static_cast<int>(std::lround(kStatusGap*static_cast<float>(Px(1000))/1000.0f));(void)step;
+        for(auto& e:extras){const int w=e.contentW+gapPx;e.rect={at-w,0,at,height};at-=w;}
         if(!extras.empty())edge=at;
     }
     // Logo slot = the Liquid Desktop system menu heading (index 0), like the macOS top-left menu.

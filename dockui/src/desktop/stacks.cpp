@@ -1179,14 +1179,35 @@ public:
 private:
     std::atomic<ULONG> refs_{1}; ComPtr<IDropTarget> target_;
 };
-// Keeps the catcher under every other docky Desktop window (they all sit at the bottom of the Z order).
+// The lowest visible window of this process other than the catcher and the band (the Z order runs top to bottom).
+HWND LowestOwnWindow() {
+    auto& s = S();
+    const DWORD self = GetCurrentProcessId();
+    HWND lowest = nullptr;
+    for (HWND w = GetTopWindow(nullptr); w; w = GetWindow(w, GW_HWNDNEXT)) {
+        if (w == s.catcher || w == s.band || !IsWindowVisible(w)) continue;
+        DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
+        if (pid == self) lowest = w;
+    }
+    return lowest;
+}
+// Keeps the catcher under every other docky Desktop window: at the bottom of the Z order, or while the desktop is raised
+// (Win+D, desktop in front) right under the lowest of them, so Stacks and the widgets stay above it and get their own
+// clicks and wheel. Above the column alone it covered the widgets and swallowed their scrolling.
+HWND CatcherAfter() {
+    auto& s = S();
+    if (!s.raised) return HWND_BOTTOM;
+    const HWND lowest = LowestOwnWindow();
+    return lowest ? lowest : HWND_BOTTOM;
+}
 void CatcherToBottom() {
     auto& s = S();
     if (!s.catcher) return;
-    DWORD self = GetCurrentProcessId();
+    const DWORD self = GetCurrentProcessId();
     for (HWND w = GetWindow(s.catcher, GW_HWNDNEXT); w; w = GetWindow(w, GW_HWNDNEXT)) {
+        if (w == s.band) continue;
         DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
-        if (pid == self && IsWindowVisible(w)) { SetWindowPos(s.catcher, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); return; }
+        if (pid == self && IsWindowVisible(w)) { SetWindowPos(s.catcher, CatcherAfter(), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); return; }
     }
 }
 void PlaceCatcher() {
@@ -1194,31 +1215,65 @@ void PlaceCatcher() {
     if (!s.catcher) return;
     MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
     const RECT r = mi.rcWork;
-    SetWindowPos(s.catcher, HWND_BOTTOM, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(s.catcher, CatcherAfter(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 void UpdateBand(POINT now) {
     auto& s = S();
-    RECT r{(std::min)(s.bandStart.x, now.x), (std::min)(s.bandStart.y, now.y), (std::max)(s.bandStart.x, now.x) + 1, (std::max)(s.bandStart.y, now.y) + 1};
+    if (s.bandShown && s.bandEnd.x == now.x && s.bandEnd.y == now.y && s.flights.empty()) return;
+    s.bandEnd = now;
+    const RECT drag{std::min(s.bandStart.x, now.x), std::min(s.bandStart.y, now.y),
+                    std::max(s.bandStart.x, now.x) + 1, std::max(s.bandStart.y, now.y) + 1};
     if (!s.bandShown && std::abs(now.x - s.bandStart.x) <= GetSystemMetrics(SM_CXDRAG) && std::abs(now.y - s.bandStart.y) <= GetSystemMetrics(SM_CYDRAG)) return;
+    RECT r{};
+    if (!IntersectRect(&r, &drag, &s.work)) return;
     if (s.band) {
-        HWND above = s.column ? GetWindow(s.column, GW_HWNDPREV) : nullptr;  // just above the stacks
-        SetWindowPos(s.band, above ? above : HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        InvalidateRect(s.band, nullptr, TRUE);
+        HWND front = s.column && IsWindowVisible(s.column) ? s.column : s.catcher;
+        for (HWND h = GetWindow(front, GW_HWNDPREV); h; h = GetWindow(h, GW_HWNDPREV)) {
+            if (h == s.catcher) { front = s.catcher; break; }
+        }
+        const HWND above = GetWindow(front, GW_HWNDPREV);
+        // On subsequent moves the band can already be immediately above the stacks.
+        // Passing its own HWND as the insertion point prevents the new rectangle from being applied.
+        const UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | (above == s.band ? SWP_NOZORDER : 0);
+        SetWindowPos(s.band, above && above != s.band ? above : HWND_TOP,
+                     r.left, r.top, r.right - r.left, r.bottom - r.top, flags);
+        RedrawWindow(s.band, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     }
     s.bandShown = true;
     std::set<std::wstring> next = s.bandBase;
-    for (size_t i = 0; i < s.entries.size(); ++i) {
-        const FileEntry* f = EntryFile(static_cast<int>(i)); if (!f) continue;
-        const RECT e = EntryScreenRect(s.entries[i]); RECT hit{};
-        if (IntersectRect(&hit, &e, &r)) next.insert(f->path);
+    const auto select = [&](int index, RECT e) {
+        const auto* f = EntryFile(index);
+        RECT hit{};
+        if (f && IntersectRect(&hit, &e, &r) && (!s.bandToggle || !next.erase(f->path))) next.insert(f->path);
+    };
+    if (s.flights.empty()) {
+        for (int i = 0; i < static_cast<int>(s.entries.size()); ++i) select(i, EntryScreenRect(s.entries[i]));
+    } else {
+        for (const auto& f : s.flights) if (f.entry >= 0 && f.Alpha() > .35f) {
+            const auto e = f.Rect();
+            select(f.entry, {Px(e.left), Px(e.top), Px(e.right), Px(e.bottom)});
+        }
     }
     if (next != s.sel) { s.sel = std::move(next); PaintColumn(); }
+}
+void FinishBand(HWND catcher) {
+    auto& s = S();
+    if (!s.banding) return;
+    s.banding = s.bandShown = false;
+    KillTimer(catcher, 2);
+    if (GetCapture() == catcher) ReleaseCapture();
+    if (s.band) ShowWindow(s.band, SW_HIDE);
+    if (!s.sel.empty()) {
+        if (const auto* f = EntryFile(SelectedEntry())) s.anchor = f->path;
+        if (s.column) SetForegroundWindow(s.column);
+    }
 }
 LRESULT CALLBACK BandProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == WM_PAINT) {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); RECT r{}; GetClientRect(h, &r);
-        HBRUSH fill = CreateSolidBrush(RGB(160, 196, 255)); FillRect(dc, &r, fill); DeleteObject(fill);
-        HBRUSH edge = CreateSolidBrush(RGB(235, 242, 255)); FrameRect(dc, &r, edge); DeleteObject(edge);
+        const COLORREF accent = GetSysColor(COLOR_HIGHLIGHT);
+        HBRUSH fill = CreateSolidBrush(accent); FillRect(dc, &r, fill); DeleteObject(fill);
+        HBRUSH edge = CreateSolidBrush(GetSysColor(COLOR_HIGHLIGHTTEXT)); FrameRect(dc, &r, edge); DeleteObject(edge);
         EndPaint(h, &ps); return 0;
     }
     if (m == WM_NCHITTEST) return HTTRANSPARENT;

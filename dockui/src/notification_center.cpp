@@ -616,6 +616,7 @@ protected:
             gp.blurSpread = (std::max)(gp.blurSpread, (std::min)(1.0f, spread * 1.15f));
             // Frost comes from Glass Studio > Notifications (default 1: cards show only the blurred sample).
         }
+        if (role != dock::GlassRole::BackdropBlur) gp.brightness *= brightness;  // stacked plates: a dimmer glass
         gp.edgeSoftness = feather;
         gp.radius = radius;
         gp.opacity = std::clamp(opacity, 0.0f, 1.0f);
@@ -877,6 +878,7 @@ constexpr float kCardW = docky::notification_card::Width, kCardRadius = docky::n
     kTextX = docky::notification_card::TextInset, kTextR = docky::notification_card::IconInset;
 constexpr float kTitleTop = 10.0f, kTitleLine = 18.0f, kBodyTop = 28.85f, kLineH = 15.6f, kBottomPad = 12.35f;
 constexpr float kCardGap = 8.0f, kPlateStep = 8.0f, kPlateInset1 = 16.0f, kPlateInset2 = 33.0f;
+constexpr float PlateBrightness(int k) { return k == 1 ? 0.82f : 0.70f; }  // the plates behind a stack, nearer first
 constexpr int kMaxLines = 4, kBannerLines = 3;
 constexpr float kTitlePitch = 17.0f;  // a wrapped title's second line (reference: 16.5-17)
 constexpr int kTitleMaxLines = 2;
@@ -1436,7 +1438,7 @@ void Center::Frame() {
         for (int k = row.plates; k >= 1; --k) {  // stacked plates under the card, the farther one first
             const float inset = k == 1 ? kPlateInset1 : kPlateInset2;
             const auto p = D2D1::RectF(r.left + inset, r.bottom - 24.0f, r.right - inset, r.bottom + kPlateStep * static_cast<float>(k));
-            glass[i][k] = Plate(p, 17.0f, ra, edge, dock::GlassRole::Notification, 0.0f, cardSpread);
+            glass[i][k] = Plate(p, 17.0f, ra, edge, dock::GlassRole::Notification, 0.0f, cardSpread, PlateBrightness(k));
         }
         glass[i][0] = Plate(r, kCardRadius, ra, edge, dock::GlassRole::Notification, 0.0f, cardSpread);
     }
@@ -1497,12 +1499,20 @@ void Center::Frame() {
             if (clipped) dc_->PopAxisAlignedClip();
             continue;
         }
-        for (int k = row.plates; k >= 1; --k) {  // fallback bodies, then the plates darkened like the reference's
+        // Stacked plates. With glass they are a dimmer glass (PlateBrightness, glass pass). Without it, a fallback body
+        // dimmed only where the plate shows: below the card for the first, below the first for the second. A black
+        // fill over the whole plate used to darken the card's lower edge and doubled where the two plates overlap,
+        // so stacks read as black.
+        for (int k = row.plates; k >= 1; --k) {
+            if (glass[i][k]) continue;
             const float inset = k == 1 ? kPlateInset1 : kPlateInset2;
             const auto p = D2D1::RectF(r.left + inset, r.bottom - 24.0f, r.right - inset, r.bottom + kPlateStep * static_cast<float>(k));
-            Body(p, 17.0f, ra, glass[i][k]);
-            brush_->SetColor(D2D1::ColorF(0, 0, 0, (k == 1 ? 0.28f : 0.42f) * ra));
+            const float shows = r.bottom + kPlateStep * static_cast<float>(k - 1);
+            dc_->PushAxisAlignedClip(D2D1::RectF(p.left - 1.0f, shows, p.right + 1.0f, p.bottom + 1.0f), D2D1_ANTIALIAS_MODE_ALIASED);
+            Body(p, 17.0f, ra, false);
+            brush_->SetColor(D2D1::ColorF(0, 0, 0, (1.0f - PlateBrightness(k)) * ra));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(p, 17.0f, 17.0f), brush_.Get());
+            dc_->PopAxisAlignedClip();
         }
         const bool hot = hoverIndex_ == static_cast<int>(i) && (hover_ == Hit::Card || hover_ == Hit::CardClose);
         // A card sliding out from under an earlier one (unfold / fold): its text and icon only show below that card,

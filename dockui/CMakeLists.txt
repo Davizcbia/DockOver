@@ -67,6 +67,8 @@ add_executable(LiquidDock WIN32
     src/menu_surface.cpp
     src/renderer.cpp src/status_group.cpp
     src/shell_items.cpp
+    src/window_preview.cpp
+    src/drag_ghost.cpp
     src/custom_icons.cpp
     src/icon_editor.cpp
     src/material.cpp

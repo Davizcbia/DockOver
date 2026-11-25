@@ -107,6 +107,8 @@ HWND g_wnd = nullptr;
 HWND g_surface = nullptr;
 bool g_quit = false;
 double g_connectedAt = 0;
+bool g_background = false;   // Settings > Run in the background: closing hides the window, remembered phones still connect
+bool g_startHidden = false;  // --background (sign-in): wait hidden until a remembered phone connects
 double g_sinkAt = -100, g_finishedAt = -100;
 float g_transferProgress = 0.0f;
 bool g_reduceMotion = false;
@@ -191,6 +193,9 @@ void LayoutPhoneControls(HWND window);
 void ShowBackConfirm(bool show, bool closing = false);
 void RevealAction(int slot);
 void ResetPairing();
+void CloseOrHide();
+void ShowFromBackground();
+void ApplyBackgroundSetting();
 void PaintPhoneItem(const DRAWITEMSTRUCT& item);
 
 docky::pairing::PcLayout PcLayoutFor(HWND window) {
@@ -632,6 +637,7 @@ void ShowPhoneSettings(HWND owner) {
     for (;;) {
         auto phones = ReadTrustedPhones();
         const int choice = ShowStyledPhoneSettings(owner, g_receiveFolder, phones, g_opt.settingsPath);
+        ApplyBackgroundSetting();
         if (choice == phone_settings::kChangeFolder) {
             const auto folder = ChooseReceiveFolder(owner, g_receiveFolder);
             if (!folder.empty()) {
@@ -742,6 +748,7 @@ void ReceivePhoneMessage(std::wstring_view message) {
     } else if ((message == L"paired" && g_opt.codeMode == 4) ||
                (message.starts_with(L"paired:") && docky::pairing::TrustHex(message.substr(7), 32))) {
         if (message.starts_with(L"paired:")) g_activePhone.assign(message.substr(7));
+        ShowFromBackground();
         g_opt.codeMode = 4;
         g_connectedAt = Now();
         ZeroMemory(g_qr, sizeof(g_qr));
@@ -1871,6 +1878,53 @@ void ResetPairing() {
     LayoutPhoneControls(g_wnd);
     g_phoneHost = docky::pairing::StartPhoneHost(g_wnd, ReceivePhoneMessage);
 }
+
+// ---- Background receiving ----------------------------------------------------------------------------------------------
+// With Run in the background on (the default), closing the window only hides it: the phone host stays connected to the
+// signalling service, so a remembered phone can still reach this PC, and the window (the water ball) comes back by
+// itself when one connects or offers files. DockDrop also starts hidden at sign-in (current-user Run entry).
+#ifdef DOCKDROP_STANDALONE
+constexpr auto kRunValue = L"DockDrop";
+#else
+constexpr auto kRunValue = L"DockOver DockDrop";
+#endif
+void SyncAutostart(bool on) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr,
+                        &key, nullptr) != ERROR_SUCCESS) return;
+    if (on) {
+        wchar_t path[32768]{};
+        const DWORD length = GetModuleFileNameW(nullptr, path, ARRAYSIZE(path));
+        if (length && length < ARRAYSIZE(path)) {
+            const std::wstring command = L"\"" + std::wstring(path, length) + L"\" --background";
+            RegSetValueExW(key, kRunValue, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()),
+                           static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(key, kRunValue);
+    }
+    RegCloseKey(key);
+}
+void ApplyBackgroundSetting() {
+    const bool on = liquid::settings::Load(g_opt.settingsPath).value.phoneBackground;
+    g_background = on;
+    SyncAutostart(on);
+}
+void CloseOrHide() {
+    if (!g_opt.pairPhone || !g_background || !g_opt.demoSession.empty()) { g_quit = true; return; }
+    if (g_connectedAt > 0 || g_transferring) { ResetPairing(); LoadWidgetDraft(); }  // end the session, listen again
+    if (g_showQr) { g_showQr = false; UpdateQr(); }
+    ShowWindow(g_wnd, SW_HIDE);
+}
+void ShowFromBackground() {
+    if (!g_wnd || IsWindowVisible(g_wnd)) return;
+    // Raised above the other windows without stealing the keyboard: a background process may not take the focus.
+    SetWindowPos(g_wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(g_wnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(g_wnd);
+    FLASHWINFO flash{sizeof(flash), g_wnd, FLASHW_TRAY | FLASHW_TIMERNOFG, 3, 0};
+    FlashWindowEx(&flash);
+}
 void PrepareShellSend(HWND owner, const std::wstring& path) {
     using namespace docky::pairing;
     const auto phones = ReadTrustedPhones();
@@ -1932,6 +1986,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case kPhoneOffer: {
+        ShowFromBackground();
         const auto host = g_phoneHost;
         const auto id = std::exchange(g_receivePrompt, {});
         const auto phones = docky::pairing::ReadTrustedPhones();
@@ -2013,7 +2068,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_opt.pairPhone && HIWORD(wp) == BN_CLICKED) {
             if (LOWORD(wp) == kClose) {
                 if (g_transferring && g_finishedAt < 0) ShowBackConfirm(true, true);
-                else g_quit = true;
+                else CloseOrHide();
                 return 0;
             }
             if (LOWORD(wp) == kBack && g_connectedAt > 0) {
@@ -2025,7 +2080,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             if (LOWORD(wp) == kConfirmLeave) {
                 const bool closing = g_confirmClose;
                 ShowBackConfirm(false);
-                if (closing) g_quit = true;
+                if (closing) CloseOrHide();
                 else { ResetPairing(); LoadWidgetDraft(); }
                 return 0;
             }
@@ -2201,6 +2256,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             ShowBackConfirm(true, true);
             return 0;
         }
+        if (g_opt.pairPhone) { CloseOrHide(); return 0; }
 #endif
         g_quit = true; return 0;
     case WM_DESTROY:
@@ -2322,6 +2378,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         else if (a == L"--demo-pc-tour") { g_opt.pcPreview = true; g_opt.pcTour = true; }
         else if (a == L"--reduce-motion") g_opt.pcReduced = true;
         else if (a == L"--pair-phone") g_opt.pairPhone = true;
+        else if (a == L"--background") { g_opt.pairPhone = true; g_startHidden = true; }
         else if (a == L"--send-file") {
             g_opt.pairPhone = true;
             g_shellSendPath = next();
@@ -2371,6 +2428,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     if (g_opt.pairPhone) {
         singleInstance = CreateMutexW(nullptr, FALSE, kPhoneMutex);
         if (singleInstance && GetLastError() == ERROR_ALREADY_EXISTS) {
+            if (g_startHidden) { CloseHandle(singleInstance); return 0; }  // already waiting
             if (HWND window = FindWindowW(kPhoneWindow, nullptr)) {
                 ShowWindow(window, SW_RESTORE);
                 SetForegroundWindow(window);
@@ -2407,6 +2465,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (g_opt.settingsPath.empty()) g_opt.settingsPath = liquid::settings::DefaultPath();
 #endif
         const auto settings = liquid::settings::Load(g_opt.settingsPath).value;
+        g_background = settings.phoneBackground;
+        if (g_opt.demoSession.empty()) SyncAutostart(g_background);
+        if (g_startHidden && !g_background) { CloseHandle(singleInstance); return 0; }  // switched off since sign-in
         g_preferredRadius = settings.phoneBallRadius;
         g_receiveFolder = settings.phoneReceiveFolder;
         if (g_receiveFolder.empty()) g_receiveFolder = docky::pairing::DownloadFolder();
@@ -2468,7 +2529,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 #endif
     App app; g_app = &app;
     if (!app.Init()) { MessageBoxW(nullptr, L"Direct3D 11 is not available.", L"Optical Bubble", MB_ICONERROR); return 1; }
-    ShowWindow(g_wnd, SW_SHOW);
+    if (!g_startHidden) ShowWindow(g_wnd, SW_SHOW);
 #ifdef DOCKY_PHONE_PAIRING
     if (g_opt.pcPreview) CreatePcControls(g_wnd);
     if (g_opt.pairPhone) {
@@ -2499,7 +2560,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                 continue;
             }
 #endif
-            if (m.message == WM_QUIT || (panel && m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE)) {
+            if (m.message == WM_QUIT) { g_quit = true; break; }
+            if (panel && m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
+#ifdef DOCKY_PHONE_PAIRING
+                if (g_opt.pairPhone) { CloseOrHide(); continue; }
+#endif
                 g_quit = true;
                 break;
             }
@@ -2508,6 +2573,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             DispatchMessageW(&m);
         }
         if (g_quit) break;
+#ifdef DOCKY_PHONE_PAIRING
+        if (g_opt.pairPhone && !IsWindowVisible(g_wnd)) {  // hidden: no frames, just wait for messages (phone host, show)
+            MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            continue;
+        }
+#endif
         app.Frame();
         docky::vblank::WaitFrame();
     }

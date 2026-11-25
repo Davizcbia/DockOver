@@ -230,6 +230,10 @@ float4 ShadeBall(float2 px, float2 ballCenter, float ballRadius, bool drawBackdr
         if (t > tEnd) break;
     }
     const float px1 = 1.0 / ballRadius;                        // one pixel in ball units
+    // Grazing rays near the silhouette creep along the surface and can use up the steps a few hundredths of a pixel
+    // from it. Calling those misses swapped neighbouring pixels between refraction and the rim reflection, which showed
+    // as broken, segmented glow along the edge while the surface moved. Within a third of a pixel it is a hit.
+    if (!hit && t <= tEnd && sdf(p) < px1 * 0.35) hit = true;
     if (!hit) {
         // anti-aliased silhouette: a thin reflective rim fading out over about a pixel
         const float a = saturate(0.6 - (minD / 0.72) / px1);
@@ -247,24 +251,35 @@ float4 ShadeBall(float2 px, float2 ballCenter, float ballRadius, bool drawBackdr
     const float3 ior = float3(1.372, 1.384, 1.401);
     const float3 absorb = float3(0.20, 0.075, 0.02);           // per ball radius of path: a cool, clear blue
     float3 trans = 0; float3 qG = p; float tG = 0; float3 dG = rd;
-    [unroll] for (int ch = 0; ch < 3; ++ch) {
+    [loop] for (int ch = 0; ch < 3; ++ch) {  // a loop: unrolled, the three traces and blends are too much code
         const float3 d = refract(rd, n, 1.0 / ior[ch]);
         float3 q, nq;
         const float len = traceInside(p, d, q, nq);
-        float3 dOut = refract(d, -nq, ior[ch]);
-        float v;
-        if (dot(dOut, dOut) < 1e-6) {                            // total internal reflection: the inside of the rim
+        // The three ways out (reflected back inside, through to the background, out to the room) blend over a short
+        // range instead of switching: each colour reaches them at a slightly different angle (dispersion), and hard
+        // switches left red, green and blue segments along the rim.
+        const float cosOut = dot(d, nq);
+        const float k = 1 - ior[ch] * ior[ch] * (1 - cosOut * cosOut);  // < 0: total internal reflection
+        const float wOut = smoothstep(0.0, 0.10, k);               // 0: all reflected back inside
+        float v = 0;
+        [branch] if (wOut < 1) {
             const float3 r2 = reflect(d, -nq);
-            v = env(float3(r2.x, r2.y, -abs(r2.z)))[ch] * 0.55;
-        } else if (dOut.z > 0.03) {
-            const float s = (BZ - q.z) / dOut.z;
-            const float2 b = (q.xy + dOut.xy * s) * E / (E + BZ);
-            const float lod = saturate(1 - cosI) * 2.0;          // a little softer where the rays fan out
-            v = bgAt(ballCenter + b * ballRadius, lod)[ch];
-        } else {
-            v = env(dOut)[ch] * 0.8;
+            v = env(float3(r2.x, r2.y, -abs(r2.z)))[ch] * 0.55 * (1 - wOut);
         }
-        trans[ch] = v * exp(-absorb[ch] * len);
+        [branch] if (wOut > 0) {
+            const float3 dOut = refract(d, -nq, ior[ch]);
+            const float wBack = smoothstep(0.0, 0.06, dOut.z);         // 1: through to the background plane
+            float through = 0;
+            [branch] if (wBack < 1) through = env(dOut)[ch] * 0.8 * (1 - wBack);
+            [branch] if (wBack > 0) {
+                const float s = (BZ - q.z) / dOut.z;
+                const float2 b = (q.xy + dOut.xy * s) * E / (E + BZ);
+                const float lod = saturate(1 - cosI) * 2.0;      // a little softer where the rays fan out
+                through += bgAt(ballCenter + b * ballRadius, lod)[ch] * wBack;
+            }
+            v += through * wOut;
+        }
+        trans += float3(ch == 0, ch == 1, ch == 2) * (v * exp(-absorb[ch] * len));  // no indexed writes in a [loop]
         if (ch == 1) { qG = q; tG = len; dG = d; }
     }
     // caustics on the far inside (seen through the ball), warm-white light

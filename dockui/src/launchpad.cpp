@@ -26,6 +26,7 @@
 #include "app_registry.h"
 #include "backdrop.h"
 #include "backdrop_wgc.h"
+#include "color_output.h"
 #include "vblank.h"
 #include "design_tokens.h"
 #include "glass_params.h"
@@ -395,6 +396,9 @@ private:
     D2D1_RECT_F SlotRect(int slot) const;              // virtual coordinates (page 0 origin)
     D2D1_RECT_F FolderPanel() const;
     D2D1_RECT_F FolderSlotRect(int i) const;
+    D2D1_RECT_F FolderContent() const;  // the part of the panel the app grid scrolls in
+    float FolderScrollMax() const;
+    void ScrollFolder(float target);
     D2D1_RECT_F SearchRect() const;
     int SlotAt(float x, float y, bool* center) const;  // screen DIPs, current page
     int FolderSlotAt(float x, float y) const;
@@ -433,7 +437,9 @@ private:
     ComPtr<IDXGIDevice> dxgi_;
     ComPtr<IDXGISwapChain1> swap_;
     HANDLE waitable_ = nullptr;
-    ComPtr<ID3D11RenderTargetView> rtv_;
+    ComPtr<ID3D11RenderTargetView> rtv_, outputRtv_;
+    docky::color::ColorOutput colors_;  // FP16 scene, resolved to scRGB (HDR) or dithered BGRA8
+    bool floatingScene_ = false, scRgb_ = false;
     ComPtr<ID2D1Factory1> d2dFactory_;
     ComPtr<ID2D1PathGeometry> folderShape_;  // macOS icon outline (icon_mask.h), centred, half-size 1
     ID2D1Geometry* FolderShape();
@@ -509,6 +515,7 @@ private:
     int folder_ = -1;          // layout index of the open (or closing) folder
     bool folderOpen_ = false;
     float folderT_ = 0;
+    float folderScroll_ = 0, folderScrollTarget_ = 0;  // DIP the open folder's grid is scrolled down
     bool renaming_ = false;
     std::wstring renameText_;
     bool animating_ = true, needsFrame_ = true;
@@ -610,7 +617,17 @@ HRESULT Launchpad::InitGraphics() {
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    if (FAILED(hr = factory->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_))) return hr;
+    floatingScene_ = colors_.Init(d3d_.Get());
+    if (floatingScene_) {
+        sd.Format = docky::color::SceneFormat;
+        scRgb_ = SUCCEEDED(factory->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_)) &&
+                 docky::color::EnableScRgb(swap_.Get());
+    }
+    if (!scRgb_) {
+        swap_.Reset();
+        sd.Format = docky::color::SdrFormat;
+        if (FAILED(hr = factory->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_))) return hr;
+    }
     ComPtr<IDXGISwapChain2> sc2;
     if (SUCCEEDED(swap_.As(&sc2))) {
         sc2->SetMaximumFrameLatency(1);
@@ -622,14 +639,29 @@ HRESULT Launchpad::InitGraphics() {
         return hr;
     if (FAILED(hr = d2dFactory_->CreateDevice(dxgi_.Get(), &d2dDevice_))) return hr;
     if (FAILED(hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return hr;
-    ComPtr<IDXGISurface> surface;
-    if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&surface)))) return hr;
     const float dpi = 96.0f * scale_;
-    const auto tp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
-    if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surface.Get(), &tp, &target_))) return hr;
     ComPtr<ID3D11Texture2D> back;
     if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return hr;
+    if (floatingScene_ && colors_.Bind(dc_.Get(), pxW_, pxH_) &&
+        SUCCEEDED(d3d_->CreateRenderTargetView(back.Get(), nullptr, &outputRtv_))) {
+        // Scene (D2D and glass) in FP16; the final pass converts to scRGB or dithers to 8 bits.
+        target_ = colors_.Bitmap();
+        back = colors_.Texture();
+        if (dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+            D2D1_RENDERING_CONTROLS controls{};
+            dc_->GetRenderingControls(&controls);
+            controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+            dc_->SetRenderingControls(&controls);
+        }
+    } else {
+        if (scRgb_) return E_FAIL;  // an FP16 swap chain needs the scene pass
+        floatingScene_ = false;
+        ComPtr<IDXGISurface> surface;
+        if (FAILED(hr = back.As(&surface))) return hr;
+        const auto tp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+        if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surface.Get(), &tp, &target_))) return hr;
+    }
     if (FAILED(hr = d3d_->CreateRenderTargetView(back.Get(), nullptr, &rtv_))) return hr;
     dc_->SetTarget(target_.Get());
     dc_->SetDpi(dpi, dpi);
@@ -679,7 +711,9 @@ HRESULT Launchpad::BuildBackground() {
     td.Height = pxH_;
     td.MipLevels = 1;
     td.ArraySize = 1;
-    td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    // FP16 with the floating scene: the heavily blurred, darkened desktop is a wide smooth gradient that bands in 8 bits.
+    const DXGI_FORMAT bgFormat = floatingScene_ ? docky::color::SceneFormat : DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.Format = bgFormat;
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -688,7 +722,7 @@ HRESULT Launchpad::BuildBackground() {
     ComPtr<IDXGISurface> surf;
     bgTex_.As(&surf);
     const auto bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET,
-                                            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96);
+                                            D2D1::PixelFormat(bgFormat, D2D1_ALPHA_MODE_PREMULTIPLIED), 96, 96);
     if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surf.Get(), &bp, &bgBmp_))) return hr;
     ComPtr<ID2D1Bitmap1> src;
     const auto sp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
@@ -803,12 +837,40 @@ D2D1_RECT_F Launchpad::SearchRect() const {
     return D2D1::RectF((W_ - w) * 0.5f, y, (W_ + w) * 0.5f, y + h);
 }
 
+// The panel is centred with equal space above and below; a folder taller than the screen allows keeps that margin and
+// scrolls its grid inside (wheel, touchpad, or holding a dragged icon near the top or bottom edge).
+namespace {
+constexpr float kFolderHead = 76.0f, kFolderFoot = 28.0f;
+}
 D2D1_RECT_F Launchpad::FolderPanel() const {
     const int n = (folder_ >= 0 && folder_ < static_cast<int>(layout_.nodes.size())) ? static_cast<int>(layout_.nodes[folder_].apps.size()) : 0;
-    const int cols = std::clamp(n, 3, 5), rows = std::clamp((n + cols - 1) / cols, 1, 5);
-    const float w = cols * cellW_ * 0.92f + 56.0f, h = 76.0f + rows * cellH_ * 0.92f + 28.0f;
-    const float x = (W_ - w) * 0.5f, y = std::max(H_ * 0.12f, (H_ - h) * 0.5f - 30.0f);
+    const int cols = std::clamp(n, 3, 5), rows = (std::max)(1, (n + cols - 1) / cols);
+    const float ch = cellH_ * 0.92f, margin = (std::max)(40.0f, H_ * 0.08f);
+    const float w = cols * cellW_ * 0.92f + 56.0f;
+    const float fit = (std::max)(ch, std::floor((H_ - 2.0f * margin - kFolderHead - kFolderFoot) / ch) * ch);  // whole rows
+    const float h = kFolderHead + (std::min)(rows * ch, fit) + kFolderFoot;
+    const float x = (W_ - w) * 0.5f, y = (H_ - h) * 0.5f;
     return D2D1::RectF(x, y, x + w, y + h);
+}
+
+D2D1_RECT_F Launchpad::FolderContent() const {
+    const D2D1_RECT_F p = FolderPanel();
+    return D2D1::RectF(p.left, p.top + kFolderHead - 8.0f, p.right, p.bottom - kFolderFoot + 20.0f);
+}
+
+float Launchpad::FolderScrollMax() const {
+    if (folder_ < 0 || folder_ >= static_cast<int>(layout_.nodes.size())) return 0;
+    const int n = static_cast<int>(layout_.nodes[folder_].apps.size());
+    const int cols = std::clamp(n, 3, 5), rows = (std::max)(1, (n + cols - 1) / cols);
+    const D2D1_RECT_F p = FolderPanel();
+    return (std::max)(0.0f, rows * cellH_ * 0.92f - (p.bottom - p.top - kFolderHead - kFolderFoot));
+}
+
+void Launchpad::ScrollFolder(float target) {
+    folderScrollTarget_ = std::clamp(target, 0.0f, FolderScrollMax());
+    if (reducedMotion_) folderScroll_ = folderScrollTarget_;
+    animating_ = true;
+    needsFrame_ = true;
 }
 
 D2D1_RECT_F Launchpad::FolderSlotRect(int i) const {
@@ -817,7 +879,7 @@ D2D1_RECT_F Launchpad::FolderSlotRect(int i) const {
     const int cols = std::clamp(n, 3, 5);
     const float cw = cellW_ * 0.92f, ch = cellH_ * 0.92f, ic = icon_ * 0.92f;
     const float x = p.left + 28.0f + (i % cols) * cw + (cw - ic) * 0.5f;
-    const float y = p.top + 76.0f + (i / cols) * ch + (ch - ic - labelH_ - 8.0f) * 0.5f;
+    const float y = p.top + kFolderHead + (i / cols) * ch + (ch - ic - labelH_ - 8.0f) * 0.5f - folderScroll_;
     return D2D1::RectF(x, y, x + ic, y + ic);
 }
 
@@ -848,8 +910,10 @@ int Launchpad::ItemAt(float x, float y) const {
 
 int Launchpad::FolderSlotAt(float x, float y) const {
     if (folder_ < 0) return -1;
+    const D2D1_RECT_F view = FolderContent();
+    if (y < view.top || y > view.bottom) return -1;  // scrolled out of the panel
     const int n = static_cast<int>(layout_.nodes[folder_].apps.size());
-    for (int i = 0; i < n && i < 25; ++i) {
+    for (int i = 0; i < n; ++i) {
         const D2D1_RECT_F r = FolderSlotRect(i);
         if (x >= r.left - 12 && x <= r.right + 12 && y >= r.top - 8 && y <= r.bottom + labelH_ + 8) return i;
     }
@@ -1104,6 +1168,7 @@ void Launchpad::OpenFolder(int node) {
     if (node < 0 || node >= static_cast<int>(layout_.nodes.size()) || !layout_.nodes[node].folder) return;
     folder_ = node;
     folderOpen_ = true;
+    folderScroll_ = folderScrollTarget_ = 0;
     renaming_ = false;
     animating_ = true;
     RequestVisibleIcons();
@@ -1295,6 +1360,21 @@ bool Launchpad::Tick(double dt) {
     folderT_ = folderSpring_.AtRest() ? (folderOpen_ ? 1.0f : 0.0f) : std::clamp(folderSpring_.F(), 0.0f, 1.04f);
     moving |= folderT_ != (folderOpen_ ? 1.0f : 0.0f);
     if (!folderOpen_ && folderT_ == 0.0f && !dragFromFolder_) folder_ = -1;
+    if (folder_ >= 0) {
+        if (dragActive_ && dragFromFolder_) {  // a dragged icon held near the grid's top or bottom edge scrolls it
+            const D2D1_RECT_F view = FolderContent();
+            const float edge = 36.0f;
+            if (mx_ >= view.left && mx_ <= view.right) {
+                if (my_ < view.top + edge && my_ > view.top - 60.0f) ScrollFolder(folderScrollTarget_ - 600.0f * static_cast<float>(dt));
+                else if (my_ > view.bottom - edge && my_ < view.bottom + 60.0f) ScrollFolder(folderScrollTarget_ + 600.0f * static_cast<float>(dt));
+            }
+        }
+        folderScrollTarget_ = std::clamp(folderScrollTarget_, 0.0f, FolderScrollMax());
+        const float k = 1.0f - std::exp(-static_cast<float>(dt) * 18.0f);  // ~120 ms ease towards the wheel target
+        folderScroll_ += (folderScrollTarget_ - folderScroll_) * k;
+        if (std::fabs(folderScrollTarget_ - folderScroll_) < 0.25f) folderScroll_ = folderScrollTarget_;
+        moving |= folderScroll_ != folderScrollTarget_;
+    }
     for (int i = 0; i < static_cast<int>(items_.size()); ++i) {
         auto& p = pos_[items_[i].key];
         const D2D1_RECT_F r = SlotRect(i);
@@ -1526,12 +1606,17 @@ void Launchpad::DrawFolderContents(float alpha) {
         dc_->DrawLine(D2D1::Point2F(p.left + 60, p.top + 60), D2D1::Point2F(p.right - 60, p.top + 60), brush_.Get(), 1.0f);
     }
     const auto& apps = layout_.nodes[folder_].apps;
-    for (int i = 0; i < static_cast<int>(apps.size()) && i < 25; ++i) {
+    const D2D1_RECT_F view = FolderContent();
+    const bool scrolls = FolderScrollMax() > 0.0f;
+    if (scrolls) dc_->PushAxisAlignedClip(view, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+    for (int i = 0; i < static_cast<int>(apps.size()); ++i) {
         if (dragActive_ && dragFromFolder_ && apps[i] == dragKey_) continue;
         const D2D1_RECT_F r = FolderSlotRect(i);
+        if (r.bottom + labelH_ + 8.0f < view.top || r.top > view.bottom) continue;
         DrawAppIcon(apps[i], r, alpha);
         DrawLabel(apps[i], NameOf(apps[i]), r, alpha,true);
     }
+    if (scrolls) dc_->PopAxisAlignedClip();
 }
 
 void Launchpad::Render() {
@@ -1607,7 +1692,8 @@ void Launchpad::Render() {
     // (120 fps on a 240 Hz display, measured 2026-11-12).
     if(!visualSnapshotPath.empty()&&!visualSaved_&&Now()-openedAt_>.7&&a>.98f){
         visualSaved_=true;ComPtr<ID3D11Texture2D> source,staging;
-        if(SUCCEEDED(swap_->GetBuffer(0,IID_PPV_ARGS(&source)))){D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;desc.MiscFlags=0;
+        if(floatingScene_)source=colors_.SdrSnapshot();else swap_->GetBuffer(0,IID_PPV_ARGS(&source));
+        if(source){D3D11_TEXTURE2D_DESC desc{};source->GetDesc(&desc);desc.Usage=D3D11_USAGE_STAGING;desc.BindFlags=0;desc.CPUAccessFlags=D3D11_CPU_ACCESS_READ;desc.MiscFlags=0;
          if(SUCCEEDED(d3d_->CreateTexture2D(&desc,nullptr,&staging))){ctx_->CopyResource(staging.Get(),source.Get());D3D11_MAPPED_SUBRESOURCE map{};
           if(SUCCEEDED(ctx_->Map(staging.Get(),0,D3D11_MAP_READ,0,&map))){HANDLE file=CreateFileW(visualSnapshotPath.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
            if(file!=INVALID_HANDLE_VALUE){BITMAPFILEHEADER header{};BITMAPINFOHEADER info{};header.bfType=0x4D42;header.bfOffBits=sizeof(header)+sizeof(info);header.bfSize=header.bfOffBits+desc.Width*desc.Height*4;info.biSize=sizeof(info);info.biWidth=desc.Width;info.biHeight=-static_cast<LONG>(desc.Height);info.biPlanes=1;info.biBitCount=32;info.biCompression=BI_RGB;DWORD written=0;WriteFile(file,&header,sizeof(header),&written,nullptr);WriteFile(file,&info,sizeof(info),&written,nullptr);for(UINT y=0;y<desc.Height;++y)WriteFile(file,static_cast<const BYTE*>(map.pData)+y*map.RowPitch,desc.Width*4,&written,nullptr);CloseHandle(file);DLOG(L"launchpad: isolated visual snapshot saved");}
@@ -1616,6 +1702,7 @@ void Launchpad::Render() {
          }
         }
     }
+    if (floatingScene_ && !colors_.Resolve(outputRtv_.Get(), scRgb_ ? colors_.WhiteForWindow(hwnd) : 0.f)) return;
     swap_->Present(0, 0);
     lap(5);
 }
@@ -1769,6 +1856,10 @@ LRESULT Launchpad::Handle(UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEWHEEL:
     case WM_MOUSEHWHEEL: {
+        if (folderOpen_ && m == WM_MOUSEWHEEL) {  // one notch = one row; touchpads send finer steps
+            ScrollFolder(folderScrollTarget_ - static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA * cellH_ * 0.92f);
+            return 0;
+        }
         if (folderOpen_ || dragActive_) return 0;
         const float delta = static_cast<float>(GET_WHEEL_DELTA_WPARAM(w)) * (m == WM_MOUSEWHEEL ? -1.0f : 1.0f);
         wheelAcc_ += delta;

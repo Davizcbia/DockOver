@@ -64,6 +64,7 @@ struct Settings {
     int phoneBallRadius = kPhoneBallDefault;  // preferred radius in DIP before monitor limits
     std::wstring phoneReceiveFolder;  // empty uses Downloads
     bool pcReceiveBubble = true;
+    bool phoneBackground = true;  // DockDrop keeps waiting for remembered phones after its window is closed
 };
 enum class LoadStatus { Loaded, Missing, Invalid, Unavailable };
 struct Result { Settings value; LoadStatus status = LoadStatus::Missing; };

@@ -48,6 +48,8 @@ Result Load(const std::wstring& path) {
         }
         if (const auto* bubble = phone->Find("pcReceiveBubble"); bubble && bubble->type == dock::json::Value::Type::Bool)
             r.value.pcReceiveBubble = bubble->boolean;
+        if (const auto* background = phone->Find("runInBackground"); background && background->type == dock::json::Value::Type::Bool)
+            r.value.phoneBackground = background->boolean;
     }
     if(const auto* section=root.Find("dock")) if(const auto* diag=section->Find("diagnostics")){
         if(diag->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;return r;}

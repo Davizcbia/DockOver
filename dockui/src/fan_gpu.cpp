@@ -5,6 +5,7 @@
 #include "fan_gpu.h"
 
 #include <d3d11.h>
+#include <DirectXPackedVector.h>
 #include <dcomp.h>
 #include <dwrite.h>
 #include <dxgi1_3.h>
@@ -19,6 +20,7 @@
 #include <vector>
 
 #include "backdrop_wgc.h"
+#include "color_output.h"
 #include "design_tokens.h"
 #include "glass_params.h"
 #include "log.h"
@@ -82,30 +84,51 @@ public:
         DXGI_SWAP_CHAIN_DESC1 sd{};
         sd.Width = w_;
         sd.Height = h_;
-        sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
         sd.SampleDesc.Count = 1;
         sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
         sd.BufferCount = 2;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        if (FAILED(f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_))) return false;
+        floatingScene_ = colors_.Init(d3d_.Get());
+        if (floatingScene_) {
+            sd.Format = docky::color::SceneFormat;
+            scRgb_ = SUCCEEDED(f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_)) && docky::color::EnableScRgb(swap_.Get());
+        }
+        if (!scRgb_) {
+            swap_.Reset();
+            sd.Format = docky::color::SdrFormat;
+            if (FAILED(f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_))) return false;
+        }
         D2D1_FACTORY_OPTIONS fo{};
         if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &fo,
                                      reinterpret_cast<void**>(factory_.GetAddressOf()))))
             return false;
         if (FAILED(factory_->CreateDevice(dxgi.Get(), &d2dDevice_))) return false;
         if (FAILED(d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return false;
-        ComPtr<IDXGISurface> surface;
-        if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&surface)))) return false;
         const float dpi = 96.0f * scale_;
-        const auto bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
-        if (FAILED(dc_->CreateBitmapFromDxgiSurface(surface.Get(), &bp, &target_))) return false;
+        ComPtr<ID3D11Texture2D> back;
+        if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return false;
+        if (floatingScene_ && colors_.Bind(dc_.Get(), w_, h_) && SUCCEEDED(d3d_->CreateRenderTargetView(back.Get(), nullptr, &outputRtv_))) {
+            target_ = colors_.Bitmap();  // glass and text in FP16; EndFrame resolves to scRGB or dithered 8 bits
+            back = colors_.Texture();
+            if (dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+                D2D1_RENDERING_CONTROLS controls{};
+                dc_->GetRenderingControls(&controls);
+                controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+                dc_->SetRenderingControls(&controls);
+            }
+        } else {
+            if (scRgb_) return false;
+            floatingScene_ = false;
+            ComPtr<IDXGISurface> surface;
+            if (FAILED(back.As(&surface))) return false;
+            const auto bp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                                                    D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+            if (FAILED(dc_->CreateBitmapFromDxgiSurface(surface.Get(), &bp, &target_))) return false;
+        }
         dc_->SetTarget(target_.Get());
         dc_->SetDpi(dpi, dpi);
         dc_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-        ComPtr<ID3D11Texture2D> back;
-        swap_->GetBuffer(0, IID_PPV_ARGS(&back));
         if (FAILED(d3d_->CreateRenderTargetView(back.Get(), nullptr, &rtv_))) return false;
         back_ = back;
         D3D11_TEXTURE2D_DESC sdsc{};
@@ -259,6 +282,7 @@ public:
         if (drawing_) { dc_->EndDraw(); drawing_ = false; }
         if (anyGlass_) ++framesWithGlass_;
         if (!snapshotPath_.empty()) WriteSnapshot();
+        if (floatingScene_ && !colors_.Resolve(outputRtv_.Get(), scRgb_ ? colors_.WhiteForWindow(hwnd_) : 0.f)) return;
         swap_->Present(0, 0);  // paced by the panel's DwmFlush ticker; never blocks here
         if (frameNo_ % 240 == 0)
             for (auto it = contrast_.begin(); it != contrast_.end();) if (frameNo_ - it->second.seen > 480) it = contrast_.erase(it); else ++it;
@@ -283,7 +307,8 @@ private:
         const std::wstring path = snapshotPath_;
         snapshotPath_.clear();
         ComPtr<ID3D11Texture2D> back, staging;
-        swap_->GetBuffer(0, IID_PPV_ARGS(&back));
+        if (floatingScene_) back = colors_.SdrSnapshot(); else swap_->GetBuffer(0, IID_PPV_ARGS(&back));
+        if (!back) return;
         D3D11_TEXTURE2D_DESC d{};
         back->GetDesc(&d);
         d.Usage = D3D11_USAGE_STAGING;
@@ -336,11 +361,21 @@ private:
             for (const auto& it : sl.items) {
                 double sum = 0; int cnt = 0;
                 for (UINT y = it.box.top; y < it.box.bottom; y += 2) {
-                    const auto* row = reinterpret_cast<const uint32_t*>(static_cast<const BYTE*>(m.pData) + y * m.RowPitch);
+                    const BYTE* line = static_cast<const BYTE*>(m.pData) + y * m.RowPitch;
                     for (UINT x = it.box.left; x < it.box.right; x += 2) {
-                        const uint32_t px = row[x]; const float a = (px >> 24) / 255.f;
-                        if (a < 0.9f) continue;  // only fully covered glass
-                        const float b = (px & 255) / 255.f / a, g = ((px >> 8) & 255) / 255.f / a, r = ((px >> 16) & 255) / 255.f / a;
+                        float r, g, b, a;
+                        if (floatingScene_) {  // FP16 scene: R, G, B, A halves, premultiplied sRGB-encoded
+                            const auto* h = reinterpret_cast<const DirectX::PackedVector::HALF*>(line) + x * 4;
+                            a = DirectX::PackedVector::XMConvertHalfToFloat(h[3]);
+                            if (a < 0.9f) continue;
+                            r = std::clamp(DirectX::PackedVector::XMConvertHalfToFloat(h[0]) / a, 0.f, 1.f);
+                            g = std::clamp(DirectX::PackedVector::XMConvertHalfToFloat(h[1]) / a, 0.f, 1.f);
+                            b = std::clamp(DirectX::PackedVector::XMConvertHalfToFloat(h[2]) / a, 0.f, 1.f);
+                        } else {
+                            const uint32_t px = reinterpret_cast<const uint32_t*>(line)[x]; a = (px >> 24) / 255.f;
+                            if (a < 0.9f) continue;  // only fully covered glass
+                            b = (px & 255) / 255.f / a; g = ((px >> 8) & 255) / 255.f / a; r = ((px >> 16) & 255) / 255.f / a;
+                        }
                         sum += 0.2126f * lut_[std::min(255, static_cast<int>(r * 255.f + 0.5f))] + 0.7152f * lut_[std::min(255, static_cast<int>(g * 255.f + 0.5f))] +
                                0.0722f * lut_[std::min(255, static_cast<int>(b * 255.f + 0.5f))];
                         ++cnt;
@@ -388,7 +423,9 @@ private:
     ComPtr<ID3D11Device> d3d_;
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<IDXGISwapChain1> swap_;
-    ComPtr<ID3D11RenderTargetView> rtv_;
+    ComPtr<ID3D11RenderTargetView> rtv_, outputRtv_;
+    docky::color::ColorOutput colors_;
+    bool floatingScene_ = false, scRgb_ = false;
     ComPtr<ID2D1Factory1> factory_;
     ComPtr<ID2D1Device> d2dDevice_;
     ComPtr<ID2D1DeviceContext> dc_;

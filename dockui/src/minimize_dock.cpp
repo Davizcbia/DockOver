@@ -99,6 +99,32 @@ bool Show(HTHUMBNAIL t, const RECT& dest, const RECT* source, BYTE opacity, bool
 
 RECT FitTile(const Entry& e) { return gpu::FitTile(e.tileRect, e.source); }
 
+// The overlay covers the whole monitor only while a Genie plays. Otherwise it is only as large as the Dock's window
+// (where the tiles are): a monitor-sized always-on-top window, even click-through, is what the Snipping Tool's window
+// mode finds under the pointer everywhere, so it could only capture the full screen while the Dock ran.
+RECT IdleOverlayRect() {
+    RECT r{};
+    if (g_dock && GetWindowRect(g_dock, &r) && !Empty(r)) return r;
+    MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(g_dock ? g_dock : g_overlay, MONITOR_DEFAULTTOPRIMARY), &mi);
+    return RECT{mi.rcMonitor.right - 1, mi.rcMonitor.bottom - 1, mi.rcMonitor.right, mi.rcMonitor.bottom};
+}
+void FitOverlay(bool full) {
+    if (!g_overlay) return;
+    RECT want{};
+    if (full) {
+        MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(g_dock ? g_dock : g_overlay, MONITOR_DEFAULTTOPRIMARY), &mi);
+        want = mi.rcMonitor;
+    } else {
+        for (auto& [w, e] : g_entries) if (e.direction && !e.gpu) return;  // thumbnail-band Genie still playing
+        want = IdleOverlayRect();
+    }
+    if (EqualRect(&want, &g_overlayRect)) return;
+    g_overlayRect = want;
+    SetWindowPos(g_overlay, nullptr, want.left, want.top, want.right - want.left, want.bottom - want.top, SWP_NOZORDER | SWP_NOACTIVATE);
+    // Thumbnail destinations are relative to the overlay: put the resting tiles back where they were on screen.
+    for (auto& [w, e] : g_entries) if (!e.direction && e.thumbnailVisible) Show(e.tile, FitTile(e), nullptr, 255, true);
+}
+
 // Fallback Genie (no GPU capture): horizontal bands of the window, each a DWM thumbnail placed along the funnel.
 void Genie(Entry& e, double t) {
     const RECT from = e.normal, to = FitTile(e);
@@ -134,14 +160,15 @@ void Finish(HWND w) {
     auto it = g_entries.find(w); if (it == g_entries.end()) return;
     Entry& e = it->second; DropBands(e);
     const int direction = e.direction; e.direction = 0; e.gpu = false;
-    if (direction > 0) { e.thumbnailVisible=Show(e.tile, FitTile(e), nullptr, 255, true); Raise(); return; }
+    if (direction > 0) { e.thumbnailVisible=Show(e.tile, FitTile(e), nullptr, 255, true); Raise(); FitOverlay(false); return; }
     ShowWindow(w, SW_RESTORE); SetForegroundWindow(w);
     DLOG(L"minimize: restored from the Dock");
     Remove(w, true);
+    FitOverlay(false);
 }
 
 // Starts a Genie: on the GPU when possible (genie_gpu reports back with kGpuDone), else with thumbnail bands.
-bool Begin(Entry& e, int direction) {
+bool Begin(Entry& e, int direction) {  // the GPU Genie draws in its own window (genie_gpu)
     e.direction = direction; e.gpu = true;
     Show(e.tile, e.tileRect, nullptr, 0, false);
     gpu::SetTile(e.window, e.tileRect);
@@ -149,6 +176,7 @@ bool Begin(Entry& e, int direction) {
     return true;
 }
 bool BeginBands(Entry& e) {
+    FitOverlay(true);
     e.gpu = false;
     if (!StartBands(e)) return false;
     Raise(); Genie(e, e.direction > 0 ? 0.0 : 1.0);
@@ -236,6 +264,7 @@ void Add(HWND w, bool animate) {
     wchar_t cls[64]{}; GetClassNameW(w, cls, 64);
     DLOG(L"minimize: window to the Dock class=%ls genie=%d%ls", cls, e.pendingGenie ? 1 : 0, animate ? L"" : L" (already minimized at start)");
     if (g_changed) g_changed(w, true);
+    FitOverlay(false);
 }
 
 void CALLBACK OnEvent(HWINEVENTHOOK, DWORD event, HWND w, LONG object, LONG child, DWORD, DWORD) {
@@ -254,8 +283,7 @@ bool Init(HWND dock, std::function<void(HWND, bool)> changed) {
     g_dock = dock; g_changed = std::move(changed);
     WNDCLASSW wc{}; wc.lpfnWndProc = OverlayProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = kClass;
     RegisterClassW(&wc);
-    MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(dock, MONITOR_DEFAULTTOPRIMARY), &mi);
-    g_overlayRect = mi.rcMonitor;
+    g_overlayRect = IdleOverlayRect();
     g_overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kClass, L"", WS_POPUP,
                                 g_overlayRect.left, g_overlayRect.top, g_overlayRect.right - g_overlayRect.left, g_overlayRect.bottom - g_overlayRect.top,
                                 nullptr, nullptr, wc.hInstance, nullptr);
@@ -299,6 +327,7 @@ void SetTileRect(HWND window, const RECT& screen) {
         e.thumbnailVisible=e.source.cx>0&&e.source.cy>0&&!Empty(screen)&&Show(e.tile,FitTile(e),nullptr,255,true);
         if(e.thumbnailVisible)Raise();
     }
+    FitOverlay(false);  // follows the Dock window when it is laid out again
 }
 
 bool SuppressFallbackTile(HWND window){

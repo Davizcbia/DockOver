@@ -355,6 +355,7 @@ inline const wchar_t* Text(const wchar_t* source) {
         {L"Refresh", L"刷新"},
         {L"Refresh network list", L"刷新网络列表"},
         {L"Reload (F3)", L"重新加载（F3）"},
+        {L"Remove", L"移除"},
         {L"Remove Divider", L"移除分隔线"},
         {L"Remove Separator", L"移除分隔符"},
         {L"Remove Widget", L"移除小组件"},

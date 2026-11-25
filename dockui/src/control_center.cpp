@@ -1213,18 +1213,22 @@ void Panel::DrawBattery(D2D1_POINT_2F c,float alpha){
     }
     if(batteryBitmap_)dc_->DrawBitmap(batteryBitmap_.Get(),D2D1::RectF(c.x-19,c.y-19,c.x+19,c.y+19),alpha,D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC);
 }
+// One accent for every selected / connected / on state in these popups: the macOS dark-appearance system blue #0A84FF.
+// (The pale #678EF6 circles and #607DF7 switch track read whitish next to it, and the sound glyph used a third blue.)
+static D2D1::ColorF Accent(float a = 1.0f) { return D2D1::ColorF(0x0A / 255.f, 0x84 / 255.f, 1.0f, a); }
+
 void Panel::ToggleCircle(D2D1_POINT_2F c, wchar_t g, bool on, bool enabled, float a, float r) {
     // macOS: active = white disc with tinted glyph; inactive = translucent disc with white glyph.
     brush_->SetColor(on ? D2D1::ColorF(1, 1, 1, 0.97f * a) : (forceOpaque_?Ink((enabled ? 0.20f : 0.10f) * a):D2D1::ColorF(1, 1, 1, (enabled ? 0.20f : 0.10f) * a)));
     dc_->FillEllipse(D2D1::Ellipse(c, r, r), brush_.Get());
-    const auto color=on?D2D1::ColorF(0.04f,0.47f,1.f):(forceOpaque_?Ink():D2D1::ColorF(1,1,1));
+    const auto color=on?Accent():(forceOpaque_?Ink():D2D1::ColorF(1,1,1));
     if(g==0xE701){const char* key=!st_.wifiAdapter||st_.wifiRadio==ctl::Radio::Unavailable?"wifi.unavailable":st_.wifiConnected?"wifi.connected":"wifi.disconnected";DrawWifi(c,r*.9f,key,color,a*(enabled?1.f:.45f));}
     else if(g==0xE702)DrawBluetooth(c,r*.9f,color,a*(enabled?1.f:.45f));
     else Glyph(g,r*.9f,c,a*(enabled?1.f:.45f),color,true);
 }
 
 void Panel::DetailCircle(D2D1_POINT_2F c,wchar_t g,bool active,float a){
-    const unsigned bg=contrastMode_?palette_.accent:0x007AFF,fg=contrastMode_?palette_.onAccent:0xFFFFFF;
+    const unsigned bg=contrastMode_?palette_.accent:0x0A84FF,fg=contrastMode_?palette_.onAccent:0xFFFFFF;
     brush_->SetColor(active?D2D1::ColorF(((bg>>16)&255)/255.f,((bg>>8)&255)/255.f,(bg&255)/255.f,a):Ink(0.17f*a));
     dc_->FillEllipse(D2D1::Ellipse(c,13,13),brush_.Get());
     const auto color=active?D2D1::ColorF(((fg>>16)&255)/255.f,((fg>>8)&255)/255.f,(fg&255)/255.f,1.f):Ink(0.72f);
@@ -1275,7 +1279,8 @@ void Panel::Switch(D2D1_RECT_F r, bool /*on*/, bool enabled, float a) {
     // Solid track: off grey -> macOS 27 menu blue #607DF7 (measured) on, cross-faded by the colour spring.
     const float c = static_cast<float>(std::clamp(switchColor_.Value(), 0.0, 1.0)), ea = (enabled ? 1.0f : 0.5f) * a;
     const float rad = (r.bottom - r.top) * 0.5f, off = forceOpaque_ ? 0.855f : 0.27f;
-    brush_->SetColor(D2D1::ColorF(off + (0.376f - off) * c, off + (0.490f - off) * c, off + (0.969f - off) * c, ea));
+    const auto on = Accent();
+    brush_->SetColor(D2D1::ColorF(off + (on.r - off) * c, off + (on.g - off) * c, off + (on.b - off) * c, ea));
     dc_->FillRoundedRectangle(D2D1::RoundedRect(r, rad, rad), brush_.Get());
     brush_->SetColor(D2D1::ColorF(0, 0, 0, 0.08f * ea));  // the slightly darker rim of the reference track
     dc_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(r.left + 0.5f, r.top + 0.5f, r.right - 0.5f, r.bottom - 0.5f), rad - 0.5f, rad - 0.5f), brush_.Get(), 1.0f);
@@ -1502,7 +1507,7 @@ void Panel::Render() {
             if(!soundOnly_){brush_->SetColor(st_.muted ? Ink( 0.95f * a) : Ink( (hovered(Hit::Mute) ? 0.28f : 0.18f) * a));dc_->FillEllipse(D2D1::Ellipse(mc, 16, 16), brush_.Get());}
             const auto maxSound=statusIcons_.find("sound.high");
             if(soundOnly_&&maxSound!=statusIcons_.end())DrawMask(maxSound->second,mc,14.f,Ink(.7f),a);
-            else DrawSound(mc,14.f,soundOnly_?Ink(0.7f):st_.muted?D2D1::ColorF(0.04f,0.47f,1.f):(forceOpaque_?Ink():D2D1::ColorF(1,1,1)),a);
+            else DrawSound(mc,14.f,soundOnly_?Ink(0.7f):st_.muted?Accent():(forceOpaque_?Ink():D2D1::ColorF(1,1,1)),a);
         } else {
             Text(L"No audio output", sub_.Get(), D2D1::RectF(sound_.r.left + 16, sound_.r.top + 34, sound_.r.right - 16, sound_.r.top + 54), a,
                  Ink( 0.6f));
@@ -1533,7 +1538,10 @@ void Panel::Render() {
                 }
                 const auto center = D2D1::Point2F(r.left + 18, (r.top + r.bottom) * .5f);
                 const float opacity = device.hidden ? a * .55f : a;
-                auto color = device.selected ? D2D1::ColorF(.04f, .47f, 1.f) : Ink();
+                // Selected output: blue disc, white glyph; the others a faint disc, like the Wi-Fi and Bluetooth rows.
+                brush_->SetColor(device.selected ? Accent(opacity) : Ink(0.10f * opacity));
+                dc_->FillEllipse(D2D1::Ellipse(center, 13, 13), brush_.Get());
+                auto color = device.selected ? D2D1::ColorF(1, 1, 1) : Ink(0.72f);
                 auto shape = docky::audio_output::FindShape(device.icon);
                 if (shape == docky::audio_output::Shape::None) {
                     std::wstring lower = device.name;
@@ -1604,8 +1612,8 @@ void Panel::Render() {
             }
             if (hover_ == Hit::Row && hoverRow_ == static_cast<int>(i)) hoverFill(r);
             const bool active = wifi ? st_.networks[item].connected : st_.btPaired[item].connected;
-            // Circle: connected = blue #678EF6 with a white glyph; otherwise a faint disc with a grey glyph.
-            brush_->SetColor(active ? D2D1::ColorF(0.404f, 0.557f, 0.965f, a) : Ink(0.10f * a));
+            // Circle: connected = system blue with a white glyph; otherwise a faint disc with a grey glyph.
+            brush_->SetColor(active ? Accent(a) : Ink(0.10f * a));
             dc_->FillEllipse(D2D1::Ellipse(circle, 13, 13), brush_.Get());
             const auto glyph = active ? D2D1::ColorF(1, 1, 1, 1) : Ink(0.58f);
             if (wifi) {

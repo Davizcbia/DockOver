@@ -52,6 +52,9 @@ inline const wchar_t* Ui(const wchar_t* source) {
         {L"接收设置", L"设置", L"Settings"},
         {L"电脑传输使用水球弹窗", L"電腦傳輸使用水球彈窗", L"Water-ball popup for PC transfers"},
         {L"关闭后使用通知中心样式", L"關閉後使用通知中心樣式", L"Off uses the Notification Center style"},
+        {L"在后台运行", L"在背景執行", L"Run in the background"},
+        {L"关闭窗口后，已配对的手机仍可发送，水球会自动弹出", L"關閉視窗後，已配對的手機仍可傳送，水球會自動彈出",
+         L"Remembered phones can still send after closing"},
         {L"已开启", L"已開啟", L"On"},
         {L"已关闭", L"已關閉", L"Off"},
         {L"无法保存设置。", L"無法儲存設定。", L"Could not save this setting."},
@@ -101,7 +104,11 @@ inline const wchar_t* Ui(const wchar_t* source) {
     for (const auto& label : labels) {
         if (std::wcscmp(source, label.key)) continue;
         if (PRIMARYLANGID(language) != LANG_CHINESE) return label.en;
-        if (SUBLANGID(language) == SUBLANG_CHINESE_SIMPLIFIED || SUBLANGID(language) == SUBLANG_CHINESE_SINGAPORE) return label.zh;
+        // Rows are {Simplified (the key), Traditional, English}. Many rows repeat the Simplified text in the second
+        // column; those are converted to Traditional here. Rows with a hand-written Traditional text keep its wording
+        // (資料夾, 傳輸...). Returning the second column for Simplified showed those rows in Traditional.
+        if (SUBLANGID(language) == SUBLANG_CHINESE_SIMPLIFIED || SUBLANGID(language) == SUBLANG_CHINESE_SINGAPORE) return label.key;
+        if (std::wcscmp(label.zh, label.key)) return label.zh;
         static std::map<std::wstring, std::wstring> traditional;
         auto& text = traditional[label.zh];
         if (text.empty()) {

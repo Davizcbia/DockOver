@@ -37,6 +37,8 @@ static volatile const char liquidBuildMarker[] = LIQUID_BUILD_MARKER;
 #include "log.h"
 #include "renderer.h"
 #include "shell_items.h"
+#include "window_preview.h"
+#include "drag_ghost.h"
 #include "custom_icons.h"
 #include "workshop.h"
 #include "icon_editor.h"
@@ -301,6 +303,8 @@ private:
     void OnLButtonUp(float x, float y);
     void UpdateDragTarget(float x, float y);
     void FinishDrag(bool commit);
+    bool UpdateDragGhost();                                    // true while the dragged icon is drawn by dragGhost_
+    std::vector<uint32_t> DockIconPixels(size_t index, UINT& w, UINT& h);  // CPU copy of the icon as the Dock shows it
     void OnRButtonUp(float x, float y);
     void UpdateDockAppBar();  // reserve / release the Dock band as a bottom AppBar (MyDockFinder "window boundary")
     static constexpr UINT kDockAppBarMsg = WM_APP + 78;
@@ -417,6 +421,11 @@ private:
     bool showDownloads_ = true, showTrash_ = true, showDivider_ = true;
     std::vector<std::wstring> tailOrder_;
     bool removeOnDrop_ = false;   // the dragged item is held well above the Dock: letting go removes it
+    dock::DragGhost dragGhost_;   // the dragged icon outside the Dock's canvas
+    std::vector<uint32_t> ghostPixels_;
+    UINT ghostW_ = 0, ghostH_ = 0;
+    std::string ghostId_;
+    uint64_t ghostKey_ = 0;
     ULONGLONG dragOutsideSince_ = 0;
     int sepPress_ = -1; POINT sepPressCursor_{};  // a separator pressed: vertical motion resizes, horizontal moves it
     void RebuildTail(const wchar_t* why);
@@ -1502,6 +1511,41 @@ HRESULT App::CreateDockIcon(const std::vector<uint32_t>& pixels,UINT w,UINT h,Co
     auto masked=MakeMacStyleIcon(pixels,w,h,true,&maskedSide,liquid::theme::IsDark(appearanceMode_,systemDark_));
     return renderer_.CreateIcon(masked,maskedSide?maskedSide:w,maskedSide?maskedSide:h,icon,shadow,pad);
 }
+std::vector<uint32_t> App::DockIconPixels(size_t i, UINT& w, UINT& h) {
+    w = h = 0;
+    if (i >= items_.size() || items_[i].pixels.empty()) return {};
+    const auto& item = items_[i];
+    const IconEdit* edit = item.stableId.empty() ? nullptr : iconStore_.FindEdit(item.stableId);
+    auto pixels = NormalizeIconBody(item.pixels, item.iconW, item.iconH);
+    if (pixels.empty()) pixels = item.pixels;
+    if (edit) pixels = ApplyIconEdit(pixels, item.iconW, item.iconH, *edit);
+    w = item.iconW; h = item.iconH;
+    const int maskOverride = edit ? edit->mask : ((item.isRecycleBin || item.isDownloads) ? 0 : -1);
+    if (maskOverride < 0 ? !iconMaskEnabled_ : maskOverride == 0) return pixels;
+    unsigned side = 0;
+    auto masked = MakeMacStyleIcon(pixels, w, h, true, &side, liquid::theme::IsDark(appearanceMode_, systemDark_));
+    if (side) w = h = side;
+    return masked;
+}
+// While an icon is dragged beyond the Dock's canvas (or far enough out that letting go removes it), a small window
+// follows the pointer with it: translucent with a "Remove" label once the drop would remove it (macOS).
+bool App::UpdateDragGhost() {
+    if (!dragging_ || dragFrom_ < 0 || static_cast<size_t>(dragFrom_) >= frame_.items.size()) { dragGhost_.Hide(); return false; }
+    const auto& g = frame_.items[static_cast<size_t>(dragFrom_)];
+    if (!(removeOnDrop_ || g.top < 0.0f)) { dragGhost_.Hide(); return false; }
+    if (ghostId_ != dragId_) {
+        ghostId_ = dragId_;
+        ghostPixels_ = DockIconPixels(static_cast<size_t>(dragFrom_), ghostW_, ghostH_);
+        ++ghostKey_;
+    }
+    if (ghostPixels_.empty()) { dragGhost_.Hide(); return false; }  // no CPU image (status cells): the Dock keeps drawing it
+    const int size = static_cast<int>(std::lround(g.size * scale_));
+    const POINT topLeft{windowRect_.left + static_cast<LONG>(std::lround(g.left * scale_)),
+                        windowRect_.top + static_cast<LONG>(std::lround(g.top * scale_ + (std::max)(0.0f, appliedOffset_)))};
+    dragGhost_.Show(ghostPixels_, ghostW_, ghostH_, ghostKey_, topLeft, size, removeOnDrop_,
+                    removeOnDrop_ ? docky::ui::Text(L"Remove") : L"", scale_);
+    return dragGhost_.Visible();
+}
 void App::BuildIcons() {
     iconBmp_.assign(items_.size(), nullptr);
     shadowBmp_.assign(items_.size(), nullptr);
@@ -2095,9 +2139,19 @@ void App::SetSceneRegion(const Scene& scene) {
     // Keep the plate's side and floor shadow. Leave the blank space above the icons to the windows behind us.
     const float pad = model_.m.shadowPad;
     add(frame.dockLeft - pad, frame.dockTop - 1.0f, frame.dockRight + pad, frame.dockBottom + pad);
+    // The band above the plate is one continuous shape: the gap between two raised neighbours (a separator, or the
+    // spacing between icons) is filled up to the lower of their tops. With holes there, leaving upwards over a
+    // separator ended the hover, the icons shrank and slid back under the pointer, and the Dock flickered between
+    // the two states.
+    float prevRight = 0.0f, prevTop = 0.0f;
+    bool havePrev = false;
     for (const auto& icon : frame.items) {
-        if (!icon.separator && icon.top < frame.dockTop)
-            add(icon.left - 2, icon.top - 2, icon.left + icon.width + 2, frame.dockTop + 1);
+        if (icon.separator) continue;
+        if (icon.top >= frame.dockTop) { havePrev = false; continue; }
+        const float left = icon.left - 2, right = icon.left + icon.width + 2, top = icon.top - 2;
+        add(left, top, right, frame.dockTop + 1);
+        if (havePrev && left > prevRight) add(prevRight, (std::max)(prevTop, top), left, frame.dockTop + 1);
+        prevRight = right; prevTop = top; havePrev = true;
     }
     if (renderer_.Ready() && scene.labelAlpha > 0.01f && scene.labelIndex >= 0 &&
         static_cast<size_t>(scene.labelIndex) < frame.items.size()) {
@@ -2334,6 +2388,7 @@ void App::Frame() {
     RequestBackdrop(CaptureWanted(), currentMonitor);
 
     DockFrame removalFrame;
+    const bool ghost = UpdateDragGhost();
     Scene scene;
     scene.frame = &frame_;
     scene.metrics = &model_.m;
@@ -2350,6 +2405,7 @@ void App::Frame() {
         v.separator = items_[i].isSeparator;
         v.external = items_[i].isMinimized && dock::minimize::SuppressFallbackTile(items_[i].window);
         v.opacity = !dragging_ && static_cast<int>(i) == pressed_ ? 0.6f : (dragging_ && removeOnDrop_ && static_cast<int>(i) == dragFrom_ ? 0.45f : 1.0f);  // dimmed: letting go removes it
+        if (ghost && static_cast<int>(i) == dragFrom_) v.opacity = 0.0f;  // drawn by the ghost window instead
         if (items_[i].isDownloads && downloadsOpenBmp_) { v.alt = downloadsOpenBmp_.Get(); v.altBlend = dock::downloads::OpenProgress(); }
         if (items_[i].isStatusGroup && i < frame_.items.size()) {
             v.statusCells = &items_[i].statusCells; v.statusState = &statusState_; v.running = false;
@@ -2359,7 +2415,7 @@ void App::Frame() {
         }
     }
     const int hovered = model_.HoveredIndex(frame_);
-    if (dragging_ && removeOnDrop_ && dragFrom_ >= 0 && static_cast<size_t>(dragFrom_) < frame_.items.size()) {
+    if (dragging_ && removeOnDrop_ && !ghost && dragFrom_ >= 0 && static_cast<size_t>(dragFrom_) < frame_.items.size()) {
         scene.labelIndex = dragFrom_;
         scene.label = L"Remove";
         scene.labelAlpha = 1.0f;
@@ -2811,6 +2867,7 @@ void App::FinishDrag(bool commit){
     KillTimer(hwnd_, kTimerDragRemoval);
     dragOutsideSince_=0;
     removeOnDrop_=false;
+    dragGhost_.Hide(); ghostId_.clear();
     std::vector<float> positions,positionsY;positions.reserve(frame_.items.size());positionsY.reserve(frame_.items.size());
     for(const auto& g:frame_.items){positions.push_back(g.cx);positionsY.push_back(g.top);}
     if(from>=0&&static_cast<size_t>(from)<positions.size()){positions[from]=mouseX_-grabX_;positionsY[from]=mouseY_-grabY_;}
