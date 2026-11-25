@@ -19,11 +19,16 @@ DockDrop for Windows 11 x64
 
 解压后运行 DockDrop.exe，使用手机浏览器扫描配对球或备用二维码。
 从 DockDrop 设置选择接收目录、管理记住的手机及添加资源管理器右键入口。
+关闭窗口后 DockDrop 默认在后台运行并随开机启动，已配对的手机仍可发送，
+水球会自动弹出；可在设置中关闭「在后台运行」。
 电脑需要 Microsoft Edge WebView2 Runtime。
 
 Unzip and run DockDrop.exe. Scan the pairing bubble or its backup QR code
 with a phone browser. Settings manages the receive folder, trusted phones
-and the File Explorer entry. Microsoft Edge WebView2 Runtime is required.
+and the File Explorer entry. After you close the window, DockDrop keeps
+running in the background and starts at sign-in, so remembered phones can
+still send and the water ball pops up; turn off Run in the background in
+Settings to stop that. Microsoft Edge WebView2 Runtime is required.
 '@
     },
     @{
