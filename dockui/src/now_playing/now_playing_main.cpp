@@ -19,6 +19,7 @@
 //              --lyrics-fetch "Artist" "Title" ["Album"] [--duration seconds]; --snapshot ... --lyrics song.lrc
 // Keys: L lyrics view on/off (Apple Music style: artwork and controls left, lyrics right; click a line to seek).
 #include "artwork_match.h"
+#include "../ui_language.h"
 #include "artwork_source.h"
 #include "audio_beat.h"
 #include "../music_wallpaper_frame.h"
@@ -1095,7 +1096,7 @@ private:
             const float rad = (lyricsBtnR_.bottom - lyricsBtnR_.top) / 2;
             brush_->SetColor(ui.lyricsView ? D2D1::ColorF(1, 1, 1, .88f * a) : D2D1::ColorF(0, 0, 0, (ui.hover == LyricsButton ? .38f : .24f) * a));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(lyricsBtnR_, rad, rad), brush_.Get());
-            Text(L"Lyrics", pill_.Get(), lyricsBtnR_, ui.lyricsView ? D2D1::ColorF(0, 0, 0, .85f * a) : D2D1::ColorF(1, 1, 1, .9f * a));
+            Text(docky::ui::Text(L"Lyrics"), pill_.Get(), lyricsBtnR_, ui.lyricsView ? D2D1::ColorF(0, 0, 0, .85f * a) : D2D1::ColorF(1, 1, 1, .9f * a));
         }
         // Close: a small glass disc, top right.
         const D2D1_POINT_2F cc{(closeR_.left + closeR_.right) / 2, (closeR_.top + closeR_.bottom) / 2};
@@ -1147,6 +1148,7 @@ struct Gpu {
 
 class App {
 public:
+    ~App() { if (musicFrameTimer_) CloseHandle(musicFrameTimer_); }
     int Run(HINSTANCE inst) {
         config_ = LoadConfig(); ReadSharedSettings();
         if (!gpu_.Init() || !scene_.Init(gpu_.device.Get())) return 1;
@@ -1158,7 +1160,7 @@ public:
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.style = CS_DBLCLKS;
         wc.hIcon = LoadIconW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1));
         RegisterClassExW(&wc);
-        hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, kClass, L"Now Playing", WS_POPUP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+        hwnd_ = CreateWindowExW(WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP, kClass, docky::ui::Text(L"Now Playing"), WS_POPUP, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
                                 nullptr, nullptr, inst, this);
         if (!hwnd_ || !CreateSwapChain()) return 1;
         const BOOL disable = TRUE; DwmSetWindowAttribute(hwnd_, DWMWA_TRANSITIONS_FORCEDISABLED, &disable, sizeof(disable));
@@ -1309,6 +1311,7 @@ private:
         const auto path = liquid::settings::DefaultPath();
         settingsRevision_ = liquid::settings::ReadRevision(path);
         const auto loaded = liquid::settings::Load(path);
+        docky::ui::SetLanguage(loaded.value.appearance.language);
         if (loaded.status == liquid::settings::LoadStatus::Loaded || loaded.status == liquid::settings::LoadStatus::Missing) {
             avoidBars_ = loaded.value.controlCenter.wallpaperAvoidBars;
             lyricsFullArt_ = loaded.value.controlCenter.lyricsFullArtwork;
@@ -1324,6 +1327,8 @@ private:
             lyricsBeat_ = loaded.value.controlCenter.lyricsBeat;
             lyricsOffsetMs_ = loaded.value.controlCenter.lyricsOffsetMs;
             musicFps_ = loaded.value.controlCenter.musicFps;
+            musicResponse_ = static_cast<MusicResponse>(loaded.value.controlCenter.musicResponse);
+            beat_.SetSensitivity(loaded.value.controlCenter.musicSensitivity);
             const bool lyricsBefore = wallpaperLyrics_;
             wallpaperLyrics_ = loaded.value.controlCenter.wallpaperLyrics;
             if (wallpaper_ && wallpaperLyrics_ && !lyricsBefore && !currentLyrics_ && snapshot_.has) { lyricsPending_ = true; lyricsSince_ = Now() - 10; }
@@ -1466,6 +1471,7 @@ private:
             }
             const int hit = scene_.Hit(float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp)));
             if (pressed_ == Scene::Progress && seekPreview_ >= 0) {
+                ResetMusic();
                 media_->Command(Cmd::Seek, int64_t(double(seekPreview_) * double(snapshot_.end)));
                 snapshot_.position = int64_t(double(seekPreview_) * double(snapshot_.end)); FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
                 snapshot_.updated = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
@@ -1495,7 +1501,7 @@ private:
                 lyricsOffsetMs_ = std::clamp(lyricsOffsetMs_ + (wp == VK_OEM_6 ? 100 : -100), -3000, 3000);
                 liquid::settings::WriteControlCenterInt(liquid::settings::DefaultPath(), "lyricsOffsetMs", lyricsOffsetMs_);
                 settingsRevision_ = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
-                wchar_t note[48]; swprintf_s(note, L"Lyrics timing %+.1f s", lyricsOffsetMs_ / 1000.0);
+                wchar_t note[48]; swprintf_s(note, docky::ui::Text(L"Lyrics timing %+.1f s"), lyricsOffsetMs_ / 1000.0);
                 toast_ = note; toastUntil_ = Now() + 1.6; break;
             }
             }
@@ -1553,6 +1559,9 @@ private:
             int64_t observed = snapshot_.position;
             if (snapshot_.playing && age >= 0 && age <= 3ll * 10000000) observed += age;
             if (snapshot_.playing && snapshot_.position > 0 && snapshot_.position % 10000000 == 0) observed += 5000000;
+            if (!track && clockValid_ && clockPlaying_ && snapshot_.playing &&
+                age >= 0 && age <= 3ll * 10000000 && std::llabs(observed - estimate) > 30000000)
+                ResetMusic();
             if (track || !clockValid_ || std::llabs(observed - estimate) > 15000000) next = observed;
             else next = estimate + (observed - estimate) / 4;
             clockValid_ = true;
@@ -1568,6 +1577,7 @@ private:
         const std::wstring key = snapshot_.has ? snapshot_.TrackKey() : L"";
         const bool track = key != trackKey_;
         if (track) {
+            ResetMusic();
             trackKey_ = key; pendingVideo_.reset(); pendingRequest_.reset(); lastLyricClick_ = -1; deskPress_ = false;
             currentLyrics_.reset(); lyricsPos_ = -1; lyricsManual_ = false; clockValid_ = false;
             lyricsPending_ = lyrics_ && snapshot_.has && !snapshot_.title.empty() && (!wallpaper_ || wallpaperLyrics_); lyricsSince_ = Now();
@@ -1661,6 +1671,7 @@ private:
         if (!currentLyrics_ || line < 0 || size_t(line) >= currentLyrics_->lines.size() || currentLyrics_->lines[size_t(line)].ms < 0 || !snapshot_.canSeek) return;
         const int64_t t = int64_t(currentLyrics_->lines[size_t(line)].ms) * 10000;
         media_->Command(Cmd::Seek, t);
+        ResetMusic();
         FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
         anchorPosition_ = t; anchorTime_ = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
         snapshot_.position = anchorPosition_; snapshot_.updated = anchorTime_;
@@ -1676,16 +1687,69 @@ private:
     }
     // The beat pulse runs only while lyrics are on screen and music plays (and the desktop is not covered).
     // A beat pushes the flow forward a little (a visible surge), once per pulse.
-    float BeatKick() {
-        const float p = beat_.Running() ? beat_.Pulse() : 0.f;
-        const float kick = p > lastKickPulse_ + .15f ? .1f * p : 0.f;
-        lastKickPulse_ = p;
-        return kick;
+    void ResetMusic() {
+        beat_.Reset();
+        musicResetAt_ = Now();
+        musicSync_.Reset();
+        musicImpulses_ = {};
+        musicLevel_ = musicTwist_ = {};
+    }
+    void WaitForMusicFrame(double deadline) {
+        const double left = deadline - Now();
+        if (left <= 0) return;
+        if (!musicFrameTimer_) musicFrameTimer_ = CreateWaitableTimerExW(nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
+        LARGE_INTEGER due;
+        due.QuadPart = -std::max<LONGLONG>(1, static_cast<LONGLONG>(left * 1e7));
+        if (musicFrameTimer_ && SetWaitableTimer(musicFrameTimer_, &due, 0, nullptr, nullptr, FALSE))
+            MsgWaitForMultipleObjects(1, &musicFrameTimer_, FALSE, INFINITE, QS_ALLINPUT);
+        else
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, DWORD(std::ceil(left * 1000)), QS_ALLINPUT);
+    }
+    float SampleMusic(double now) {
+        const double dt = lastMusicSample_ ? std::clamp(now - lastMusicSample_, 0.0, .1) : 1.0 / 60;
+        lastMusicSample_ = now;
+        const auto deliver = [&](const RhythmEvent& event) {
+            auto& impulse = musicImpulses_[static_cast<size_t>(event.kind)];
+            impulse = event;
+            if (musicTrace_ && (!musicTraceEvent_.published || event.kind == RhythmKind::Kick))
+                musicTraceEvent_ = event;
+        };
+        MusicFrame frame;
+        while (beat_.Pop(frame)) {
+            if (frame.published < musicResetAt_) continue;
+            if (frame.generation != musicSync_.Frame().generation) {
+                musicImpulses_ = {};
+                musicLevel_ = musicTwist_ = {};
+            }
+            musicSync_.Read(frame, now, deliver);
+        }
+        musicSync_.Advance(now, deliver);
+        const auto& state = musicSync_.Frame();
+        const bool fresh = beat_.Running() && now - state.published < .25;
+        constexpr float attacks[]{.006f, .015f, .042f};
+        constexpr float releases[]{.105f, .18f, .31f};
+        const auto mode = static_cast<size_t>(musicResponse_);
+        const float attack = attacks[mode], release = releases[mode];
+        const auto pulse = [&](RhythmKind kind) {
+            const auto& event = musicImpulses_[static_cast<size_t>(kind)];
+            return event.strength * std::exp(-float(std::max(0.0, now - event.at)) / release);
+        };
+        const float strength = fresh ? std::max({pulse(RhythmKind::Beat), .8f * pulse(RhythmKind::Kick),
+            .35f * pulse(RhythmKind::Snare), .12f * pulse(RhythmKind::HiHat),
+            (state.period ? .15f : .55f) * pulse(RhythmKind::Onset),
+            .55f * pulse(RhythmKind::Drop)}) : 0.f;
+        const float targetLevel = fresh ? .65f * state.bass + .35f * state.level : 0.f;
+        musicLevel_.Step(targetLevel, dt, attack, release);
+        musicTwist_.Step(strength + .25f * musicLevel_.value, dt, attack, release);
+        if (LyricsView() && snapshot_.playing)
+            flowClock_ += float(dt) * (.12f + .3f * (fresh ? musicLevel_.value : .3f) + .42f * strength);
+        return strength;
     }
     bool UpdateBeat() {
         const bool want = lyricsBeat_ && snapshot_.playing && LyricsView() && (!wallpaper_ || (shown_ && !covered_));
         if (want && !beat_.Running()) beat_.Start();
-        else if (!want && beat_.Running()) beat_.Stop();
+        else if (!want && beat_.Running()) { beat_.Stop(); ResetMusic(); }
         return want;
     }
     bool LyricsView() const { return (wallpaper_ ? wallpaperLyrics_ : config_.lyrics) && currentLyrics_ && !currentLyrics_->Empty(); }
@@ -1788,19 +1852,18 @@ private:
                 if (closing_ >= 0 && wallAlpha_ == 0) { DestroyWindow(hwnd_); continue; }
                 const bool lyricsMoving = shown_ && !covered_ && StepLyrics(dt);
                 UpdateRawInput();
-                // Beat: frames at most 60 per second, and only while the pulse is visible.
-                // Flowing background on the desktop: at most 30 frames per second, only while lyrics show and music plays.
                 bool beatFrame = false;
                 UpdateBeat();
                 if (shown_ && !covered_ && LyricsView() && snapshot_.playing && (musicFps_ <= 0 || now - lastBeatFrame_ >= 1.0 / musicFps_)) {
-                    flowClock_ += float(std::min(.1, now - lastBeatFrame_)) * (.12f + .3f * (beat_.Running() ? beat_.Level() : .3f)) + BeatKick();
                     beatFrame = true; lastBeatFrame_ = now;
                 }
                 const bool anim = wallAlpha_ != before || prev_ || finishedTransition || lyricsMoving || beatFrame;
                 if (shown_ && (dirty_ || anim || frame)) { Render(prev_ ? std::min(1.f, mix) : 1.f, wallAlpha_); dirty_ = false; }
                 else if (shown_ && ((cur_ && cur_->video && VideoShouldPlay()) || pendingVideo_)) DwmFlush();
                 else if (shown_ && !covered_ && LyricsView() && snapshot_.playing && musicFps_ <= 0) DwmFlush();
-                else MsgWaitForMultipleObjects(0, nullptr, FALSE, shown_ && !covered_ && LyricsView() && snapshot_.playing ? DWORD(std::max(4, 1000 / std::max(1, musicFps_) - 1)) : shown_ && !covered_ ? UntilNextLine() : 1000, QS_ALLINPUT);
+                else if (shown_ && !covered_ && LyricsView() && snapshot_.playing)
+                    WaitForMusicFrame(lastBeatFrame_ + 1.0 / musicFps_);
+                else MsgWaitForMultipleObjects(0, nullptr, FALSE, shown_ && !covered_ ? UntilNextLine() : 1000, QS_ALLINPUT);
                 continue;
             }
             // Controls: shown while the cursor moves or rests on the platter, then fade away.
@@ -1819,12 +1882,12 @@ private:
             // Lyrics: the scroll follows the line being sung with a short ease; the backdrop drifts while the view is up.
             bool lyricsAnim = StepLyrics(dt);
             UpdateBeat();
-            if (LyricsView() && snapshot_.playing) { flowClock_ += dt * (.12f + .3f * (beat_.Running() ? beat_.Level() : .3f)) + BeatKick(); lyricsAnim = true; }
+            if (LyricsView() && snapshot_.playing) lyricsAnim = true;
             if (now < toastUntil_ + .1) lyricsAnim = true;
             if (LyricsView() && !lyricsFullArt_) lyricsAnim = true;  // the card layout's backdrop drifts
             const bool anim = controlsAnim || prev_ || appear < 1 || closing_ >= 0 || lyricsAnim;
             if (!dirty_ && !frame && anim && musicFps_ > 0 && now - lastFrame_ < 1.0 / musicFps_) {
-                MsgWaitForMultipleObjects(0, nullptr, FALSE, DWORD(std::max(1.0, (1.0 / musicFps_ - (now - lastFrame_)) * 1000)), QS_ALLINPUT);
+                WaitForMusicFrame(lastFrame_ + 1.0 / musicFps_);
             } else if (dirty_ || anim || frame) {
                 lastFrame_ = now;
                 Render(prev_ ? std::min(1.f, mix) : 1.f, closing_ >= 0 ? 1 - closeT : appear);
@@ -1885,7 +1948,9 @@ private:
         ui.lyricsAvailable = !wallpaper_ && currentLyrics_ && !currentLyrics_->Empty();
         ui.lyricsView = LyricsView(); ui.lyrics = currentLyrics_.get(); ui.lyricsPos = std::max(0.f, lyricsPos_); ui.lyricsActive = lyricsActive_;
         ui.lyricsFullArt = lyricsFullArt_; ui.lyricsBlend = lyricsBlend_; ui.lyricsManual = lyricsManualBlend_;
-        ui.beat = beat_.Running() ? beat_.Pulse() : 0.f;
+        const double consumed = Now();
+        musicTraceEvent_ = {};
+        ui.beat = SampleMusic(consumed);
         ui.flowTime = flowClock_;
         if (!wallpaper_ && Now() < toastUntil_) ui.toast = toast_;
         ui.time = wallpaper_ ? 0.f : float(Now() - opened_);  // no backdrop drift on the desktop (no frame every refresh)
@@ -1895,11 +1960,7 @@ private:
         if (ui.lyricsView && lyricsBeat_ && cur_ && !cur_->palette.empty() && silk_.Ready()) {
             UINT sw = W_, sh = H_;
             if (wallpaper_) { sw = sh = 0; for (const auto& m : monitors_) { sw = std::max<UINT>(sw, UINT(m.screen.right - m.screen.left)); sh = std::max<UINT>(sh, UINT(m.screen.bottom - m.screen.top)); } }
-            // Twist: the beat pulse with a quick (~50 ms) attack and a slower (~0.4 s) release, plus a little loudness.
-            const double tn = Now(); const float sdt = float(std::clamp(tn - silkTwistAt_, 0.0, .1)); silkTwistAt_ = tn;
-            const float target = ui.beat + (beat_.Running() ? .25f * beat_.Level() : 0.f);
-            silkTwist_ += (target - silkTwist_) * std::min(1.f, sdt * (target > silkTwist_ ? 20.f : 2.5f));
-            ui.silk = silk_.Render(dc, std::max<UINT>(64, UINT(sw * .56f / 2)), std::max<UINT>(64, sh / 2), flowClock_, std::min(1.f, silkTwist_), cur_->palette);
+            ui.silk = silk_.Render(dc, std::max<UINT>(64, UINT(sw * .56f / 2)), std::max<UINT>(64, sh / 2), flowClock_, std::min(1.f, musicTwist_.value), cur_->palette);
         }
         dc->SetTarget(target_.Get()); dc->BeginDraw();
         if (wallpaper_) {
@@ -1921,7 +1982,14 @@ private:
         const HRESULT hr = dc->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) { Log(L"device lost"); PostQuitMessage(2); return; }
         if (wallpaper_ && appear > 0.f && SUCCEEDED(hr)) PublishWallpaperFrame(appear, mix);
-        swap_->Present(1, 0);
+        const double submitted = musicTraceEvent_.published ? Now() : 0;
+        const HRESULT present = swap_->Present(1, 0);
+        if (submitted) {
+            const auto& event = musicTraceEvent_;
+            Log(L"music timing kind=%u audio=%.6f sample_end=%.6f capture=%.6f analysis=%.6f publish=%.6f consume=%.6f present_call=%.6f present_return=%.6f hr=0x%08lx overruns=%u",
+                unsigned(event.kind), event.at, event.sampleEnd, event.captured, event.analyzed, event.published, consumed,
+                submitted, Now(), static_cast<unsigned long>(present), beat_.Overruns());
+        }
     }
 
     static bool SavePng(ID2D1DeviceContext* dc, ID2D1Bitmap1* target, UINT w, UINT h, const std::wstring& path);
@@ -1954,8 +2022,23 @@ private:
     bool lyricsManual_ = false, lyricsPress_ = false, lyricsDragged_ = false, lyricsAutoReturn_ = true;
     float lyricsManualPos_ = 0, lyricsPressPos_ = 0, lyricsPressX_ = 0, lyricsPressY_ = 0, lyricsManualBlend_ = 0; double lyricsScrolled_ = 0;
     std::vector<std::pair<int, D2D1_RECT_F>> deskLyricRects_; std::vector<D2D1_RECT_F> deskLyricsColumns_;
-    SilkRenderer silk_; float silkTwist_ = 0; double silkTwistAt_ = 0; float lastKickPulse_ = 0; int musicFps_ = 60; double lastFrame_ = 0;
-    AudioBeat beat_; float flowClock_ = 0; bool lyricsBeat_ = true; int lyricsOffsetMs_ = 300; double lastBeatFrame_ = 0, toastUntil_ = 0; float lastPulse_ = 0; std::wstring toast_;
+    SilkRenderer silk_;
+    HANDLE musicFrameTimer_ = nullptr;
+    int musicFps_ = 60;
+    double lastFrame_ = 0;
+    AudioBeat beat_;
+    MusicSync musicSync_;
+    MusicResponse musicResponse_ = MusicResponse::Balanced;
+    std::array<RhythmEvent, static_cast<size_t>(RhythmKind::Count)> musicImpulses_{};
+    MusicEnvelope musicLevel_, musicTwist_;
+    RhythmEvent musicTraceEvent_{};
+    const bool musicTrace_ = GetEnvironmentVariableW(L"DOCKY_MUSIC_TIMING", nullptr, 0) != 0;
+    double lastMusicSample_ = 0, musicResetAt_ = 0;
+    float flowClock_ = 0;
+    bool lyricsBeat_ = true;
+    int lyricsOffsetMs_ = 300;
+    double lastBeatFrame_ = 0, toastUntil_ = 0;
+    std::wstring toast_;
     bool animatedArtwork_ = true, lyricsDoubleClickSeek_ = true, keepPaused_ = false, localTags_ = true;
     int lastLyricClick_ = -1;
     ULONGLONG lastLyricClickTime_ = 0;

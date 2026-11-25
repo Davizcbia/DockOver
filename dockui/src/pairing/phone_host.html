@@ -1,0 +1,155 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; connect-src wss://dockdrop-signal.dockdrop-signal.workers.dev">
+<script type="module">
+  import { pair } from './pair.js';
+  import { SIGNAL_URL } from './config.js';
+  import { encode } from './bubble-code.js';
+  import { qrEncode } from './qr.js';
+  import { serveTransfer } from './transfer.js';
+
+  const send = (message) => chrome.webview.postMessage(message);
+  const scanner = 'https://davizcbia.github.io/dockdrop-scan/bubble/';
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  let bridgeTail = Promise.resolve();
+  function writeToComputer(message, timeoutMs = 12000) {
+    const request = bridgeTail.then(() => new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        chrome.webview.removeEventListener('message', reply);
+        reject(new Error('电脑接收超时。'));
+      }, timeoutMs);
+      function reply(event) {
+        if (typeof event.data !== 'string' || (event.data !== 'ok' && event.data !== 'error' && !event.data.startsWith('ok:'))) return;
+        clearTimeout(timeout);
+        chrome.webview.removeEventListener('message', reply);
+        if (event.data === 'ok') resolve();
+        else if (event.data.startsWith('ok:')) resolve(event.data.slice(3));
+        else reject(new Error('电脑无法读写传输内容。'));
+      }
+      chrome.webview.addEventListener('message', reply);
+      send(message);
+    }));
+    bridgeTail = request.catch(() => {});
+    return request;
+  }
+  // Only the file and clipboard adapter depends on WebView2.
+  async function readSelection(remembered = false) {
+    const {files, text} = JSON.parse(await writeToComputer('out-meta'));
+    if (remembered && (files.length || text)) await writeToComputer('send-offer:', 41000);
+    return {text, files: files.map((file, index) => ({
+      ...file,
+      slice: (offset) => ({arrayBuffer: async () => {
+        const chunk = atob(await writeToComputer(`out-read:${index}:${offset}`));
+        return Uint8Array.from(chunk, character => character.charCodeAt(0)).buffer;
+      }}),
+    }))};
+  }
+  function writeIncoming(message, bytes) {
+    if (bytes) message += ':' + btoa(String.fromCharCode(...new Uint8Array(bytes)));
+    return writeToComputer(message);
+  }
+  function progressReporter() {
+    let lastAt = -Infinity;
+    return (fraction) => {
+      const now = performance.now();
+      if (fraction > 0 && fraction < 1 && now - lastAt < 32) return;
+      lastAt = now;
+      send('transfer-progress:' + Math.round(fraction * 10000));
+    };
+  }
+  const CAPABILITY = 'remember-phone-v1';
+  const secretHex = (size) => Array.from(crypto.getRandomValues(new Uint8Array(size)),
+    byte => byte.toString(16).padStart(2, '0')).join('');
+  let discovery;
+  chrome.webview.addEventListener('message', ({data}) => {
+    if (data === 'trust-refresh') discovery?.abort();
+  });
+
+  function offerRemembering(connection, computer) {
+    const {channel, peerName} = connection;
+    let enrolled = false;
+    channel.addEventListener('message', async ({data}) => {
+      if (data !== 'dockdrop-remember:request' || enrolled) return;
+      enrolled = true;
+      const phone = {id: secretHex(16), secret: secretHex(32),
+        name: peerName.replace(/[\x00-\x1f\x7f-\x9f\u202a-\u202e\u2066-\u2069]/g, '').trim() || 'Phone'};
+      try {
+        await writeToComputer('trust-add:' + phone.id + ':' + phone.secret + ':' + phone.name);
+        if (channel.readyState === 'open')
+          channel.send('dockdrop-remember:ok:' + JSON.stringify({id: phone.id, secret: phone.secret, name: computer}));
+      } catch {
+        if (channel.readyState === 'open') channel.send('dockdrop-remember:error');
+      }
+    });
+  }
+
+  async function listen(phone, computer, signal) {
+    while (!signal.aborted) {
+      const secret = phone?.secret || secretHex(8);
+      const cells = phone ? null : encode({ version: 1, flags: 1, secret: BigInt('0x' + secret) }).flat().join('');
+      const qr = phone ? null : qrEncode(scanner + '#s=' + secret);
+      let shown = false;
+      try {
+        return await pair({
+          signalUrl: SIGNAL_URL, secret, role: 'host', name: computer,
+          remembered: Boolean(phone), capabilities: [CAPABILITY],
+          timeoutMs: 60000, peerWaitMs: 0, signal,
+          onStatus(text) {
+            if (phone || signal.aborted) return;
+            if (!shown && text === '正在等待手机…') {
+              shown = true;
+              send('qr:' + qr.size + ':' + qr.modules.map(row => row.map(cell => cell ? '1' : '0').join('')).join(''));
+              send('cells:' + cells);
+            }
+            send('status:' + text);
+          },
+        });
+      } catch (error) {
+        if (signal.aborted) return;
+        if (!phone) {
+          send('clear');
+          if (error.message !== 'timeout') send('status:连接中断，正在重试…');
+        }
+        await wait(error.message === 'timeout' ? 25 : 1800);
+      }
+    }
+  }
+
+  async function host() {
+    for (;;) {
+      const settings = JSON.parse(await writeToComputer('trust-list'));
+      const computer = settings.computer || 'DockDrop';
+      const controller = new AbortController();
+      discovery = controller;
+      let winner = null;
+      await Promise.race([null, ...settings.phones].map(async (phone) => {
+        const connection = await listen(phone, computer, controller.signal);
+        if (!connection) return;
+        if (winner || controller.signal.aborted) {
+          connection.pc.close();
+          return;
+        }
+        winner = {connection, phone};
+        controller.abort();
+      }));
+      controller.abort();
+      discovery = null;
+      if (!winner) continue;
+      const {connection, phone} = winner;
+      if (phone) {
+        try { await writeToComputer('trust-check:' + phone.id); }
+        catch { connection.pc.close(); continue; }
+      } else offerRemembering(connection, computer);
+      window.dockdropLink = connection;
+      send(phone ? 'paired:' + phone.id : 'paired');
+      serveTransfer(connection.channel, {
+        readSelection: () => readSelection(Boolean(phone)), writeIncoming,
+        authorize: phone ? () => writeToComputer('receive-offer:', 41000) : undefined,
+        onState: send, onProgress: progressReporter(),
+      });
+      connection.channel.addEventListener('close', () => send('error'), {once: true});
+      return;
+    }
+  }
+  host().catch(() => send('error'));
+</script>

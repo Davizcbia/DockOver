@@ -1,4 +1,5 @@
 #include "menu_glass.h"
+#include "ui_language.h"
 #include <QApplication>
 #include <QWidget>
 #include <QPainter>
@@ -50,6 +51,8 @@
 #include <QToolTip>
 #include <QStandardPaths>
 #include <algorithm>
+
+static QString Ui(const wchar_t* text) { return QString::fromWCharArray(docky::ui::Text(text)); }
 
 struct Item {QString id,name;std::wstring target;QImage icon;};
 
@@ -218,7 +221,7 @@ class Applications final:public QWidget {
    if(index<0||index>=items.size())return false;
    const auto before=pins;
    if(pins.contains(items[index].id))pins.removeAll(items[index].id);else pins.push_back(items[index].id);
-   if(!savePins()){pins=before;QMessageBox::warning(this,"DockOver","Could not save pinned apps.");return false;}
+   if(!savePins()){pins=before;QMessageBox::warning(this,"DockOver",Ui(L"Could not save pinned apps."));return false;}
    scroll.Reset();update();return true;
  }
  void migrateShortcutKeys(){
@@ -274,7 +277,7 @@ class Applications final:public QWidget {
  std::mutex iconPriorityLock;
  QStringList visibleIconPriority;  // ids of the icons on screen: loaded first
  std::atomic<bool> stopping{false};
- QString status=QStringLiteral("Loading apps…");
+ QString status=Ui(L"Loading apps…");
  // The app list from the previous opening (applications-catalog.json next to the pins): reading the Start menu takes
  // ~0.8 s, so the window shows the cached list at once and refreshes it in the background (changes swap in).
  QString catalogPath()const{return QFileInfo(sharedSettingsPath()).dir().filePath("applications-catalog.json");}
@@ -367,7 +370,7 @@ class Applications final:public QWidget {
     if(ShellExecuteExW(&info)){
       auto& entry=usage[items[i].id];entry.count=std::min(1000000,entry.count+1);entry.last=QDateTime::currentMSecsSinceEpoch();savePins();close();
     }
-    else QMessageBox::warning(this,"DockOver",QStringLiteral("Could not open %1").arg(items[i].name));
+    else QMessageBox::warning(this,"DockOver",Ui(L"Could not open %1").arg(items[i].name));
  }
  QPointF design(QPoint p)const{return {(p.x()-ox)/s,(p.y()-oy)/s};}
  static QPainterPath continuous(QRectF r,qreal extent,qreal exponent=3.05){
@@ -500,7 +503,7 @@ class Applications final:public QWidget {
   update();
  }
  void syncUiSize(){
-  int percent=80,order=0;QFile file(sharedSettingsPath());if(file.open(QIODevice::ReadOnly)){const auto root=QJsonDocument::fromJson(file.readAll()).object();const auto appearance=root.value("appearance").toObject();const auto value=appearance.value("applicationsScalePercent");order=appearance.value("applicationsSort").toInt();if(root.value("schemaVersion").toInt()==1&&value.isDouble()&&value.toDouble()==value.toInt()&&value.toInt()>=60&&value.toInt()<=120)percent=value.toInt();}
+  int percent=80,order=0;QFile file(sharedSettingsPath());if(file.open(QIODevice::ReadOnly)){const auto root=QJsonDocument::fromJson(file.readAll()).object();const auto appearance=root.value("appearance").toObject();const auto value=appearance.value("applicationsScalePercent");order=appearance.value("applicationsSort").toInt();docky::ui::SetLanguage(appearance.value("language").toString().toStdString());if(root.value("schemaVersion").toInt()==1&&value.isDouble()&&value.toDouble()==value.toInt()&&value.toInt()>=60&&value.toInt()<=120)percent=value.toInt();}
   if(order>=0&&order<=2&&order!=sortOrder){sortOrder=order;scroll.Reset();hover=-1;update();}
   const bool sizeFile=QFile::exists(windowSizePath());
   const bool reset=hadSizeFile&&!sizeFile&&!resizing;  // Settings > Reset size
@@ -592,7 +595,7 @@ public:
   auto sizePoll=new QTimer(this);connect(sizePoll,&QTimer::timeout,this,[this]{syncUiSize();});sizePoll->start(300);setMouseTracking(true);setFocusPolicy(Qt::StrongFocus);
   search->setFrame(false);search->installEventFilter(this);
   connect(search,&QLineEdit::returnPressed,this,[this]{if(!hits.isEmpty())launch(hits.front().second);});
-  search->setPlaceholderText("Applications");search->setAccessibleName("Search apps");
+  search->setPlaceholderText(Ui(L"Applications"));search->setAccessibleName(Ui(L"Search apps"));
   search->setStyleSheet("QLineEdit{background:transparent;border:0;padding:0;color:white;selection-background-color:#3566a3;}");
   auto palette=search->palette();palette.setColor(QPalette::PlaceholderText,QColor(237,235,231,160));search->setPalette(palette);
   connect(search,&QLineEdit::textChanged,this,[this](const QString& text){query=text;category=-1;scroll.Reset();hover=-1;update();});

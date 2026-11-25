@@ -124,6 +124,7 @@ public:
     void RequestSnapshot(const std::wstring& path) { snapshotPath_ = path; }
     void RequestPngSnapshot() { pngSnapshotRequested_ = true; }
     HRESULT Render(const Scene& scene);  // draws, presents (sync interval 1)
+    bool LabelBounds(const Scene& s, const ItemGeom& g, D2D1_RECT_F& bounds);
     // Low-latency layering (opt-in, the Dock; see renderer.cpp): PrepareUi draws the D2D UI into a cached layer before
     // the desktop frame is taken; Compose then draws only the GPU glass, lays the cached layer over it and presents.
     // Compose returns S_FALSE when it cannot draw this scene (no cached layer, no backdrop, glass or label glass failed):
@@ -173,7 +174,6 @@ private:
     bool RenderLocalGlass(const LocalGlassOverlay& overlay);
     void DrawScene(const Scene& scene, bool drawPlate);
     ComPtr<ID2D1PathGeometry> ContinuousRect(D2D1_RECT_F r, float radius);
-    bool LabelBounds(const Scene& s, const ItemGeom& g, D2D1_RECT_F& bounds);
     void DrawLabel(const Scene& s, const ItemGeom& g);
     bool labelUsedGpu_ = false;
 

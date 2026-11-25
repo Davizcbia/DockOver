@@ -14,6 +14,17 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     self.resize(GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size())));
     const std::wstring dir = self.substr(0, self.find_last_of(L"\\/"));
     const std::wstring runtime = dir + L"\\runtime", manager = runtime + L"\\LiquidDesktopManager.exe";
+    const auto dockdrop = runtime + L"\\docky-bubble.exe";
+    if (GetFileAttributesW(dockdrop.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        std::wstring registration = L"\"" + dockdrop + L"\" --register-dockdrop-menu";
+        STARTUPINFOW startup{sizeof(startup)};
+        PROCESS_INFORMATION process{};
+        if (CreateProcessW(dockdrop.c_str(), registration.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                nullptr, runtime.c_str(), &startup, &process)) {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+        }
+    }
 
     if (HANDLE running = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\LiquidDesktopManagerV05SingleInstance")) {
         CloseHandle(running);

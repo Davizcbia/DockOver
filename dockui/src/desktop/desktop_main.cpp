@@ -3,6 +3,7 @@
 // the extension protocol windows (ext_protocol.h): the Menu Bar's docky menu can open this app's widget gallery,
 // this app's tray icon shows in the Menu Bar's Hidden Icons, and both follow docky's Appearance setting when present.
 #include "../game_compat.h"
+#include "../ui_language.h"
 #include "../capture_visible.h"
 #include "canvas.h"
 #include "widgets.h"
@@ -24,6 +25,7 @@
 #include "../vblank.h"
 #include "../motion.h"
 #include "../music_wallpaper_frame.h"
+#include "../pairing/widget_queue.h"
 #include <shellapi.h>
 #include <commdlg.h>
 #include <shellscalingapi.h>
@@ -34,6 +36,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <map>
 #include <memory>
@@ -48,6 +51,9 @@ constexpr wchar_t kHostClass[] = L"DockyDesktopHostV1", kWidgetClass[] = L"Docky
 constexpr UINT kTrayMsg = WM_APP + 1, kDataReady = WM_APP + 3, kCalendarReady = WM_APP + 4, kDevicesReady = WM_APP + 5, kWeatherReady = WM_APP + 6, kMusicFrame = WM_APP + 20;
 std::atomic<bool> musicFramePending{false};
 constexpr UINT_PTR kTickTimer = 1, kPollTimer = 2, kExitTimer = 3, kDevMenuTimer = 4, kDevMenuShot = 5;
+using docky::pairing::kDropWidgetKind;
+using docky::pairing::WidgetDraft;
+using docky::pairing::WidgetQueue;
 // Game mode: a full-screen app (game, video, F11 browser) in front covers the widgets, so clocks, system graphs and data
 // polling pause until it leaves (they repaint on the next tick).
 // Games list (Settings > Menu Bar > Game compatibility): a listed program running pauses the widgets too.
@@ -77,6 +83,13 @@ struct WidgetWin {
     float scrollMin = 0, scrollMax = 0;
     ULONGLONG lastScroll = 0;  // after 20 s without scrolling the widget glides back to its normal view
     double scrollStepAt = 0;
+    bool dropHover = false;
+    bool dropRegistered = false;
+    int dropPage = 0;
+    int dropPreview = -1;
+    bool dropTracking = false;
+    DropWidgetNotice dropNotice = DropWidgetNotice::None;
+    ULONGLONG dropNoticeUntil = 0;
 };
 struct Config {
     std::vector<WidgetWin> widgets;
@@ -94,6 +107,55 @@ bool desktopRaised = false, trayAdded = false;
 std::wstring devPng;
 liquid::settings::Revision themeRevision;
 Theme theme;
+WidgetDraft dropDraft;
+std::vector<DropWidgetEntry> dropEntries;
+ULONGLONG dropCheckedAt = 0;
+
+DropWidgetEntry FileDropEntry(const std::wstring& path) {
+    DropWidgetEntry entry;
+    const auto slash = path.find_last_of(L"\\/");
+    entry.preview = slash == std::wstring::npos ? path : path.substr(slash + 1);
+    SHFILEINFOW info{};
+    if (!SHGetFileInfoW(path.c_str(), FILE_ATTRIBUTE_NORMAL, &info, sizeof(info),
+                       SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES)) return entry;
+    ComPtr<IWICBitmap> source;
+    if (Wic()) Wic()->CreateBitmapFromHICON(info.hIcon, &source);
+    DestroyIcon(info.hIcon);
+    ComPtr<IWICFormatConverter> converter;
+    if (!source || FAILED(Wic()->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(source.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone,
+                                     nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+        FAILED(converter->GetSize(&entry.iconW, &entry.iconH)) || !entry.iconW || !entry.iconH) return entry;
+    entry.icon.resize(static_cast<size_t>(entry.iconW) * entry.iconH);
+    if (FAILED(converter->CopyPixels(nullptr, entry.iconW * 4, entry.iconW * entry.iconH * 4,
+                                    reinterpret_cast<BYTE*>(entry.icon.data())))) entry.icon.clear();
+    return entry;
+}
+
+void RefreshDropDraft() {
+    WidgetDraft draft;
+    if (WidgetQueue().Read(draft) && (draft.files != dropDraft.files || draft.texts != dropDraft.texts)) {
+        std::vector<DropWidgetEntry> entries;
+        entries.reserve(draft.files.size() + draft.texts.size());
+        for (const auto& file : draft.files) {
+            const auto existing = std::find(dropDraft.files.begin(), dropDraft.files.end(), file);
+            if (existing == dropDraft.files.end()) entries.push_back(FileDropEntry(file));
+            else entries.push_back(std::move(dropEntries[existing - dropDraft.files.begin()]));
+        }
+        for (const auto& text : draft.texts) {
+            DropWidgetEntry entry;
+            // Bound the preview work. All of the original text stays in the draft.
+            entry.preview = text.size() <= 360 ? text : text.substr(0, 360) + L"…";
+            if (text.size() > 360 && IS_HIGH_SURROGATE(entry.preview[359])) entry.preview.erase(359, 1);
+            entry.clipboard = true;
+            entries.push_back(std::move(entry));
+        }
+        dropDraft = std::move(draft);
+        dropEntries = std::move(entries);
+        for (auto& w : config.widgets) w.dropPreview = -1;
+    }
+    dropCheckedAt = GetTickCount64();
+}
 std::wstring ConfigPath() { return DataDir() + L"\\desktop.json"; }
 bool EditMode();
 extern RECT galleryRect;
@@ -229,7 +291,21 @@ void PaintWidgetWin(WidgetWin& w) {
     const Theme content = PaintPlate(rt, shape, screen, theme, PlateToneOf(w.kind));
     rt->PushAxisAlignedClip(shape, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
     PaintScroll() = WidgetScroll{Scrollable(w.kind) ? w.scroll.F() : 0.f, w.scrollMin, w.scrollMax};
-    PaintWidget(rt, w.kind, w.size, shape, content, ext);
+    DropWidgetState drop;
+    if (w.kind == kDropWidgetKind) {
+        const auto now = GetTickCount64();
+        if (now - dropCheckedAt >= 600 || !dropCheckedAt) RefreshDropDraft();
+        const int capacity = LayoutDropWidget(shape).Capacity();
+        const int pages = (static_cast<int>(dropEntries.size()) + capacity - 1) / capacity;
+        w.dropPage = std::clamp(w.dropPage, 0, std::max(0, pages - 1));
+        drop.entries = dropEntries;
+        drop.page = w.dropPage;
+        drop.hovered = w.dropHover ? -1 : w.dropPreview;
+        drop.hovering = w.dropHover;
+        drop.focused = GetFocus() == w.hwnd && !EditMode();
+        if (now < w.dropNoticeUntil) drop.notice = w.dropNotice;
+    }
+    PaintWidget(rt, w.kind, w.size, shape, content, ext, &drop);
     if (Scrollable(w.kind)) { w.scrollMin = PaintScroll().min; w.scrollMax = PaintScroll().max; }
     PaintScroll() = WidgetScroll{};  // other paths (gallery, previews) draw the normal view
     rt->PopAxisAlignedClip();
@@ -251,6 +327,184 @@ void PlaceWidget(WidgetWin& w, bool show) {
 }
 
 WidgetWin* WidgetOf(HWND h) { for (auto& w : config.widgets) if (w.hwnd == h) return &w; return nullptr; }
+
+bool OpenDockDrop(HWND owner) {
+    wchar_t module[32768]{};
+    const DWORD len = GetModuleFileNameW(nullptr, module, ARRAYSIZE(module));
+    if (!len || len >= ARRAYSIZE(module)) return false;
+    const std::wstring path(module, len);
+    const auto dir = path.substr(0, path.find_last_of(L"\\/") + 1);
+    for (const auto* executable : {L"runtime\\docky-bubble.exe", L"docky-bubble.exe", L"DockDrop.exe"}) {
+        const auto candidate = dir + executable;
+        const DWORD attributes = GetFileAttributesW(candidate.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(owner, L"open", candidate.c_str(), L"--pair-phone", nullptr, SW_SHOWNORMAL)) > 32)
+            return true;
+    }
+    return false;
+}
+
+void OpenDropWidget(WidgetWin& widget) {
+    if (OpenDockDrop(widget.hwnd)) return;
+    widget.dropNotice = DropWidgetNotice::Unavailable;
+    widget.dropNoticeUntil = GetTickCount64() + 2400;
+    PaintWidgetWin(widget);
+}
+
+DropWidgetLayout DropLayoutOf(const WidgetWin& widget) {
+    const auto size = SizeDip(widget.size);
+    return LayoutDropWidget(D2D1::RectF(kShadow, kShadow, kShadow + size.width, kShadow + size.height));
+}
+
+D2D1_POINT_2F DropPoint(const WidgetWin& widget, LPARAM point) {
+    const float scale = 96.f / DpiAt(widget.pos);
+    return D2D1::Point2F(GET_X_LPARAM(point) * scale, GET_Y_LPARAM(point) * scale);
+}
+
+bool DropContains(const D2D1_RECT_F& rect, D2D1_POINT_2F point) {
+    return point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+}
+
+bool ChangeDropPage(WidgetWin& widget, int delta) {
+    const int capacity = DropLayoutOf(widget).Capacity();
+    const int page = std::clamp(widget.dropPage + delta, 0, std::max(0, (static_cast<int>(dropEntries.size()) - 1) / capacity));
+    if (page == widget.dropPage) return false;
+    widget.dropPage = page;
+    widget.dropPreview = -1;
+    PaintWidgetWin(widget);
+    return true;
+}
+
+bool StageDropWidget(WidgetWin& widget, const WidgetDraft& drop) {
+    const bool saved = WidgetQueue().Append(drop);
+    RefreshDropDraft();
+    widget.dropNotice = DropWidgetNotice::InvalidDrop;
+    widget.dropNoticeUntil = saved ? 0 : GetTickCount64() + 2400;
+    if (saved && !dropEntries.empty()) {
+        const auto last = drop.texts.empty() ? dropDraft.files.size() : dropEntries.size();
+        widget.dropPage = static_cast<int>(last - 1) / DropLayoutOf(widget).Capacity();
+    }
+    PaintWidgetWin(widget);
+    return saved;
+}
+
+std::wstring ReadDropText(HGLOBAL memory, CLIPFORMAT format) {
+    const auto* bytes = static_cast<const char*>(GlobalLock(memory));
+    if (!bytes) return {};
+    const SIZE_T size = GlobalSize(memory);
+    const auto limit = docky::pairing::kWidgetMaxText + 1;
+    std::wstring text;
+    if (format == CF_UNICODETEXT) {
+        const auto* first = reinterpret_cast<const wchar_t*>(bytes);
+        const auto* bound = first + std::min(size / sizeof(wchar_t), limit);
+        const auto* end = std::find(first, bound, L'\0');
+        if (end < bound) text.assign(first, end);
+    } else if (const auto* end = static_cast<const char*>(std::memchr(bytes, 0, std::min(size, limit)))) {
+        const int length = static_cast<int>(end - bytes);
+        const int wide = MultiByteToWideChar(CP_ACP, 0, bytes, length, nullptr, 0);
+        if (wide > 0) {
+            text.resize(static_cast<size_t>(wide));
+            MultiByteToWideChar(CP_ACP, 0, bytes, length, text.data(), wide);
+        }
+    }
+    GlobalUnlock(memory);
+    return text;
+}
+
+void PasteDropWidget(WidgetWin& widget) {
+    std::wstring text;
+    if (OpenClipboard(widget.hwnd)) {
+        if (const auto value = GetClipboardData(CF_UNICODETEXT)) text = ReadDropText(value, CF_UNICODETEXT);
+        CloseClipboard();
+    }
+    if (text.empty()) {
+        widget.dropNotice = DropWidgetNotice::EmptyClipboard;
+        widget.dropNoticeUntil = GetTickCount64() + 2400;
+        PaintWidgetWin(widget);
+    } else StageDropWidget(widget, {{}, {std::move(text)}});
+}
+
+class WidgetDropTarget final : public IDropTarget {
+public:
+    explicit WidgetDropTarget(HWND widget) : widget_(widget) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
+        if (!out) return E_POINTER;
+        if (id == IID_IUnknown || id == IID_IDropTarget) { *out = this; AddRef(); return S_OK; }
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG count = InterlockedDecrement(&refs_);
+        if (!count) delete this;
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
+        format_ = 0;
+        if (data) {
+            for (const CLIPFORMAT candidate : {CLIPFORMAT(CF_HDROP), CLIPFORMAT(CF_UNICODETEXT), CLIPFORMAT(CF_TEXT)}) {
+                FORMATETC format{candidate, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+                if (SUCCEEDED(data->QueryGetData(&format))) { format_ = candidate; break; }
+            }
+        }
+        return DragOver(keys, point, effect);
+    }
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL point, DWORD* effect) override {
+        const auto* widget = WidgetOf(widget_);
+        bool accept = false;
+        if (format_ && widget && !EditMode() && (*effect & DROPEFFECT_COPY)) {
+            const auto size = SizeDip(widget->size);
+            const UINT dpi = DpiAt(widget->pos);
+            const RECT body{widget->pos.x, widget->pos.y, widget->pos.x + Px(size.width, dpi), widget->pos.y + Px(size.height, dpi)};
+            accept = PtInRect(&body, POINT{point.x, point.y}) != FALSE;
+        }
+        *effect = accept ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        Highlight(accept);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override { format_ = 0; Highlight(false); return S_OK; }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
+        DragOver(keys, point, effect);
+        if (*effect == DROPEFFECT_NONE) return DragLeave();
+        FORMATETC format{format_, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+        STGMEDIUM medium{};
+        WidgetDraft drop;
+        if (data && SUCCEEDED(data->GetData(&format, &medium))) {
+            if (format_ == CF_HDROP) {
+                const auto files = static_cast<HDROP>(medium.hGlobal);
+                const UINT count = DragQueryFileW(files, 0xFFFFFFFF, nullptr, 0);
+                if (count <= docky::pairing::kWidgetMaxFiles) {
+                    for (UINT i = 0; i < count; ++i) {
+                        const UINT length = DragQueryFileW(files, i, nullptr, 0);
+                        std::wstring path(length + 1, L'\0');
+                        if (!length || !DragQueryFileW(files, i, path.data(), length + 1)) { drop.files.clear(); break; }
+                        path.resize(length);
+                        drop.files.push_back(std::move(path));
+                    }
+                }
+            } else {
+                auto text = ReadDropText(medium.hGlobal, format_);
+                if (!text.empty()) drop.texts.push_back(std::move(text));
+            }
+            ReleaseStgMedium(&medium);
+        }
+        auto* widget = WidgetOf(widget_);
+        const bool saved = widget && StageDropWidget(*widget, drop);
+        *effect = saved ? DROPEFFECT_COPY : DROPEFFECT_NONE;
+        return DragLeave();
+    }
+
+private:
+    void Highlight(bool value) {
+        if (auto* widget = WidgetOf(widget_); widget && widget->dropHover != value) {
+            widget->dropHover = value;
+            PaintWidgetWin(*widget);
+        }
+    }
+    HWND widget_;
+    LONG refs_ = 1;
+    CLIPFORMAT format_ = 0;
+};
 void ShowWidgetMenu(WidgetWin& w, POINT at);
 void OpenGallery();
 void RefreshGallery();
@@ -369,7 +623,9 @@ void StepGlide(HWND h) {
 
 LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_MOUSEACTIVATE:
+        if (const auto* w = WidgetOf(h); w && w->kind == kDropWidgetKind && !EditMode()) return MA_ACTIVATE;
+        return MA_NOACTIVATE;
     case WM_WINDOWPOSCHANGING: if (!desktopRaised && drag.h != h) { auto* p = reinterpret_cast<WINDOWPOS*>(lp); if (!(p->flags & SWP_NOZORDER)) p->hwndInsertAfter = HWND_BOTTOM; } break;
     case WM_LBUTTONDOWN: {
         WidgetWin* w = WidgetOf(h); if (!w) return 0;
@@ -377,6 +633,7 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             const UINT dpi = DpiAt(w->pos); const float x = GET_X_LPARAM(lp) * 96.f / dpi - (kShadow + 3), y = GET_Y_LPARAM(lp) * 96.f / dpi - (kShadow + 3);
             if (x * x + y * y <= 12.f * 12.f) { RemoveWidget(h); RefreshGallery(); return 0; }
         }
+        if (w->kind == kDropWidgetKind && !EditMode()) SetFocus(h);
         glides.erase(std::remove_if(glides.begin(), glides.end(), [&](const Glide& g) { return g.h == h; }), glides.end()); KillTimer(h, kGlideTimer);
         drag = {h, {}, w->pos, false, 0}; GetCursorPos(&drag.start); SetCapture(h); return 0;
     }
@@ -393,6 +650,25 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
                 if (repaint) drag.lastPaint = now;
                 MoveWidget(*w, Magnet(*w, POINT{drag.origin.x + pt.x - drag.start.x, drag.origin.y + pt.y - drag.start.y}), repaint);
             }
+        } else if (auto* w = WidgetOf(h); w && w->kind == kDropWidgetKind && !EditMode()) {
+            if (!w->dropTracking) {
+                TRACKMOUSEEVENT leave{sizeof(leave), TME_LEAVE, h, 0};
+                w->dropTracking = TrackMouseEvent(&leave) != FALSE;
+            }
+            const auto layout = DropLayoutOf(*w);
+            const auto point = DropPoint(*w, lp);
+            const int start = w->dropPage * layout.Capacity();
+            int hovered = -1;
+            for (int i = start; i < std::min(static_cast<int>(dropEntries.size()), start + layout.Capacity()); ++i) {
+                if (DropContains(layout.Tile(i - start), point)) { hovered = i; break; }
+            }
+            if (hovered != w->dropPreview) { w->dropPreview = hovered; PaintWidgetWin(*w); }
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (auto* w = WidgetOf(h); w && w->kind == kDropWidgetKind) {
+            w->dropTracking = false;
+            if (w->dropPreview >= 0) { w->dropPreview = -1; PaintWidgetWin(*w); }
         }
         return 0;
     case WM_LBUTTONUP: {
@@ -405,7 +681,13 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (EditMode() && PtInRect(&gr, pt)) { RemoveWidget(h); RefreshGallery(); return 0; }  // dropped back on the gallery
             StartGlide(*w, Settle(*w, w->pos)); SaveConfig(); return 0;
         }
-        if (ExtWidget* e = FindExt(w->kind)) {
+        if (w->kind == kDropWidgetKind && !EditMode()) {
+            const auto layout = DropLayoutOf(*w);
+            const auto point = DropPoint(*w, lp);
+            if (DropContains(layout.open, point)) OpenDropWidget(*w);
+            else if (DropContains(layout.previous, point)) ChangeDropPage(*w, -1);
+            else if (DropContains(layout.next, point)) ChangeDropPage(*w, 1);
+        } else if (ExtWidget* e = FindExt(w->kind)) {
             if (e->notify && IsWindow(e->notify)) {
                 const UINT dpi = DpiAt(w->pos); POINT pt{}; GetCursorPos(&pt);
                 const auto s = SizeDip(w->size);
@@ -416,10 +698,30 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         } else OpenBuiltin(w->kind);
         return 0;
     }
+    case WM_SETFOCUS:
+    case WM_KILLFOCUS:
+        if (auto* w = WidgetOf(h); w && w->kind == kDropWidgetKind) PaintWidgetWin(*w);
+        break;
+    case WM_PASTE:
+    case WM_KEYDOWN:
+        if (auto* w = WidgetOf(h); w && w->kind == kDropWidgetKind && !EditMode()) {
+            if (m == WM_PASTE || (wp == 'V' && (GetKeyState(VK_CONTROL) & 0x8000))) {
+                if (m == WM_PASTE || !(lp & 0x40000000)) PasteDropWidget(*w);
+                return 0;
+            }
+            if (wp == VK_RETURN && !(lp & 0x40000000)) { OpenDropWidget(*w); return 0; }
+            if (wp == VK_LEFT || wp == VK_RIGHT) { ChangeDropPage(*w, wp == VK_LEFT ? -1 : 1); return 0; }
+        }
+        break;
     case WM_TIMER: if (wp == kGlideTimer) StepGlide(h); else if (wp == kScrollTimer) StepScroll(h); return 0;
     case WM_MOUSEWHEEL: {  // Calendar and Weather scroll (one notch = 48 DIP; touchpads send finer steps)
         WidgetWin* w = WidgetOf(h);
-        if (!w || !Scrollable(w->kind) || EditMode() || drag.h) return 0;
+        if (!w || EditMode() || drag.h) return 0;
+        if (w->kind == kDropWidgetKind) {
+            ChangeDropPage(*w, GET_WHEEL_DELTA_WPARAM(wp) > 0 ? -1 : 1);
+            return 0;
+        }
+        if (!Scrollable(w->kind)) return 0;
         if (w->scrollMax <= w->scrollMin) { PaintWidgetWin(*w); if (w->scrollMax <= w->scrollMin) return 0; }  // range known after a paint
         const float delta = -static_cast<float>(GET_WHEEL_DELTA_WPARAM(wp)) / WHEEL_DELTA * 48.f;
         w->lastScroll = GetTickCount64();
@@ -434,13 +736,22 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_RBUTTONUP: { WidgetWin* w = WidgetOf(h); if (w) { POINT pt{}; GetCursorPos(&pt); ShowWidgetMenu(*w, pt); } return 0; }
     case WM_DPICHANGED: if (WidgetWin* w = WidgetOf(h)) { PlaceWidget(*w, true); PaintWidgetWin(*w); } return 0;
+    case WM_DESTROY:
+        if (auto* widget = WidgetOf(h); widget && widget->dropRegistered) RevokeDragDrop(h);
+        return 0;
     }
     return DefWindowProcW(h, m, wp, lp);
 }
 
 bool CreateWidgetWindow(WidgetWin& w) {
-    w.hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, kWidgetClass, L"DockOver widget", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    const DWORD style = WS_EX_LAYERED | WS_EX_TOOLWINDOW | (w.kind == kDropWidgetKind ? 0 : WS_EX_NOACTIVATE);
+    w.hwnd = CreateWindowExW(style, kWidgetClass, L"DockOver widget", WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
     if (!w.hwnd) return false;
+    if (w.kind == kDropWidgetKind) {
+        auto* target = new WidgetDropTarget(w.hwnd);
+        w.dropRegistered = SUCCEEDED(RegisterDragDrop(w.hwnd, target));
+        target->Release();
+    }
     RegisterLayer(w.hwnd, w.canvas.get());  // liquid glass menus and panels refract the widgets under them
     PlaceWidget(w, false); PaintWidgetWin(w); ShowWindow(w.hwnd, SW_SHOWNOACTIVATE); PlaceWidget(w, true);
     return true;
@@ -493,7 +804,8 @@ void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND w, LONG, LONG, DWORD, DWOR
 // ---- Menus (docky's unified popup, opaque theme: this app has no screen capture) --------------------------------
 using liquid::menu::ItemKind; using liquid::menu::MenuItem;
 constexpr UINT kCmdAdd = 0x100, kCmdSize = 0x200, kCmdRemove = 0x300, kCmdGallery = 0x301, kCmdStacks = 0x302, kCmdGroupKind = 0x303,
-               kCmdGroupDate = 0x304, kCmdHideIcons = 0x305, kCmdQuit = 0x306, kCmdInPlace = 0x307, kCmdPanel = 0x308, kCmdSettings = 0x309, kCmdEdit = 0x30A, kCmdAddExt = 0x400;
+               kCmdGroupDate = 0x304, kCmdHideIcons = 0x305, kCmdQuit = 0x306, kCmdInPlace = 0x307, kCmdPanel = 0x308, kCmdSettings = 0x309, kCmdEdit = 0x30A,
+               kCmdClearDockDrop = 0x30B, kCmdPasteDockDrop = 0x30C, kCmdAddExt = 0x400;
 std::vector<MenuItem> AddItems() {
     std::vector<MenuItem> items;
     const auto kinds = BuiltinKinds();
@@ -504,18 +816,18 @@ std::vector<MenuItem> AddItems() {
 }
 std::vector<MenuItem> AppItems() {
     std::vector<MenuItem> items;
-    items.push_back({L"Edit Widgets…", ItemKind::Command, true, false, {}, kCmdGallery});
-    items.push_back({L"Widgets & Stacks Settings\u2026", ItemKind::Command, true, false, {}, kCmdSettings});
-    items.push_back({L"Add Widget", ItemKind::Submenu, true, false, AddItems()});
+    items.push_back({docky::ui::Text(L"Edit Widgets…"), ItemKind::Command, true, false, {}, kCmdGallery});
+    items.push_back({docky::ui::Text(L"Widgets & Stacks Settings\u2026"), ItemKind::Command, true, false, {}, kCmdSettings});
+    items.push_back({docky::ui::Text(L"Add Widget"), ItemKind::Submenu, true, false, AddItems()});
     items.push_back({L"", ItemKind::Separator, false, false, {}});
-    items.push_back({L"Use Stacks", ItemKind::Command, true, config.stacks, {}, kCmdStacks});
-    items.push_back({L"Group Stacks By", ItemKind::Submenu, config.stacks, false,
-                     {{L"Kind", ItemKind::Command, true, config.by == GroupBy::Kind, {}, kCmdGroupKind}, {L"Date Modified", ItemKind::Command, true, config.by == GroupBy::Date, {}, kCmdGroupDate}}});
-    items.push_back({L"Open Stacks", ItemKind::Submenu, config.stacks, false,
-                     {{L"On the Desktop", ItemKind::Command, true, config.style == StackStyle::InPlace, {}, kCmdInPlace}, {L"In a Glass Panel", ItemKind::Command, true, config.style == StackStyle::Panel, {}, kCmdPanel}}});
-    items.push_back({L"Hide Windows Desktop Icons", ItemKind::Command, config.stacks, config.hideIcons, {}, kCmdHideIcons});
+    items.push_back({docky::ui::Text(L"Use Stacks"), ItemKind::Command, true, config.stacks, {}, kCmdStacks});
+    items.push_back({docky::ui::Text(L"Group Stacks By"), ItemKind::Submenu, config.stacks, false,
+                     {{docky::ui::Text(L"Kind"), ItemKind::Command, true, config.by == GroupBy::Kind, {}, kCmdGroupKind}, {docky::ui::Text(L"Date Modified"), ItemKind::Command, true, config.by == GroupBy::Date, {}, kCmdGroupDate}}});
+    items.push_back({docky::ui::Text(L"Open Stacks"), ItemKind::Submenu, config.stacks, false,
+                     {{docky::ui::Text(L"On the Desktop"), ItemKind::Command, true, config.style == StackStyle::InPlace, {}, kCmdInPlace}, {docky::ui::Text(L"In a Glass Panel"), ItemKind::Command, true, config.style == StackStyle::Panel, {}, kCmdPanel}}});
+    items.push_back({docky::ui::Text(L"Hide Windows Desktop Icons"), ItemKind::Command, config.stacks, config.hideIcons, {}, kCmdHideIcons});
     items.push_back({L"", ItemKind::Separator, false, false, {}});
-    items.push_back({L"Quit DockOver Desktop", ItemKind::Command, true, false, {}, kCmdQuit});
+    items.push_back({docky::ui::Text(L"Quit DockOver Desktop"), ItemKind::Command, true, false, {}, kCmdQuit});
     return items;
 }
 void ApplyStacks() {
@@ -532,6 +844,12 @@ void Command(UINT id, HWND widget) {
     else if (id >= kCmdAddExt && id < kCmdAddExt + extWidgets.size()) AddWidget(L"ext:" + extWidgets[id - kCmdAddExt].id, extWidgets[id - kCmdAddExt].size);
     else if (id >= kCmdSize && id < kCmdSize + 3) { if (WidgetWin* w = WidgetOf(widget)) { w->size = static_cast<Size>(id - kCmdSize); w->pos = Settle(*w, w->pos); PlaceWidget(*w, true); PaintWidgetWin(*w); SaveConfig(); } }
     else if (id == kCmdRemove) RemoveWidget(widget);
+    else if (id == kCmdClearDockDrop) {
+        if (WidgetQueue().Write({})) { RefreshDropDraft(); RepaintAll(); }
+    }
+    else if (id == kCmdPasteDockDrop) {
+        if (auto* w = WidgetOf(widget); w && w->kind == kDropWidgetKind) PasteDropWidget(*w);
+    }
     else if (id == kCmdGallery) { if (gallery) CloseGallery(); else OpenGallery(); }  // Edit Widgets toggles
     else if (id == kCmdSettings) OpenSettings();
     else if (id == kCmdEdit) EditWidget(widget);
@@ -561,12 +879,16 @@ void ShowWidgetMenu(WidgetWin& w, POINT at) {
     items.push_back({L"", ItemKind::Separator, false, false, {}});
     // macOS: "Edit “Weather”…" opens the widget's own settings beside it; general settings stay separate
     if (WidgetHasPage(w)) items.push_back({L"Edit \u201C" + WidgetName(w) + L"\u201D\u2026", ItemKind::Command, true, false, {}, kCmdEdit});
-    items.push_back({L"Remove Widget", ItemKind::Command, true, false, {}, kCmdRemove});
+    if (w.kind == kDropWidgetKind) {
+        items.push_back({docky::ui::Text(L"Paste Text"), ItemKind::Command, IsClipboardFormatAvailable(CF_UNICODETEXT) != FALSE, false, {}, kCmdPasteDockDrop});
+        items.push_back({docky::ui::Text(L"Clear Staged Items"), ItemKind::Command, !dropEntries.empty(), false, {}, kCmdClearDockDrop});
+    }
+    items.push_back({docky::ui::Text(L"Remove Widget"), ItemKind::Command, true, false, {}, kCmdRemove});
     items.push_back({L"", ItemKind::Separator, false, false, {}});
-    items.push_back({L"Edit Widgets…", ItemKind::Command, true, false, {}, kCmdGallery});
-    items.push_back({L"Widgets & Stacks Settings\u2026", ItemKind::Command, true, false, {}, kCmdSettings});
+    items.push_back({docky::ui::Text(L"Edit Widgets…"), ItemKind::Command, true, false, {}, kCmdGallery});
+    items.push_back({docky::ui::Text(L"Widgets & Stacks Settings\u2026"), ItemKind::Command, true, false, {}, kCmdSettings});
     items.push_back({L"", ItemKind::Separator, false, false, {}});
-    items.push_back({L"Quit DockOver Desktop", ItemKind::Command, true, false, {}, kCmdQuit});
+    items.push_back({docky::ui::Text(L"Quit DockOver Desktop"), ItemKind::Command, true, false, {}, kCmdQuit});
     (void)ext;
     ShowMenu(std::move(items), at, w.hwnd);
 }
@@ -594,7 +916,7 @@ bool EditMode() { return gallery != nullptr; }
 
 D2D1_COLOR_F Rgb(unsigned c, float a = 1.f) { return D2D1::ColorF(((c >> 16) & 255) / 255.f, ((c >> 8) & 255) / 255.f, (c & 255) / 255.f, a); }
 std::vector<GalleryRow> GalleryRows() {
-    std::vector<GalleryRow> rows{{L"", L"All Widgets", L"", 0x8E8E93}};
+    std::vector<GalleryRow> rows{{L"", docky::ui::Text(L"All Widgets"), L"", 0x8E8E93}};
     const struct { const wchar_t* id; const wchar_t* glyph; unsigned color; } builtins[] = {
         {L"Clock", L"", 0x1C1C1E}, {L"Calendar", L"", 0xFF3B30}, {L"Weather", L"\uE753", 0x2F7AD6}, {L"Batteries", L"", 0x30D158}, {L"System", L"", 0x0A84FF}};
     for (const auto& b : builtins) rows.push_back({b.id, b.id, b.glyph, b.color});
@@ -657,7 +979,7 @@ void PaintGallery() {
         b->SetColor(D2D1::ColorF(0.04f, 0.52f, 1.f, 0.9f));
         if (GetForegroundWindow() == gallery) dc->DrawRoundedRectangle(D2D1::RoundedRect(gallerySearchBox, 14, 14), b.Get(), 1.5f);
         Text(dc, L"", IconFont(12.f), D2D1::RectF(gallerySearchBox.left + 8, gallerySearchBox.top, gallerySearchBox.left + 28, gallerySearchBox.bottom), dim);
-        Text(dc, gallerySearch.empty() ? L"Search Widgets" : gallerySearch, Font(12.5f), D2D1::RectF(gallerySearchBox.left + 30, gallerySearchBox.top, gallerySearchBox.right - 8, gallerySearchBox.bottom), gallerySearch.empty() ? dim : ink);
+        Text(dc, gallerySearch.empty() ? docky::ui::Text(L"Search Widgets") : gallerySearch, Font(12.5f), D2D1::RectF(gallerySearchBox.left + 30, gallerySearchBox.top, gallerySearchBox.right - 8, gallerySearchBox.bottom), gallerySearch.empty() ? dim : ink);
         // Sidebar rows
         for (size_t i = 0; i < galleryRows.size(); ++i) {
             const auto& r = galleryRows[i];
@@ -675,18 +997,18 @@ void PaintGallery() {
         if (all) {  // header card
             const D2D1_RECT_F card = D2D1::RectF(cl, 14, cr, 112);
             b->SetColor(D2D1::ColorF(1, 1, 1, 0.08f)); dc->FillRoundedRectangle(D2D1::RoundedRect(card, 14, 14), b.Get());
-            Text(dc, L"Widgets on Desktop", Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(card.left + 18, card.top + 14, card.right - 196, card.top + 36), ink);
+            Text(dc, docky::ui::Text(L"Widgets on Desktop"), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(card.left + 18, card.top + 14, card.right - 196, card.top + 36), ink);
             ComPtr<IDWriteTextFormat> wrap;
             if (SUCCEEDED(DWrite()->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.f, L"", &wrap)))
-                Text(dc, L"Place widgets directly on the desktop by dragging them from the gallery, or click one to add it. Widgets snap to each other and to the grid.", wrap.Get(),
+                Text(dc, docky::ui::Text(L"Place widgets directly on the desktop by dragging them from the gallery, or click one to add it. Widgets snap to each other and to the grid."), wrap.Get(),
                      D2D1::RectF(card.left + 18, card.top + 40, card.right - 196, card.bottom - 10), dim);
             gallerySettingsLink = D2D1::RectF(card.right - 168, card.top + 35, card.right - 22, card.top + 63);
             b->SetColor(D2D1::ColorF(1, 1, 1, 0.14f)); dc->FillRoundedRectangle(D2D1::RoundedRect(gallerySettingsLink, 14, 14), b.Get());
-            Text(dc, L"Widget Settings…", Font(12.5f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), gallerySettingsLink, ink);
-            Text(dc, L"Suggestions", Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(cl + 2, 124, cr, 142), dim);
+            Text(dc, docky::ui::Text(L"Widget Settings…"), Font(12.5f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), gallerySettingsLink, ink);
+            Text(dc, docky::ui::Text(L"Suggestions"), Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(cl + 2, 124, cr, 142), dim);
         } else {
             gallerySettingsLink = D2D1::RectF();
-            Text(dc, gallerySearch.empty() ? galleryRows[static_cast<size_t>(galleryRowSel)].name : L"Results", Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(cl + 2, 14, cr, 38), ink);
+            Text(dc, gallerySearch.empty() ? galleryRows[static_cast<size_t>(galleryRowSel)].name : docky::ui::Text(L"Results"), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(cl + 2, 14, cr, 38), ink);
         }
         // Previews (scrolled), clipped to the content area
         const float clipTop = all ? 146.f : 42.f;
@@ -708,11 +1030,11 @@ void PaintGallery() {
             if (static_cast<int>(i) == galleryHover) { b->SetColor(D2D1::ColorF(1, 1, 1, 0.55f)); dc->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(r.left - 3, r.top - 3, r.right + 3, r.bottom + 3), 14, 14), b.Get(), 2.f); }
         }
         dc->PopAxisAlignedClip();
-        if (galleryTiles.empty()) Text(dc, L"No widgets match", Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cl, 150, cr, 180), dim);
+        if (galleryTiles.empty()) Text(dc, docky::ui::Text(L"No widgets match"), Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(cl, 150, cr, 180), dim);
         // Bottom bar
-        Text(dc, L"Drag a widget to place it on the desktop…", Font(12.5f), D2D1::RectF(16, H - 40, W - 120, H - 12), dim);
+        Text(dc, docky::ui::Text(L"Drag a widget to place it on the desktop…"), Font(12.5f), D2D1::RectF(16, H - 40, W - 120, H - 12), dim);
         b->SetColor(D2D1::ColorF(0.04f, 0.52f, 1.f, 1.f)); dc->FillRoundedRectangle(D2D1::RoundedRect(galleryDone, 14, 14), b.Get());
-        Text(dc, L"Done", Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), galleryDone, D2D1::ColorF(1, 1, 1, 1));
+        Text(dc, docky::ui::Text(L"Done"), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), galleryDone, D2D1::ColorF(1, 1, 1, 1));
     });
 }
 void RefreshGallery() { if (gallery) { LayoutGallery(); PaintGallery(); } }
@@ -1078,7 +1400,7 @@ void PaintSettings() {
         Text(dc, SettingsTitle(), Font(17.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(24, 18, W - 120, 46), ink);
         const D2D1_RECT_F done = D2D1::RectF(W - 96, 18, W - 22, 46);
         b->SetColor(D2D1::ColorF(0.04f, 0.52f, 1.f, 1)); dc->FillRoundedRectangle(D2D1::RoundedRect(done, 14, 14), b.Get());
-        Text(dc, L"Done", Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), done, D2D1::ColorF(1, 1, 1, 1));
+        Text(dc, docky::ui::Text(L"Done"), Font(13.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), done, D2D1::ColorF(1, 1, 1, 1));
         controls.push_back({Ctl::Done, done});
         float y = 62;
         auto section = [&](const wchar_t* title, int rows) {
@@ -1202,10 +1524,10 @@ void PaintSettings() {
                 }
                 y = top + rows * 40.f + 14;
             }
-            Text(dc, L"DEVICES", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim);
+            Text(dc, docky::ui::Text(L"DEVICES"), Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim);
             if (!settingsDevices.empty()) {
-                Text(dc, L"Widget", Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(colWidget - 40, y, colWidget + 40, y + 18), dim);
-                Text(dc, L"Menu Bar", Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(colMenu - 40, y, colMenu + 40, y + 18), dim);
+                Text(dc, docky::ui::Text(L"Widget"), Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(colWidget - 40, y, colWidget + 40, y + 18), dim);
+                Text(dc, docky::ui::Text(L"Menu Bar"), Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER), D2D1::RectF(colMenu - 40, y, colMenu + 40, y + 18), dim);
             }
             y += 22;
             const float rowsH = 40.f + kDeviceRow * settingsDevices.size();
@@ -1247,11 +1569,11 @@ void PaintSettings() {
             // CALENDARS: one row per subscription. The dot is its colour (click: a colour wheel opens under the row),
             // the title its own name (or the link's site), the subtitle what the last fetch found; the minus removes
             // it (with Undo).
-            Text(dc, L"CALENDARS", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
+            Text(dc, docky::ui::Text(L"CALENDARS"), Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
             const float listH = (std::max<size_t>)(1, n) * kCalRow + (calPicker >= 0 ? kCalPickerH : 0.f);
             b->SetColor(D2D1::ColorF(1, 1, 1, 0.08f)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(16, y, W - 16, y + listH), 12, 12), b.Get());
             if (!n) {
-                Text(dc, L"No calendars yet", Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(30, y + 8, W - 30, y + 28), ink);
+                Text(dc, docky::ui::Text(L"No calendars yet"), Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(30, y + 8, W - 30, y + 28), ink);
                 Text(dc, L"Add one below. Its events appear in the Calendar widget.", Font(11.5f), D2D1::RectF(30, y + 27, W - 30, y + 45), dim);
             }
             for (size_t i = 0; i < n; ++i) {
@@ -1297,7 +1619,7 @@ void PaintSettings() {
                     b->SetColor(D2D1::ColorF(0, 0, 0, 0.25f)); dc->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(kx, ky), 8.5f, 8.5f), b.Get(), 1.f);
                     controls.push_back({Ctl::CalWheel, D2D1::RectF(c.x - kCalWheelR - 6, c.y - kCalWheelR - 6, c.x + kCalWheelR + 6, c.y + kCalWheelR + 6)});
                 }
-                Text(dc, L"Brightness", Font(11.5f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(200, pTop + 16, W - 36, pTop + 34), dim);
+                Text(dc, docky::ui::Text(L"Brightness"), Font(11.5f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(200, pTop + 16, W - 36, pTop + 34), dim);
                 {   // brightness: black to the full colour
                     const auto bar = CalBrightBar(pTop, W);
                     D2D1_GRADIENT_STOP stops[2] = {{0.f, D2D1::ColorF(0, 0, 0, 1)}, {1.f, ColourF(HsvToRgb(calH, calS, 1))}};
@@ -1325,14 +1647,14 @@ void PaintSettings() {
                     const bool down = SettingsPressed(Ctl::CalPickerDone);
                     b->SetColor(D2D1::ColorF(accent.r * (down ? .8f : 1.f), accent.g * (down ? .8f : 1.f), accent.b * (down ? .85f : 1.f), 1));
                     dc->FillRoundedRectangle(D2D1::RoundedRect(doneBtn, 8, 8), b.Get());
-                    Text(dc, L"Done", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), doneBtn, D2D1::ColorF(1, 1, 1, 1));
+                    Text(dc, docky::ui::Text(L"Done"), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), doneBtn, D2D1::ColorF(1, 1, 1, 1));
                     controls.push_back({Ctl::CalPickerDone, doneBtn});
                 }
             }
             y += listH + 14;
             // ADD CALENDAR: a field for a pasted link (Enter adds it) and Add; the line under it is the hint, or what
             // went wrong, or Undo after a removal.
-            Text(dc, L"ADD CALENDAR", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
+            Text(dc, docky::ui::Text(L"ADD CALENDAR"), Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(28, y, W - 24, y + 18), dim); y += 22;
             b->SetColor(D2D1::ColorF(1, 1, 1, 0.08f)); dc->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(16, y, W - 16, y + kCalFieldRow), 12, 12), b.Get());
             const D2D1_RECT_F field = D2D1::RectF(26, y + 8, W - 30 - 64, y + kCalFieldRow - 8), add = D2D1::RectF(W - 30 - 56, y + 8, W - 26, y + kCalFieldRow - 8);
             b->SetColor(D2D1::ColorF(1, 1, 1, calFocus ? 0.14f : 0.09f)); dc->FillRoundedRectangle(D2D1::RoundedRect(field, 8, 8), b.Get());
@@ -1357,13 +1679,13 @@ void PaintSettings() {
             const bool canAdd = !calconfig::Trim(calField).empty(), addDown = SettingsPressed(Ctl::CalAdd);
             b->SetColor(canAdd ? D2D1::ColorF(accent.r * (addDown ? .8f : 1.f), accent.g * (addDown ? .8f : 1.f), accent.b * (addDown ? .85f : 1.f), 1) : D2D1::ColorF(1, 1, 1, addDown ? 0.22f : 0.12f));
             dc->FillRoundedRectangle(D2D1::RoundedRect(add, 8, 8), b.Get());
-            Text(dc, L"Add", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), add, canAdd ? D2D1::ColorF(1, 1, 1, 1) : dim);
+            Text(dc, docky::ui::Text(L"Add"), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), add, canAdd ? D2D1::ColorF(1, 1, 1, 1) : dim);
             controls.push_back({Ctl::CalAdd, add});
             y += kCalFieldRow + 6;
             if (calUndo.active) {
                 Text(dc, L"Removed “" + calUndo.name + L"”.", Font(11.5f), D2D1::RectF(28, y, W - 100, y + 20), dim);
                 const D2D1_RECT_F undo = D2D1::RectF(W - 30 - 56, y, W - 26, y + 20);
-                Text(dc, L"Undo", Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), undo, SettingsPressed(Ctl::CalUndo) ? dim : accent);
+                Text(dc, docky::ui::Text(L"Undo"), Font(11.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING), undo, SettingsPressed(Ctl::CalUndo) ? dim : accent);
                 controls.push_back({Ctl::CalUndo, D2D1::RectF(undo.left - 8, undo.top - 4, undo.right + 4, undo.bottom + 4)});
             } else if (!calError.empty()) Text(dc, calError, Font(11.5f), D2D1::RectF(28, y, W - 24, y + 20), danger);
             else Text(dc, L"Outlook, Google, iCloud and Canvas each offer a private iCal link.", Font(11.5f), D2D1::RectF(28, y, W - 24, y + 20), dim);
@@ -1989,7 +2311,7 @@ LRESULT CALLBACK HostProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SampleSystem();
             if (Wallpaper::Get().Stale()) { Wallpaper::Get().Invalidate(); RepaintAll(); GetStacks().Relayout(); }  // new wallpaper, no broadcast
             const auto rev = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
-            if (rev != themeRevision) { themeRevision = rev; ThemeChanged(); const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
+            if (rev != themeRevision) { themeRevision = rev; ThemeChanged(); const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; docky::ui::SetLanguage(pf.appearance.language); gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
             static int ticks = 0;
             if (++ticks % 5 == 0) {
                 ReloadManifests();
@@ -2128,7 +2450,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     liquid::popup::SetRenderDevice(SharedUiDevice());  // menus, panels and halos share one device (see SharedUiDevice)
     { wchar_t local[MAX_PATH]{}; if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, MAX_PATH)) dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(local) + L"\\LiquidDock\\glass.json"); }
     themeRevision = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
-    { const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
+    { const auto pf = liquid::settings::Load(liquid::settings::DefaultPath()).value; docky::ui::SetLanguage(pf.appearance.language); gameCompatDesktop = pf.dock.gameCompatibility; docky::vblank::SetCaps(pf.performance.animationFps, pf.performance.captureFps); }
     theme = CurrentTheme();
     { const auto p = liquid::theme::Palette(theme.dark ? 2 : 1, theme.dark, theme.contrast); liquid::popup::SetTheme(theme.contrast || !theme.dark, liquid::theme::ColorRef(p.surface), liquid::theme::ColorRef(p.primary)); }
     SampleSystem();

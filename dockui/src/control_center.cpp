@@ -1,4 +1,5 @@
 #include "control_center.h"
+#include "ui_language.h"
 #include "audio_output_icons.h"
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -1057,7 +1058,8 @@ bool Panel::RefreshTheme(){
 void Panel::Text(const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, float alpha, D2D1::ColorF c) {
     if(forceOpaque_&&c.r==1.f&&c.g==1.f&&c.b==1.f)c=Ink(c.a);
     brush_->SetColor(D2D1::ColorF(c.r, c.g, c.b, c.a * alpha));
-    dc_->DrawTextW(s.c_str(), static_cast<UINT32>(s.size()), f, r, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    const auto text = docky::ui::Text(s.c_str());
+    dc_->DrawTextW(text, static_cast<UINT32>(wcslen(text)), f, r, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void Panel::CenteredText(const std::wstring& s, IDWriteTextFormat* f, D2D1_RECT_F r, float alpha, D2D1::ColorF c) {

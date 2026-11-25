@@ -1,4 +1,6 @@
 #include "notification_center.h"
+#include "ui_language.h"
+#include "notification_card_metrics.h"
 
 #include "backdrop_wgc.h"
 #include "design_tokens.h"
@@ -838,7 +840,9 @@ private:
 // semibold, 18 line, baseline 14) starts 10 below the card top, the body (13.5, 15.6 pitch) 28.85 below it, and 12.35
 // stay below the last line (title + one line = 56.8, + two = 72.4). Cards are 8 apart, plus 8 per stacked plate; the
 // plates are inset 16 and 33 on both sides.
-constexpr float kCardW = 343.0f, kCardRadius = 20.0f, kIcon = 34.0f, kIconX = 13.0f, kTextX = 57.5f, kTextR = 13.0f;
+constexpr float kCardW = docky::notification_card::Width, kCardRadius = docky::notification_card::Radius,
+    kIcon = docky::notification_card::Icon, kIconX = docky::notification_card::IconInset,
+    kTextX = docky::notification_card::TextInset, kTextR = docky::notification_card::IconInset;
 constexpr float kTitleTop = 10.0f, kTitleLine = 18.0f, kBodyTop = 28.85f, kLineH = 15.6f, kBottomPad = 12.35f;
 constexpr float kCardGap = 8.0f, kPlateStep = 8.0f, kPlateInset1 = 16.0f, kPlateInset2 = 33.0f;
 constexpr int kMaxLines = 4, kBannerLines = 3;
@@ -1416,7 +1420,7 @@ void Center::Frame() {
     dc_->SetTransform(D2D1::Matrix3x2F::Translation(dx, 0));
     const auto white = [&](float k) { return g.opaque ? Ink(k * a) : D2D1::ColorF(1, 1, 1, k * a); };
     // Header: "Notification Center" (18 bold, baseline 12 above the first card) and the clear button at the right.
-    Text(L"Notification Center", g.header.Get(), D2D1::RectF(Left() + 2.0f, ListTop() - 31.0f, Right() - 90.0f, ListTop() - 7.0f), white(0.96f));
+    Text(docky::ui::Text(L"Notification Center"), g.header.Get(), D2D1::RectF(Left() + 2.0f, ListTop() - 31.0f, Right() - 90.0f, ListTop() - 7.0f), white(0.96f));
     if (!items_.empty()) {
         const auto c = HeaderClose();
         if (hover_ == Hit::Clear) {
@@ -1425,7 +1429,7 @@ void Center::Frame() {
             dc_->FillRoundedRectangle(D2D1::RoundedRect(p, 12.0f, 12.0f), brush_.Get());
             brush_->SetColor(g.opaque ? Rgb(g.palette.divider, a) : D2D1::ColorF(1, 1, 1, 0.16f * a));
             dc_->DrawRoundedRectangle(D2D1::RoundedRect(p, 12.0f, 12.0f), brush_.Get(), 1.0f / scale);
-            Text(L"Clear All", g.button.Get(), p, white(0.9f));
+            Text(docky::ui::Text(L"Clear All"), g.button.Get(), p, white(0.9f));
         } else CloseButton(c, 10.0f, a, false);
     }
     dc_->PushAxisAlignedClip(D2D1::RectF(-dx - 20.0f, clipTop, Right() + kMarginR, clipBottom), D2D1_ANTIALIAS_MODE_ALIASED);
@@ -1457,7 +1461,7 @@ void Center::Frame() {
             const auto p = D2D1::RectF(r.right - 84.0f, r.top + 3.0f, r.right, r.bottom - 3.0f);
             brush_->SetColor(g.opaque ? Rgb(g.palette.surface, ra) : D2D1::ColorF(0.24f, 0.24f, 0.26f, (hover_ == Hit::ShowLess ? 0.98f : 0.85f) * ra));
             dc_->FillRoundedRectangle(D2D1::RoundedRect(p, 12.0f, 12.0f), brush_.Get());
-            Text(L"Show Less", g.button.Get(), p, white(0.88f * row.appear.F()));
+            Text(docky::ui::Text(L"Show Less"), g.button.Get(), p, white(0.88f * row.appear.F()));
             if (clipped) dc_->PopAxisAlignedClip();
             continue;
         }
@@ -1482,7 +1486,7 @@ void Center::Frame() {
     // Bottom controls.
     Body(pill, 12.0f, a, pillGlass);
     if (hover_ == Hit::EditWidgets) { brush_->SetColor(D2D1::ColorF(1, 1, 1, 0.06f * a)); dc_->FillRoundedRectangle(D2D1::RoundedRect(pill, 12.0f, 12.0f), brush_.Get()); }
-    Text(L"Edit Widgets", g.button.Get(), pill, white(0.62f));
+    Text(docky::ui::Text(L"Edit Widgets"), g.button.Get(), pill, white(0.62f));
     {
         const auto c = BottomClose();
         const auto cr = D2D1::RectF(c.x - 11.5f, c.y - 11.5f, c.x + 11.5f, c.y + 11.5f);
@@ -1601,7 +1605,7 @@ void Banner::Show(const Item& item) {
     // 10 DIP below the menu bar (the work area's top when the bar reserves it), 17 DIP from the screen edge (the panel's margin).
     const LONG top = (std::max)(mi.rcWork.top, mi.rcMonitor.top + static_cast<LONG>(std::lround(24 * s))) + static_cast<LONG>(std::lround((10 - kPad) * s));
     const LONG w = static_cast<LONG>(std::lround((kCardW + 2 * kPad) * s)), h = static_cast<LONG>(std::lround((cardH_ + 2 * kPad) * s));
-    const LONG right = mi.rcMonitor.right - static_cast<LONG>(std::lround((17 - kPad) * s));
+    const LONG right = mi.rcMonitor.right - static_cast<LONG>(std::lround((docky::notification_card::RightMargin - kPad) * s));
     if (!Place(RECT{right - w, top, right, top + h})) { DLOG(L"notify: banner placement failed"); Destroy(); return; }
     leaving_ = false; hover_ = closeHot_ = pressed_ = false;
     // macOS: the banner slides in from beyond the right edge with a short, lightly damped spring.

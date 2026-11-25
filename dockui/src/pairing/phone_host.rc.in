@@ -1,0 +1,6 @@
+201 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/src/pairing/phone_host.html"
+202 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/web/dockdrop-scan/pair.js"
+203 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/web/dockdrop-scan/config.js"
+204 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/web/dockdrop-scan/bubble/bubble-code.js"
+205 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/web/dockdrop-scan/bubble/qr.js"
+206 RCDATA "@CMAKE_CURRENT_SOURCE_DIR@/web/dockdrop-scan/bubble/transfer.js"

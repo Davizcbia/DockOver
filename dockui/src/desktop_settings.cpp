@@ -37,6 +37,18 @@ Result Load(const std::wstring& path) {
         const auto* section=root.Find(name);
         if(section&&!section->IsObject()){r.status=LoadStatus::Invalid;return r;}
     }
+    if (const auto* phone = root.Find("phonePairing"); phone && phone->IsObject()) {
+        if (const auto* radius = phone->Find("ballRadius"); radius && radius->type == dock::json::Value::Type::Number
+            && radius->number >= kPhoneBallMinimum && radius->number <= kPhoneBallMaximum
+            && std::floor(radius->number) == radius->number) {
+            r.value.phoneBallRadius = static_cast<int>(radius->number);
+        }
+        if (const auto* folder = phone->Find("receiveFolder"); folder && folder->type == dock::json::Value::Type::String) {
+            r.value.phoneReceiveFolder = dock::json::FromUtf8(folder->string);
+        }
+        if (const auto* bubble = phone->Find("pcReceiveBubble"); bubble && bubble->type == dock::json::Value::Type::Bool)
+            r.value.pcReceiveBubble = bubble->boolean;
+    }
     if(const auto* section=root.Find("dock")) if(const auto* diag=section->Find("diagnostics")){
         if(diag->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;return r;}
         r.value.dock.diagnostics=diag->boolean;
@@ -188,6 +200,10 @@ Result Load(const std::wstring& path) {
             }
         }
         if(const auto* v=section->Find("lyricsBeat");v&&v->type==dock::json::Value::Type::Bool)r.value.controlCenter.lyricsBeat=v->boolean;
+        if(const auto* v=section->Find("musicSensitivity");v&&v->type==dock::json::Value::Type::Number&&
+           v->number>=0&&v->number<=100)r.value.controlCenter.musicSensitivity=static_cast<int>(v->number);
+        if(const auto* v=section->Find("musicResponse");v&&v->type==dock::json::Value::Type::Number&&
+           (v->number==0||v->number==1||v->number==2))r.value.controlCenter.musicResponse=static_cast<int>(v->number);
         if(const auto* v=section->Find("musicFps");v&&v->type==dock::json::Value::Type::Number){const int f=static_cast<int>(v->number);if(f==0||f==30||f==60||f==120||f==240)r.value.controlCenter.musicFps=f;}
         if(const auto* v=section->Find("lyricsOffsetMs");v&&v->type==dock::json::Value::Type::Number&&v->number>=-3000&&v->number<=3000)r.value.controlCenter.lyricsOffsetMs=static_cast<int>(v->number);
     }
@@ -196,7 +212,7 @@ Result Load(const std::wstring& path) {
         r.value.controlCenter.backdropBlur=static_cast<int>(blur->number);
     }
     if(const auto* section=root.Find("appearance")){
-        if(const auto* lang=section->Find("language");lang&&lang->type==dock::json::Value::Type::String&&lang->string=="en")r.value.appearance.language="en";
+        if(const auto* lang=section->Find("language");lang&&lang->type==dock::json::Value::Type::String&&(lang->string=="en"||lang->string=="zh-CN"))r.value.appearance.language=lang->string;
         if(const auto* order=section->Find("applicationsSort");order&&order->type==dock::json::Value::Type::Number&&(order->number==1||order->number==2))
             r.value.appearance.applicationsSort=static_cast<int>(order->number);
         for(const auto* key:{"settingsScalePercent","applicationsScalePercent"})if(const auto* v=section->Find(key)){
@@ -271,7 +287,7 @@ bool ReadBytes(const std::wstring& path,std::string& bytes,bool& missing) {
     if(ok){bytes.resize(static_cast<size_t>(n.QuadPart));ok=ReadFile(h,bytes.data(),static_cast<DWORD>(bytes.size()),&got,nullptr)&&got==bytes.size();}
     CloseHandle(h);return ok;
 }
-bool Category(const std::string& s){for(const char* c:{"dock","menuBar","launchpad","controlCenter","appearance","taskbar","performance","updates"})if(s==c)return true;return false;}
+bool Category(const std::string& s){for(const char* c:{"dock","menuBar","launchpad","controlCenter","appearance","taskbar","performance","updates","phonePairing"})if(s==c)return true;return false;}
 std::string Encode(const std::string& s){return dock::json::Write(dock::json::Value::MakeString(s));}
 }
 // kind: 0 number, 1 boolean, 2 any JSON value (an existing value of a different kind is still refused for 0 / 1).
@@ -323,6 +339,14 @@ static SaveStatus WriteScalar(const std::wstring& path,const std::string& sectio
 }
 SaveStatus WriteBool(const std::wstring& path,const std::string& section,const std::string& key,bool value){
  return WriteScalar(path,section,key,value?"true":"false",true);
+}
+SaveStatus WritePhoneBallRadius(const std::wstring& path, int radius) {
+    if (radius < kPhoneBallMinimum || radius > kPhoneBallMaximum) return SaveStatus::Invalid;
+    return WriteScalar(path, "phonePairing", "ballRadius", std::to_string(radius), 0);
+}
+SaveStatus WritePhoneReceiveFolder(const std::wstring& path, const std::wstring& folder) {
+    const auto utf8 = dock::json::ToUtf8(folder);
+    return WriteScalar(path, "phonePairing", "receiveFolder", Encode(utf8), 2);
 }
 SaveStatus WritePerformanceInt(const std::wstring& path,const std::string& key,int value){
  const bool valid=(key=="animationFps"||key=="captureFps")&&ValidFrameCap(value);
@@ -388,14 +412,14 @@ SaveStatus WriteAudioOutputs(const std::wstring& path, const std::vector<AudioOu
 }
 SaveStatus WriteControlCenterInt(const std::wstring& path,const std::string& key,int value){
  const bool shortcut=key=="shortcutLyrics"||key=="shortcutArtwork"||key=="shortcutDesktop"||key=="shortcutNowPlaying";
- const bool valid=(key=="backdropBlur"&&value>=0&&value<=100)||(shortcut&&value>=0&&value<=0x7FF)||(key=="lyricsOffsetMs"&&value>=-3000&&value<=3000)||(key=="musicFps"&&(value==0||value==30||value==60||value==120||value==240));
+ const bool valid=(key=="backdropBlur"&&value>=0&&value<=100)||(shortcut&&value>=0&&value<=0x7FF)||(key=="lyricsOffsetMs"&&value>=-3000&&value<=3000)||(key=="musicSensitivity"&&value>=0&&value<=100)||(key=="musicResponse"&&value>=0&&value<=2)||(key=="musicFps"&&(value==0||value==30||value==60||value==120||value==240));
  return valid?WriteScalar(path,"controlCenter",key,std::to_string(value),false):SaveStatus::Invalid;
 }
 SaveStatus WriteApplicationsSort(const std::wstring& path,int order){
  return order>=0&&order<=2?WriteScalar(path,"appearance","applicationsSort",std::to_string(order),false):SaveStatus::Invalid;
 }
 SaveStatus WriteLanguage(const std::wstring& path,const std::string& language){
- return language=="en"?WriteScalar(path,"appearance","language",Encode(language),false):SaveStatus::Invalid;
+ return (language=="en"||language=="zh-CN")?WriteScalar(path,"appearance","language",Encode(language),2):SaveStatus::Invalid;
 }
 SaveStatus WriteUiScale(const std::wstring& path,const std::string& key,int percent){
  const bool valid=(key=="settingsScalePercent"&&percent>=75&&percent<=125)||(key=="applicationsScalePercent"&&percent>=60&&percent<=120);

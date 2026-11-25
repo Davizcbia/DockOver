@@ -42,7 +42,7 @@ bool ValidStatusCell(const std::wstring& id);
 struct MenuBar { int scalePercent=100; bool enabled=true; bool themeGradient=true; int gradientOpacity=90, gradientLength=100; bool captureNotifications=false; bool hideSystemNotifications=true; int notificationBlur=20, notificationBlurFade=100, notificationShade=30; /* defaults: the user's tuning, 2026-11-19 */ }; struct Launchpad { int densityPreset=0, iconSize=96, gapX=80, gapY=48; bool hideLabels=false;
  bool showWindows=false; /* false (macOS): only the live wallpaper behind Launchpad; true: the live screen with its windows */ };
 struct AudioOutputPreference { std::wstring id, name; std::string icon; bool hidden=false; };
-struct ControlCenter { std::vector<AudioOutputPreference> audioOutputs; bool mediaArtworkBackground=false; bool musicWallpaper=false; /* desktop background shows the playing music's artwork (docky-now-playing --wallpaper) */ bool wallpaperAvoidBars=true; /* that artwork is fitted between the menu bar and the Dock */ bool wallpaperLyrics=true; /* lyrics on that desktop artwork */ bool lyricsFullArtwork=true; /* lyrics keep the borderless artwork (else: artwork card) */ bool animatedArtwork=true; bool lyricsDoubleClickSeek=true; bool keepArtworkWhenPaused=false; /* paused music keeps the artwork and lyrics on screen (else they fade out after 2.5 s) */ bool localMusicTags=true; /* a track named like a file (song.mp3) is looked up on this PC: its tags, cover and .lrc */ bool hideDesktopIconsWithWidgets=true; /* the hide-DockOver-Desktop shortcut also hides Windows desktop icons */ bool lyricsAutoReturn=true; /* scrolled lyrics return to the sung line */ int musicFps=60; /* frame rate cap of the music views' animation: 30/60/120/240, 0 = unlimited */ bool lyricsBeat=true; /* lyrics pulse with the music (WASAPI loopback) */ int lyricsOffsetMs=300; /* lyrics shown this much earlier (-3000..3000) */ int shortcutLyrics=0x34C, shortcutArtwork=0x34D, shortcutDesktop=0x344, shortcutNowPlaying=0x34E; /* global shortcuts, (MOD_* << 8) | virtual key, 0 = none; defaults Ctrl+Alt+L / M / D / N: desktop lyrics, music wallpaper, hide DockOver Desktop, full-screen Now Playing */ int backdropBlur=60; /* 0..100 %: strength of the blur behind the whole Control Center */ }; struct Appearance { int mode=0, settingsScalePercent=90, applicationsScalePercent=80, applicationsSort=0; std::string language="en"; }; // 0 system, 1 light, 2 dark
+struct ControlCenter { std::vector<AudioOutputPreference> audioOutputs; bool mediaArtworkBackground=false; bool musicWallpaper=false; /* desktop background shows the playing music's artwork (docky-now-playing --wallpaper) */ bool wallpaperAvoidBars=true; /* that artwork is fitted between the menu bar and the Dock */ bool wallpaperLyrics=true; /* lyrics on that desktop artwork */ bool lyricsFullArtwork=true; /* lyrics keep the borderless artwork (else: artwork card) */ bool animatedArtwork=true; bool lyricsDoubleClickSeek=true; bool keepArtworkWhenPaused=false; /* paused music keeps the artwork and lyrics on screen (else they fade out after 2.5 s) */ bool localMusicTags=true; /* a track named like a file (song.mp3) is looked up on this PC: its tags, cover and .lrc */ bool hideDesktopIconsWithWidgets=true; /* the hide-DockOver-Desktop shortcut also hides Windows desktop icons */ bool lyricsAutoReturn=true; /* scrolled lyrics return to the sung line */ int musicSensitivity=50; int musicResponse=1; /* 0 Instant, 1 Balanced, 2 Smooth */ int musicFps=60; /* frame rate cap of the music views' animation: 30/60/120/240, 0 = unlimited */ bool lyricsBeat=true; /* lyrics pulse with the music (WASAPI loopback) */ int lyricsOffsetMs=300; /* lyrics shown this much earlier (-3000..3000) */ int shortcutLyrics=0x34C, shortcutArtwork=0x34D, shortcutDesktop=0x344, shortcutNowPlaying=0x34E; /* global shortcuts, (MOD_* << 8) | virtual key, 0 = none; defaults Ctrl+Alt+L / M / D / N: desktop lyrics, music wallpaper, hide DockOver Desktop, full-screen Now Playing */ int backdropBlur=60; /* 0..100 %: strength of the blur behind the whole Control Center */ }; struct Appearance { int mode=0, settingsScalePercent=90, applicationsScalePercent=80, applicationsSort=0; std::string language="en"; }; // 0 system, 1 light, 2 dark
 // Windows taskbar integration. hideOnStartup is a preference only; the current visibility is runtime state
 // owned by the Desktop Manager. hotkeyModifiers uses MOD_* bits (MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4);
 // hotkeyKey 0 means "no shortcut". Default suggestion: Ctrl + Alt + T.
@@ -54,12 +54,16 @@ struct Performance { int animationFps = 0, captureFps = 0; };
 // Software update (Settings > About). autoCheck: the Manager looks for a new GitHub release once a day;
 // autoInstall: it also downloads, verifies and installs it (docky restarts). Off: Settings shows it, a notification tells.
 struct Updates { bool autoCheck = true; bool autoInstall = false; };
+inline constexpr int kPhoneBallMinimum = 64, kPhoneBallMaximum = 270, kPhoneBallDefault = 210;
 struct Settings {
     int schemaVersion = 1;
     Dock dock; MenuBar menuBar; Launchpad launchpad;
     ControlCenter controlCenter; Appearance appearance; Taskbar taskbar;
     Performance performance;
     Updates updates;
+    int phoneBallRadius = kPhoneBallDefault;  // preferred radius in DIP before monitor limits
+    std::wstring phoneReceiveFolder;  // empty uses Downloads
+    bool pcReceiveBubble = true;
 };
 enum class LoadStatus { Loaded, Missing, Invalid, Unavailable };
 struct Result { Settings value; LoadStatus status = LoadStatus::Missing; };
@@ -70,6 +74,8 @@ Result Load(const std::wstring& path);
 enum class SaveStatus { Saved, Invalid, Unavailable, Busy };
 SaveStatus WriteBool(const std::wstring& path, const std::string& section,
                      const std::string& key, bool value);
+SaveStatus WritePhoneBallRadius(const std::wstring& path, int radius);
+SaveStatus WritePhoneReceiveFolder(const std::wstring& path, const std::wstring& folder);
 // Only explicitly supported Launchpad density integers; same lock, validation and atomic replace.
 SaveStatus WriteDensityInt(const std::wstring& path, const std::string& key, int value);
 // Overall Menu Bar size, including text, icons, hit regions and reserved work area.

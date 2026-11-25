@@ -1,4 +1,5 @@
 #include "finder_fit.h"
+#include "ui_language.h"
 #include "liquid_build_id.h"
 static volatile const char liquidBuildMarker[] = LIQUID_BUILD_MARKER;
 // Liquid Dock V0.2 - a Win32 / D3D11 / DirectComposition / Direct2D dock with real Windows icons,
@@ -70,6 +71,8 @@ constexpr UINT_PTR kTimerRunning = 1;
 constexpr UINT_PTR kTimerExit = 2;
 constexpr UINT_PTR kTimerLaunchpadIcon = 3;  // a Launchpad icon command, run once Launchpad has faded out
 constexpr UINT_PTR kTimerLaunchpadPrewarm = 4;  // app discovery and icon cache for Launchpad, a few seconds after start
+constexpr UINT_PTR kTimerDragRemoval = 5;
+constexpr UINT kDragRemovalDwellMs = 300;
 constexpr UINT_PTR kTimerApplicationsPrewarm = 58;  // the resident Applications window, started hidden after the Dock
 static HWND ApplicationsWindow(HANDLE process);  // the resident Applications window of that process, if any
 constexpr UINT kIconPx = 256;
@@ -87,6 +90,9 @@ static bool OwnPopupVisible() {
 }
 constexpr UINT kMenuApplications=74;
 constexpr UINT kMenuTaskManager=79;  // Dock menu > Task Manager (taskmgr.exe; Windows asks for elevation when its policy wants it)
+#ifdef DOCKY_PHONE_PAIRING
+constexpr UINT kMenuPairPhone = 80;
+#endif
 constexpr UINT kMenuShowBase=1100;  // Dock menu > Show in Dock: +0 divider, +1 Downloads, +2 Recycle Bin, +10.. status cells
 // The status items a user can put in the Dock, in menu order: whole-icon tiles first, then the half-size cells.
 // Whole-icon tiles first (kStatusTileCount), then the half-size cells of the status group.
@@ -229,6 +235,7 @@ private:
     std::shared_ptr<DownloadsPreviewShared> downloadsPreview_=std::make_shared<DownloadsPreviewShared>();
     std::vector<std::uint32_t> downloadsPixels_;
     void SetFullRegion(bool full, bool force = false);
+    void SetSceneRegion(const Scene& scene);
     void Frame();
     void StartAnimating();
     bool WantsFrame() const { return animating_ || needsFrame_ || backdropDirty_ || glass_.continuousRender || BackdropStreaming(); }
@@ -328,19 +335,26 @@ private:
     RECT dockAppBarRect_{};
     void OnKey(WPARAM key);
     void OnDrop(HDROP drop);
-    void PinPaths(const std::vector<std::wstring>& paths, float x);
+    void PinPaths(const std::vector<std::wstring>& paths, int insert);
     void AddToLaunchpad(const std::vector<std::wstring>& paths);
 public:
     // OLE drop target (macOS): the Dock magnifies under a dragged file; a drop on the Trash recycles it, on an app
     // opens it with that app, on Downloads moves it there, and between icons pins it (as WM_DROPFILES did).
     enum class DropKind { None, Pin, Trash, OpenWith, Downloads, Launchpad };
-    DWORD DragHover(POINTL screen, DWORD allowed, bool leave);
-    DWORD DragDropped(IDataObject* data, POINTL screen, DWORD allowed);
+    DWORD DragHover(POINTL screen, DWORD allowed, const std::vector<std::wstring>& paths);
+    void DragLeave();
+    DWORD DragDropped(const std::vector<std::wstring>& paths, POINTL screen, DWORD allowed);
 private:
     DropKind DropKindAt(int hit) const;
+    DropKind ExternalDropKind(const DockFrame& frame, int hit, float x,
+                              const std::vector<std::wstring>& paths) const;
+    int DropInsertionAt(const DockFrame& frame, float x) const;
     int dropHit_ = -1;
+    int dropInsertion_ = -1;
+    bool externalDrag_ = false;
+    docky::motion::Spring externalGap_ = MakeOffsetSpring();
     static constexpr UINT kDropWork = WM_APP + 83;  // deferred file work after the drag source has returned
-    struct DropJob { DropKind kind; std::vector<std::wstring> paths; int item; float x; };
+    struct DropJob { DropKind kind; std::vector<std::wstring> paths; int item; int insert; };
     std::vector<DropJob> dropJobs_;
     void ActivateItem(int index);
     void Reload();
@@ -399,6 +413,7 @@ private:
     bool showDownloads_ = true, showTrash_ = true, showDivider_ = true;
     std::vector<std::wstring> tailOrder_;
     bool removeOnDrop_ = false;   // the dragged item is held well above the Dock: letting go removes it
+    ULONGLONG dragOutsideSince_ = 0;
     int sepPress_ = -1; POINT sepPressCursor_{};  // a separator pressed: vertical motion resizes, horizontal moves it
     void RebuildTail(const wchar_t* why);
     void RemoveDockItem(int index);
@@ -443,6 +458,7 @@ private:
     bool tracking_ = false;
     bool regionFull_ = false;
     bool regionInit_ = false;
+    std::vector<RECT> sceneRegion_;
     bool diag_ = false;
     bool bounds_ = false;
     int pressed_ = -1;
@@ -468,6 +484,53 @@ private:
     unsigned long long animationVersion_ = 0;
 };
 
+static std::vector<std::wstring> ReadDockDropPaths(IDataObject* data) {
+    std::vector<std::wstring> paths;
+    if (!data) return paths;
+    FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (SUCCEEDED(data->GetData(&format, &medium))) {
+        const auto drop = static_cast<HDROP>(medium.hGlobal);
+        const UINT count = std::min(DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0), 500u);
+        for (UINT i = 0; i < count; ++i) {
+            const UINT len = DragQueryFileW(drop, i, nullptr, 0);
+            if (!len) continue;
+            std::wstring path(len + 1, L'\0');
+            if (DragQueryFileW(drop, i, path.data(), len + 1)) {
+                path.resize(len);
+                paths.push_back(std::move(path));
+            }
+        }
+        ReleaseStgMedium(&medium);
+        return paths;
+    }
+    // Explorer's Applications folder can drag virtual items with no filesystem path.
+    ComPtr<IShellItemArray> array;
+    if (FAILED(SHCreateShellItemArrayFromDataObject(data, IID_PPV_ARGS(&array)))) return paths;
+    DWORD count = 0;
+    if (FAILED(array->GetCount(&count))) return paths;
+    constexpr std::wstring_view appsFolder = L"::{4234d49b-0245-4df3-b780-3893943456e1}\\";
+    for (DWORD i = 0; i < std::min(count, 500ul); ++i) {
+        ComPtr<IShellItem> item;
+        PWSTR name = nullptr;
+        if (FAILED(array->GetItemAt(i, &item)) || FAILED(item->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING, &name))) continue;
+        const std::wstring_view parsing(name);
+        if (parsing.size() > appsFolder.size() && _wcsnicmp(name, appsFolder.data(), appsFolder.size()) == 0)
+            paths.push_back(L"shell:AppsFolder\\" + std::wstring(parsing.substr(appsFolder.size())));
+        CoTaskMemFree(name);
+    }
+    return paths;
+}
+
+static bool IsAppDropPath(const std::wstring& path) {
+    if (path.starts_with(L"shell:AppsFolder\\")) return true;
+    const auto dot = path.find_last_of(L".");
+    const auto slash = path.find_last_of(L"\\/");
+    if (dot == std::wstring::npos || (slash != std::wstring::npos && dot < slash)) return false;
+    const auto* ext = path.c_str() + dot;
+    return _wcsicmp(ext, L".exe") == 0 || _wcsicmp(ext, L".lnk") == 0 || _wcsicmp(ext, L".appref-ms") == 0;
+}
+
 class DockDropTarget final : public IDropTarget {
 public:
     explicit DockDropTarget(App* app) : app_(app) {}
@@ -479,21 +542,25 @@ public:
     ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
     ULONG STDMETHODCALLTYPE Release() override { const ULONG r = InterlockedDecrement(&refs_); if (!r) delete this; return r; }
     HRESULT STDMETHODCALLTYPE DragEnter(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
-        FORMATETC f{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
-        files_ = data && SUCCEEDED(data->QueryGetData(&f));
-        *effect = files_ ? app_->DragHover(pt, *effect, false) : DROPEFFECT_NONE;
+        paths_ = ReadDockDropPaths(data);
+        *effect = app_->DragHover(pt, *effect, paths_);
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD* effect) override { *effect = files_ ? app_->DragHover(pt, *effect, false) : DROPEFFECT_NONE; return S_OK; }
-    HRESULT STDMETHODCALLTYPE DragLeave() override { app_->DragHover(POINTL{}, 0, true); return S_OK; }
-    HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD, POINTL pt, DWORD* effect) override {
-        *effect = files_ ? app_->DragDropped(data, pt, *effect) : DROPEFFECT_NONE;
-        app_->DragHover(POINTL{}, 0, true);
+    HRESULT STDMETHODCALLTYPE DragOver(DWORD, POINTL pt, DWORD* effect) override {
+        *effect = app_->DragHover(pt, *effect, paths_);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE DragLeave() override { paths_.clear(); app_->DragLeave(); return S_OK; }
+    HRESULT STDMETHODCALLTYPE Drop(IDataObject*, DWORD, POINTL pt, DWORD* effect) override {
+        *effect = app_->DragDropped(paths_, pt, *effect);
+        DragLeave();
         return S_OK;
     }
 private:
     ~DockDropTarget() = default;
-    App* app_; LONG refs_ = 1; bool files_ = false;
+    App* app_;
+    LONG refs_ = 1;
+    std::vector<std::wstring> paths_;
 };
 
 App::DropKind App::DropKindAt(int hit) const {
@@ -508,36 +575,73 @@ App::DropKind App::DropKindAt(int hit) const {
     return DropKind::OpenWith;
 }
 
-DWORD App::DragHover(POINTL screen, DWORD allowed, bool leave) {
-    if (leave) { dropHit_ = -1; OnMouseLeave(); return DROPEFFECT_NONE; }
+int App::DropInsertionAt(const DockFrame& frame, float x) const {
+    const int end = static_cast<int>(std::min(PinnedEnd(), frame.items.size()));
+    int insert = 0;
+    while (insert < end && frame.items[insert].cx < x) ++insert;
+    return insert;
+}
+
+App::DropKind App::ExternalDropKind(const DockFrame& frame, int hit, float x,
+                                   const std::vector<std::wstring>& paths) const {
+    const auto on = DropKindAt(hit);
+    if (std::any_of(paths.begin(), paths.end(), [](const auto& path) { return path.starts_with(L"shell:AppsFolder\\"); }))
+        return on == DropKind::Trash || on == DropKind::Downloads ? DropKind::None : DropKind::Pin;
+    if (on == DropKind::Trash || on == DropKind::Downloads) return on;
+    if (std::all_of(paths.begin(), paths.end(), IsAppDropPath)) return DropKind::Pin;
+    if (on == DropKind::OpenWith) {
+        const auto& item = frame.items[hit];
+        if (std::abs(x - item.cx) > item.width * 0.33f) return DropKind::Pin;
+    }
+    return on;
+}
+
+void App::DragLeave() {
+    dropHit_ = dropInsertion_ = -1;
+    if (!externalDrag_) return;
+    externalDrag_ = false;
+    OnMouseLeave();
+}
+
+DWORD App::DragHover(POINTL screen, DWORD allowed, const std::vector<std::wstring>& paths) {
+    if (paths.empty() || dragging_ || resizing_) return DROPEFFECT_NONE;
+    externalDrag_ = true;
     POINT pt{screen.x, screen.y}; ScreenToClient(hwnd_, &pt);
-    OnMouseMove(Dip(pt.x), Dip(pt.y));  // same magnification as the pointer
-    const int hit = model_.HitTest(frame_, Dip(pt.x), Dip(pt.y));
-    if (hit != dropHit_) { dropHit_ = hit; needsFrame_ = true; }
-    switch (DropKindAt(hit)) {
+    const float x = Dip(pt.x), y = Dip(pt.y);
+    // OLE owns the pointer until DragLeave. Mouse tracking can report a synthetic
+    // leave each time the animated window region changes under the drag source.
+    mouseX_ = x;
+    mouseY_ = y;
+    model_.SetPointer(true, x, y);
+    StartAnimating();
+    DockFrame base;
+    model_.Compute(base, Now());
+    const int hit = model_.HitTest(base, x, y);
+    const auto kind = ExternalDropKind(base, hit, x, paths);
+    const int insert = kind == DropKind::Pin ? DropInsertionAt(base, x) : -1;
+    if (hit != dropHit_ || insert != dropInsertion_) {
+        dropHit_ = hit;
+        dropInsertion_ = insert;
+        needsFrame_ = true;
+    }
+    switch (kind) {
+    case DropKind::None: return DROPEFFECT_NONE;
     case DropKind::Trash: case DropKind::Downloads: return allowed & DROPEFFECT_MOVE ? DROPEFFECT_MOVE : allowed & DROPEFFECT_COPY;
     case DropKind::OpenWith: return allowed & DROPEFFECT_COPY ? DROPEFFECT_COPY : allowed & DROPEFFECT_LINK;
     default: return allowed & DROPEFFECT_LINK ? DROPEFFECT_LINK : allowed & DROPEFFECT_COPY;
     }
 }
 
-DWORD App::DragDropped(IDataObject* data, POINTL screen, DWORD allowed) {
-    FORMATETC f{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL}; STGMEDIUM m{};
-    if (!data || FAILED(data->GetData(&f, &m))) return DROPEFFECT_NONE;
-    std::vector<std::wstring> paths;
-    if (auto drop = static_cast<HDROP>(m.hGlobal)) {
-        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
-        for (UINT i = 0; i < count && i < 500; ++i) { wchar_t path[MAX_PATH * 2]; if (DragQueryFileW(drop, i, path, ARRAYSIZE(path))) paths.push_back(path); }
-    }
-    ReleaseStgMedium(&m);
-    if (paths.empty()) return DROPEFFECT_NONE;
+DWORD App::DragDropped(const std::vector<std::wstring>& paths, POINTL screen, DWORD allowed) {
+    const DWORD effect = DragHover(screen, allowed, paths);
+    if (effect == DROPEFFECT_NONE) return effect;
     POINT pt{screen.x, screen.y}; ScreenToClient(hwnd_, &pt);
-    const int hit = model_.HitTest(frame_, Dip(pt.x), Dip(pt.y));
-    const DropKind kind = DropKindAt(hit);
-    const DWORD effect = DragHover(screen, allowed, false);
-    if(effect==DROPEFFECT_NONE)return DROPEFFECT_NONE;
+    DockFrame base;
+    model_.Compute(base, Now());
+    const int hit = model_.HitTest(base, Dip(pt.x), Dip(pt.y));
+    const DropKind kind = ExternalDropKind(base, hit, Dip(pt.x), paths);
     // The file work runs after the drag source's DoDragDrop has returned, so the source app never waits on it.
-    dropJobs_.push_back({kind, std::move(paths), hit, Dip(pt.x)});
+    dropJobs_.push_back({kind, paths, hit, dropInsertion_});
     PostMessageW(hwnd_, kDropWork, 0, 0);
     DLOG(L"drop: kind=%d item=%d", static_cast<int>(kind), hit);
     return effect;
@@ -550,7 +654,9 @@ int App::Run(HINSTANCE instance, const Options& options) {
     autoHide_=options.autoHide;
     try {systemUi_=winrt::Windows::UI::ViewManagement::UISettings();} catch(...) {systemUi_=nullptr;}
     RefreshAccessibility();
-    appearanceMode_=liquid::settings::Load(opt_.desktopSettingsPath).value.appearance.mode;
+    const auto appearance=liquid::settings::Load(opt_.desktopSettingsPath).value.appearance;
+    appearanceMode_=appearance.mode;
+    docky::ui::SetLanguage(appearance.language);
     try {if(systemUi_){const auto c=systemUi_.GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Background);systemDark_=(int(c.R)*299+int(c.G)*587+int(c.B)*114)<128000;}} catch(...) {}
     BOOL animations = TRUE;
     if (SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0)) reducedMotion_ = !animations;
@@ -805,10 +911,11 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
     case WM_MOUSEMOVE:
-        OnMouseMove(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
+        if (!externalDrag_) OnMouseMove(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
         return 0;
     case WM_MOUSELEAVE:
-        OnMouseLeave();
+        if (!externalDrag_) OnMouseLeave();
+        else tracking_ = false;
         return 0;
     case WM_MOUSEACTIVATE:
         // Over a full-screen app (game) a click on the revealed Dock must not take the focus: an exclusive full-screen
@@ -825,6 +932,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         OnRButtonUp(Dip(GET_X_LPARAM(lp)), Dip(GET_Y_LPARAM(lp)));
         return 0;
     case WM_CAPTURECHANGED:
+        sepPress_ = -1;
         if (resizing_) FinishResize();
         if (dragging_) FinishDrag(false);
         if (pressed_ >= 0) {
@@ -841,7 +949,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case kDropWork: {
         auto jobs = std::move(dropJobs_); dropJobs_.clear();
         for (auto& job : jobs) {
-            if (job.kind == DropKind::Pin) { PinPaths(job.paths, job.x); continue; }
+            if (job.kind == DropKind::Pin) { PinPaths(job.paths, job.insert); continue; }
             if(job.kind==DropKind::Launchpad){AddToLaunchpad(job.paths);continue;}
             if (job.kind == DropKind::OpenWith && job.item >= 0 && static_cast<size_t>(job.item) < items_.size()) {
                 const auto& app = items_[job.item];
@@ -895,6 +1003,14 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if(next!=downloadsPixels_){downloadsPixels_=std::move(next);for(auto& item:items_)if(item.isDownloads){ResolveItem(item);break;}BuildIcons();}
         return 0;}
     case WM_TIMER:
+        if (wp == kTimerDragRemoval) {
+            if (dragging_) {
+                UpdateDragTarget(mouseX_, mouseY_);
+                needsFrame_ = true;
+                StartAnimating();
+            } else KillTimer(hwnd_, kTimerDragRemoval);
+            return 0;
+        }
         if (wp == kTimerLaunchpadPrewarm) { KillTimer(hwnd_, kTimerLaunchpadPrewarm); dock::launchpad::Prewarm(); return 0; }
         if (wp == kTimerApplicationsPrewarm) { KillTimer(hwnd_, kTimerApplicationsPrewarm); if (!ApplicationsWindow(applicationsProcess_)) StartApplications(true); return 0; }
         if (wp == kTimerLaunchpadIcon) {
@@ -943,6 +1059,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
             tickMark(4);
             const auto revision=liquid::settings::ReadRevision(opt_.desktopSettingsPath);
             if(revision!=settingsRevision_){settingsRevision_=revision;const auto current=liquid::settings::Load(opt_.desktopSettingsPath);
+                docky::ui::SetLanguage(current.value.appearance.language);
                 docky::vblank::SetCaps(current.value.performance.animationFps,current.value.performance.captureFps);
                 if(appearanceMode_!=current.value.appearance.mode){appearanceMode_=current.value.appearance.mode;if(opaqueFallback_)needsFrame_=true;}
                 const bool mask=opt_.iconMaskOverride<0?current.value.dock.useMacIconMask:opt_.iconMaskOverride!=0;
@@ -1253,7 +1370,7 @@ void App::OpenIconEditorFor(const PinnedItem& target) {
     const std::string id=target.stableId;
     if(!iconStore_.Available() || id.empty()) {
         const std::wstring detail=iconStoreError_.empty()?L"Custom icon settings are unavailable.":iconStoreError_;
-        MessageBoxW(hwnd_,detail.c_str(),L"Edit Icon",MB_OK|MB_ICONERROR);return;
+        MessageBoxW(hwnd_,detail.c_str(),docky::ui::Text(L"Edit Icon"),MB_OK|MB_ICONERROR);return;
     }
     dock::iconedit::State st;
     st.source=target.pixels;st.w=target.iconW;st.h=target.iconH;st.globalMask=iconMaskEnabled_;
@@ -1267,7 +1384,7 @@ void App::OpenIconEditorFor(const PinnedItem& target) {
     cb.changeImage=[this](dock::iconedit::State& s){
         const std::wstring path=PickIconImage(hwnd_);if(path.empty())return false;
         std::vector<uint32_t> px;UINT w=0,h=0;std::wstring error;
-        if(!LoadCustomIconPixels(path,px,w,h,error)){MessageBoxW(hwnd_,error.c_str(),L"Edit Icon",MB_OK|MB_ICONERROR);return false;}
+        if(!LoadCustomIconPixels(path,px,w,h,error)){MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Edit Icon"),MB_OK|MB_ICONERROR);return false;}
         s.source=std::move(px);s.w=w;s.h=h;s.newImage=path;return true;};
     cb.resetToOriginal=[this,originalItem](dock::iconedit::State& s){
         PinnedItem original=originalItem;ResolvePinnedItem(original,kIconPx);if(IsFinderSlot(original))ApplyDockWorkshop(original,"dock.finder");
@@ -1277,12 +1394,12 @@ void App::OpenIconEditorFor(const PinnedItem& target) {
         if(s.resetAll&&s.newImage.empty()&&s.edit.IsDefault())ok=iconStore_.Remove(id,error);  // full reset: image override + all edits
         else{const std::wstring none;const std::wstring* image=!s.newImage.empty()?&s.newImage:(s.resetAll?&none:nullptr);
             ok=iconStore_.SetEdit(id,s.edit,image,error);}
-        if(!ok){MessageBoxW(hwnd_,error.c_str(),L"Edit Icon",MB_OK|MB_ICONERROR);return false;}
+        if(!ok){MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Edit Icon"),MB_OK|MB_ICONERROR);return false;}
         for(auto& item:items_)if(!item.isSeparator&&item.stableId==id)ResolveItem(item);
         BuildIcons();needsFrame_=true;StartAnimating();dock::launchpad::InvalidateIcon(id);
         DLOG(L"icon editor: applied scale=%.2f offset=%.2f,%.2f mask=%d shadow=%d image=%d reset=%d",s.edit.scale,s.edit.offsetX,s.edit.offsetY,s.edit.mask,s.edit.shadow,s.newImage.empty()?0:1,s.resetAll?1:0);
         return true;};
-    if(!dock::iconedit::Open(hwnd_,target.label,std::move(st),std::move(cb)))MessageBoxW(hwnd_,L"Could not open the icon editor.",L"Edit Icon",MB_OK|MB_ICONERROR);
+    if(!dock::iconedit::Open(hwnd_,target.label,std::move(st),std::move(cb)))MessageBoxW(hwnd_,L"Could not open the icon editor.",docky::ui::Text(L"Edit Icon"),MB_OK|MB_ICONERROR);
 }
 
 void App::ChangeIcon(int index, bool reset) {
@@ -1296,7 +1413,7 @@ void App::ChangeIconFor(const PinnedItem& targetRef, bool reset) {
     const auto id=target.stableId;
     if(!iconStore_.Available() || id.empty()) {
         const std::wstring detail=iconStoreError_.empty()?L"Custom icon settings are unavailable.":iconStoreError_;
-        MessageBoxW(hwnd_,detail.c_str(),L"Custom icon",MB_OK|MB_ICONERROR);return;
+        MessageBoxW(hwnd_,detail.c_str(),docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;
     }
     std::vector<uint32_t> pixels; UINT w=0,h=0; std::wstring path,error; IconFileStamp selectedStamp;
     if(reset) {
@@ -1315,19 +1432,19 @@ void App::ChangeIconFor(const PinnedItem& targetRef, bool reset) {
             PWSTR raw=nullptr;if(SUCCEEDED(hr))hr=selected->GetDisplayName(SIGDN_FILESYSPATH,&raw);
             if(SUCCEEDED(hr)&&raw){path=raw;CoTaskMemFree(raw);}else if(raw)CoTaskMemFree(raw);
         }
-        if(FAILED(hr)||path.empty()){MessageBoxW(hwnd_,L"Could not open the image chooser.",L"Custom icon",MB_OK|MB_ICONERROR);return;}
+        if(FAILED(hr)||path.empty()){MessageBoxW(hwnd_,L"Could not open the image chooser.",docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
         selectedStamp=ReadIconFileStamp(path);
-        if(!selectedStamp.exists){MessageBoxW(hwnd_,L"The image is no longer available.",L"Custom icon",MB_OK|MB_ICONERROR);return;}
-        if(!LoadCustomIconPixels(path,pixels,w,h,error)){MessageBoxW(hwnd_,error.c_str(),L"Custom icon",MB_OK|MB_ICONERROR);return;}
-        if(!(ReadIconFileStamp(path)==selectedStamp)){MessageBoxW(hwnd_,L"The image changed while loading. Please choose it again.",L"Custom icon",MB_OK|MB_ICONERROR);return;}
+        if(!selectedStamp.exists){MessageBoxW(hwnd_,L"The image is no longer available.",docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
+        if(!LoadCustomIconPixels(path,pixels,w,h,error)){MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
+        if(!(ReadIconFileStamp(path)==selectedStamp)){MessageBoxW(hwnd_,L"The image changed while loading. Please choose it again.",docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
     }
     ComPtr<ID2D1Bitmap1> icon,shadow;float shadowPad=0;
     if(!pixels.empty()) {
         const HRESULT hr=CreateDockIcon(pixels,w,h,icon,shadow,shadowPad);
-        if(FAILED(hr)){MessageBoxW(hwnd_,L"Could not create the icon texture.",L"Custom icon",MB_OK|MB_ICONERROR);return;}
+        if(FAILED(hr)){MessageBoxW(hwnd_,L"Could not create the icon texture.",docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
     }
     const bool saved=reset?iconStore_.Remove(id,error):iconStore_.Set(id,path,error);
-    if(!saved){MessageBoxW(hwnd_,error.c_str(),L"Custom icon",MB_OK|MB_ICONERROR);return;}
+    if(!saved){MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Custom icon"),MB_OK|MB_ICONERROR);return;}
     for(size_t i=0;i<items_.size();++i)if(!items_[i].isSeparator && items_[i].stableId==id){
         items_[i].pixels=pixels;items_[i].iconW=w;items_[i].iconH=h;
         if(i<iconBmp_.size()){iconBmp_[i]=icon;shadowBmp_[i]=shadow;shadowPad_[i]=shadowPad;}
@@ -1911,14 +2028,14 @@ void App::ApplyWindowLayout(const wchar_t* reason) {
          model_.BaseWidth(), model_.MaxExtra());
 }
 
-// Idle: the window region is just the resting plate (+ shadow) so the rest of the window never
-// blocks clicks to the desktop. While hovered/animating the region covers the whole window.
+// The whole canvas is needed only while carrying an icon or resizing with mouse capture.
 void App::SetFullRegion(bool full, bool force) {
     if (hiddenRegion_ && hwnd_) {  // hidden by auto-hide: only the reveal strip on the screen edge
         const RectF r = model_.BaseDockRect();
         const int strip = (std::max)(2, static_cast<int>(std::lround(4.0f * scale_)));
-        SetWindowRgn(hwnd_, CreateRectRgn(static_cast<int>(std::floor(r.left * scale_)), static_cast<int>(pxH_) - strip,
-                                         static_cast<int>(std::ceil(r.right * scale_)), static_cast<int>(pxH_)), TRUE);
+        HRGN reveal = CreateRectRgn(static_cast<int>(std::floor(r.left * scale_)), static_cast<int>(pxH_) - strip,
+                                    static_cast<int>(std::ceil(r.right * scale_)), static_cast<int>(pxH_));
+        if (reveal && !SetWindowRgn(hwnd_, reveal, TRUE)) DeleteObject(reveal);
         regionFull_ = full; regionInit_ = true;
         return;
     }
@@ -1934,7 +2051,51 @@ void App::SetFullRegion(bool full, bool force) {
     HRGN rgn = CreateRectRgn(static_cast<int>(std::floor((r.left - pad) * scale_)),
                              static_cast<int>(std::floor((r.top - pad) * scale_)),
                              static_cast<int>(std::ceil((r.right + pad) * scale_)), static_cast<int>(pxH_));
-    SetWindowRgn(hwnd_, rgn, TRUE);
+    if (!SetWindowRgn(hwnd_, rgn, TRUE)) DeleteObject(rgn);
+    sceneRegion_.clear();
+}
+
+void App::SetSceneRegion(const Scene& scene) {
+    if (hiddenRegion_ || dragging_ || resizing_ || !scene.frame) return;
+    const auto& frame = *scene.frame;
+    std::vector<RECT> rects;
+    rects.reserve(frame.items.size() + 2);
+    const auto add = [&](float l, float t, float r, float b) {
+        RECT rect{
+            std::max(0L, static_cast<LONG>(std::floor(l * scale_))),
+            std::max(0L, static_cast<LONG>(std::floor(t * scale_ + appliedOffset_))),
+            std::min(static_cast<LONG>(pxW_), static_cast<LONG>(std::ceil(r * scale_))),
+            std::min(static_cast<LONG>(pxH_), static_cast<LONG>(std::ceil(b * scale_ + appliedOffset_)))
+        };
+        if (!IsRectEmpty(&rect)) rects.push_back(rect);
+    };
+    // Keep the plate's side and floor shadow. Leave the blank space above the icons to the windows behind us.
+    const float pad = model_.m.shadowPad;
+    add(frame.dockLeft - pad, frame.dockTop - 1.0f, frame.dockRight + pad, frame.dockBottom + pad);
+    for (const auto& icon : frame.items) {
+        if (!icon.separator && icon.top < frame.dockTop)
+            add(icon.left - 2, icon.top - 2, icon.left + icon.width + 2, frame.dockTop + 1);
+    }
+    if (renderer_.Ready() && scene.labelAlpha > 0.01f && scene.labelIndex >= 0 &&
+        static_cast<size_t>(scene.labelIndex) < frame.items.size()) {
+        D2D1_RECT_F label{};
+        if (renderer_.LabelBounds(scene, frame.items[scene.labelIndex], label))
+            add(label.left - 1, label.top - 1, label.right + 1, label.bottom + 7);
+    }
+    if (!regionFull_ && rects.size() == sceneRegion_.size() &&
+        std::equal(rects.begin(), rects.end(), sceneRegion_.begin(),
+                   [](const RECT& a, const RECT& b) { return EqualRect(&a, &b) != FALSE; })) return;
+    HRGN region = CreateRectRgn(0, 0, 0, 0);
+    if (!region) return;
+    for (const auto& rect : rects) {
+        const HRGN part = CreateRectRgnIndirect(&rect);
+        if (part) { CombineRgn(region, region, part, RGN_OR); DeleteObject(part); }
+    }
+    if (SetWindowRgn(hwnd_, region, TRUE)) {
+        sceneRegion_ = std::move(rects);
+        regionFull_ = false;
+        regionInit_ = true;
+    } else DeleteObject(region);
 }
 
 bool App::UpdateAutoHide(double dt, double now) {
@@ -2108,11 +2269,15 @@ void App::Frame() {
     bool anim = model_.Update(dt, now) | UpdateGlassPointer(dt);
     anim = UpdateAutoHide(dt, now) || anim;
     model_.Compute(frame_, now);
-    DockFrame baseFrame=frame_;
     if(visualOffsets_.size()!=frame_.items.size())visualOffsets_.assign(frame_.items.size(),MakeOffsetSpring());
     if(visualYOffsets_.size()!=frame_.items.size())visualYOffsets_.assign(frame_.items.size(),MakeOffsetSpring());
+    const float gapTarget = dropInsertion_ >= 0 ? model_.m.pitch * 0.5f : 0.0f;
+    if (reducedMotion_) externalGap_.SnapTo(gapTarget);
+    else { externalGap_.SetTarget(gapTarget); anim = externalGap_.Step(dt) || anim; }
     for(size_t i=0;i<frame_.items.size();++i){
         float target=0.0f;
+        if (dropInsertion_ >= 0)
+            target = static_cast<int>(i) < dropInsertion_ ? -model_.m.pitch * 0.5f : model_.m.pitch * 0.5f;
         if(dragging_ && dropAllowed_ && static_cast<int>(i)!=dragFrom_){
             if(dragTarget_>dragFrom_ && static_cast<int>(i)>dragFrom_ && static_cast<int>(i)<=dragTarget_)target=-model_.m.pitch;
             if(dragTarget_<dragFrom_ && static_cast<int>(i)>=dragTarget_ && static_cast<int>(i)<dragFrom_)target=model_.m.pitch;
@@ -2124,6 +2289,8 @@ void App::Frame() {
         const float offset=ox.F(),offsetY=oy.F();
         auto& g=frame_.items[i];g.cx+=offset;g.left+=offset;g.tileLeft+=offset;g.tileRight+=offset;g.top+=offsetY;g.restTop+=offsetY;
     }
+    frame_.dockLeft -= externalGap_.F();
+    frame_.dockRight += externalGap_.F();
     if(dragging_ && dragFrom_>=0 && static_cast<size_t>(dragFrom_)<frame_.items.size()){
         auto& g=frame_.items[dragFrom_];const float center=mouseX_-grabX_;g.left+=center-g.cx;g.cx=center;g.top=mouseY_-grabY_;g.restTop=g.top;
     }
@@ -2142,11 +2309,11 @@ void App::Frame() {
     const HMONITOR currentMonitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY);
     RequestBackdrop(CaptureWanted(), currentMonitor);
 
+    DockFrame removalFrame;
     Scene scene;
     scene.frame = &frame_;
     scene.metrics = &model_.m;
-    if(dragging_){scene.dragIndex=dragFrom_;scene.showInsertion=dropAllowed_;
-        if(dropAllowed_ && dragTarget_>=0 && static_cast<size_t>(dragTarget_)<baseFrame.items.size())scene.insertionX=baseFrame.items[dragTarget_].cx;}
+    if (dragging_) scene.dragIndex = dragFrom_;
     scene.windowW = model_.WindowWidth();
     scene.windowH = model_.WindowHeight();
     scene.icons.resize(items_.size());
@@ -2168,7 +2335,21 @@ void App::Frame() {
         }
     }
     const int hovered = model_.HoveredIndex(frame_);
-    if (hovered >= 0 && !dragging_) {
+    if (dragging_ && removeOnDrop_ && dragFrom_ >= 0 && static_cast<size_t>(dragFrom_) < frame_.items.size()) {
+        scene.labelIndex = dragFrom_;
+        scene.label = L"Remove";
+        scene.labelAlpha = 1.0f;
+        const auto& dragged = frame_.items[dragFrom_];
+        if (dragged.restTop < 50.0f) {
+            // Keep the cue visible at the edge of the Dock canvas even when
+            // the captured pointer has carried the icon beyond that canvas.
+            removalFrame = frame_;
+            removalFrame.items.push_back(dragged);
+            removalFrame.items.back().restTop = 50.0f;
+            scene.labelIndex = static_cast<int>(removalFrame.items.size()) - 1;
+            scene.frame = &removalFrame;
+        }
+    } else if (hovered >= 0 && !dragging_ && !externalDrag_) {
         scene.labelIndex = hovered;
         scene.label = items_[hovered].label;
         if (items_[hovered].isStatusGroup) {  // the label names the hovered cell
@@ -2185,6 +2366,7 @@ void App::Frame() {
         }
         scene.labelAlpha = std::clamp((model_.Hover() - 0.35f) / 0.65f, 0.0f, 1.0f);
     }
+    SetSceneRegion(scene);
     scene.opaqueFallback=opaqueFallback_;
     if(opaqueFallback_){const auto palette=liquid::theme::Palette(appearanceMode_,systemDark_,highContrast_);
         scene.opaqueBackground=liquid::theme::ColorRef(palette.surface);scene.opaqueForeground=liquid::theme::ColorRef(palette.primary);}
@@ -2309,7 +2491,6 @@ void App::Frame() {
     animating_ = anim;
     if (!anim && !glass_.continuousRender) {
         FlushStats(now, L"animation settled");
-        if (!tracking_ && !dragging_ && model_.Hover() <= 0.0f) SetFullRegion(false);
     }
 }
 
@@ -2404,7 +2585,6 @@ void App::OnMouseMove(float x, float y) {
         TrackMouseEvent(&tme);
         tracking_ = true;
     }
-    SetFullRegion(true);
     if(pressed_>=0 && !dragging_){
         const float dx=x-pressX_,dy=y-pressY_;
         const float threshold=static_cast<float>(std::max(GetSystemMetricsForDpi(SM_CXDRAG,static_cast<UINT>(dpi_)),GetSystemMetricsForDpi(SM_CYDRAG,static_cast<UINT>(dpi_))))/scale_;
@@ -2415,8 +2595,9 @@ void App::OnMouseMove(float x, float y) {
             std::vector<bool> bounds;for(size_t i=0;i<items_.size();++i)bounds.push_back(section(i)!=section(static_cast<size_t>(pressed_)));
             dragRegion_=FindDragRegion(bounds,pressed_);
             if(dragRegion_.Valid()){
-                dragging_=true;removeOnDrop_=false;dragFrom_=dragTarget_=pressed_;dragId_=DragKey(static_cast<size_t>(pressed_));
+                dragging_=true;removeOnDrop_=false;dragOutsideSince_=0;dragFrom_=dragTarget_=pressed_;dragId_=DragKey(static_cast<size_t>(pressed_));
                 grabX_=pressX_-frame_.items[pressed_].cx;grabY_=pressY_-frame_.items[pressed_].top;
+                SetFullRegion(true);
                 model_.SetPointer(false,x,y);DLOG(L"drag: started index=%d region=%d..%d",dragFrom_,dragRegion_.first,dragRegion_.last);
             }
         }
@@ -2478,11 +2659,22 @@ void App::UpdateDragTarget(float x,float y){
     const float left=dragRegion_.first>0?base.items[dragRegion_.first-1].cx:base.dockLeft;
     const float right=static_cast<size_t>(dragRegion_.last+1)<base.items.size()?base.items[dragRegion_.last+1].cx:base.dockRight;
     dropAllowed_=x>=left && x<right && y>=base.dockTop-model_.m.shadowPad && y<=base.dockBottom+model_.m.shadowPad;
-    // macOS: an item held a good way above the Dock is removed on release (Launchpad and running apps stay).
-    {   const auto& it=items_[static_cast<size_t>(dragFrom_)];
-        const bool removable=!it.isLaunchpad&&!it.isTransient&&!it.isMinimized;
-        const bool wasRemoving=removeOnDrop_;removeOnDrop_=removable&&y<base.dockTop-model_.m.icon*1.1f;
-        if(removeOnDrop_!=wasRemoving)needsFrame_=true;}
+    const auto& item = items_[static_cast<size_t>(dragFrom_)];
+    const bool removable = !item.isLaunchpad && !item.isTransient && !item.isMinimized;
+    const float distance = model_.m.icon * 1.1f;
+    const bool outside = removable && (y < base.dockTop - distance ||
+        x < base.dockLeft - distance || x > base.dockRight + distance);
+    if (!outside) {
+        dragOutsideSince_ = 0;
+        removeOnDrop_ = false;
+        KillTimer(hwnd_, kTimerDragRemoval);
+    } else if (!dragOutsideSince_) {
+        dragOutsideSince_ = GetTickCount64();
+        SetTimer(hwnd_, kTimerDragRemoval, kDragRemovalDwellMs, nullptr);
+    } else {
+        removeOnDrop_ = GetTickCount64() - dragOutsideSince_ >= kDragRemovalDwellMs;
+        if (removeOnDrop_) KillTimer(hwnd_, kTimerDragRemoval);
+    }
     float nearest=1e30f;int target=dragFrom_;
     for(int i=dragRegion_.first;i<=dragRegion_.last;++i){float d=std::fabs(x-base.items[i].cx);if(d<nearest){nearest=d;target=i;}}
     dragTarget_=target;
@@ -2493,6 +2685,8 @@ void App::FinishDrag(bool commit){
         static_cast<size_t>(from)<items_.size()&&DragKey(static_cast<size_t>(from))==dragId_;
     const bool remove=commit&&removeOnDrop_&&!dropAllowed_&&from>=0&&static_cast<size_t>(from)<items_.size()&&DragKey(static_cast<size_t>(from))==dragId_;
     const bool tail=from>=0&&static_cast<size_t>(from)<items_.size()&&IsTailItem(items_[static_cast<size_t>(from)]);
+    KillTimer(hwnd_, kTimerDragRemoval);
+    dragOutsideSince_=0;
     removeOnDrop_=false;
     std::vector<float> positions,positionsY;positions.reserve(frame_.items.size());positionsY.reserve(frame_.items.size());
     for(const auto& g:frame_.items){positions.push_back(g.cx);positionsY.push_back(g.top);}
@@ -2508,12 +2702,13 @@ void App::FinishDrag(bool commit){
         else DLOG(L"drag: order saved %d -> %d",from,to);
     }else DLOG(L"drag: %ls",valid?L"unchanged":L"cancelled");
     dragging_=false;dropAllowed_=false;dragFrom_=dragTarget_=-1;dragId_.clear();pressed_=-1;
+    SetFullRegion(false);
     DockFrame base;model_.Compute(base,Now());visualOffsets_.assign(base.items.size(),MakeOffsetSpring());visualYOffsets_.assign(base.items.size(),MakeOffsetSpring());
     for(size_t i=0;i<positions.size()&&i<base.items.size();++i){visualOffsets_[i].SetValue(positions[i]-base.items[i].cx);visualYOffsets_[i].SetValue(positionsY[i]-base.items[i].top);}
     if(GetCapture()==hwnd_)ReleaseCapture();
     model_.SetPointer(tracking_,mouseX_,mouseY_);needsFrame_=true;StartAnimating();
     if(saveFailed)MessageBoxW(hwnd_,L"The new order could not be saved. It will remain in this session only.",L"DockOver",MB_OK|MB_ICONWARNING);
-    if(remove){DLOG(L"drag: removed from the Dock (dropped above it)");RemoveDockItem(from);}
+    if(remove){DLOG(L"drag: removing after dwell outside the Dock");RemoveDockItem(from);}
 }
 void App::OnLButtonUp(float x, float y) {
     if (resizing_) { FinishResize(); return; }
@@ -2589,8 +2784,8 @@ void App::OnRButtonUp(float x, float y) {
     if(hit>=0 && items_[hit].isMinimized) return;  // a minimized window: click restores it
     if(hit>=0 && items_[hit].isRecycleBin){
         HMENU menu=CreatePopupMenu();const int full=RecycleBinFull();
-        AppendMenuW(menu,MF_STRING,401,L"Open Recycle Bin");AppendMenuW(menu,MF_STRING|(full==0?MF_GRAYED:0),402,L"Empty Recycle Bin\u2026");
-        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,403,L"Remove from Dock");
+        AppendMenuW(menu,MF_STRING,401,docky::ui::Text(L"Open Recycle Bin"));AppendMenuW(menu,MF_STRING|(full==0?MF_GRAYED:0),402,docky::ui::Text(L"Empty Recycle Bin\u2026"));
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,403,docky::ui::Text(L"Remove from Dock"));
         POINT pt{};GetCursorPos(&pt);SetForegroundWindow(hwnd_);auto popupItems=liquid::popup::FromNative(menu);DestroyMenu(menu);
         liquid::popup::Show(hwnd_,pt,std::move(popupItems),[this](const liquid::menu::MenuItem& chosen){
             if(chosen.commandId==403){for(size_t i=0;i<items_.size();++i)if(items_[i].isRecycleBin){RemoveDockItem(static_cast<int>(i));break;}return;}
@@ -2607,12 +2802,12 @@ void App::OnRButtonUp(float x, float y) {
         ShowStatusGroupMenu(hit);return;}
     if(hit>=0 && items_[hit].isDownloads){
         HMENU menu=CreatePopupMenu(),display=CreatePopupMenu(),view=CreatePopupMenu(),sort=CreatePopupMenu();
-        auto append=[](HMENU m,UINT id,const wchar_t* text,bool checked){AppendMenuW(m,MF_STRING|(checked?MF_CHECKED:0),id,text);};
+        auto append=[](HMENU m,UINT id,const wchar_t* text,bool checked){AppendMenuW(m,MF_STRING|(checked?MF_CHECKED:0),id,docky::ui::Text(text));};
         append(display,301,L"Stack",downloadsSettings_.display==dock::downloads::Display::Stack);append(display,302,L"Folder",downloadsSettings_.display==dock::downloads::Display::Folder);
         append(view,311,L"Fan",downloadsSettings_.view==dock::downloads::View::Fan);append(view,312,L"Grid",downloadsSettings_.view==dock::downloads::View::Grid);append(view,313,L"List",downloadsSettings_.view==dock::downloads::View::List);
         append(sort,321,L"Date",downloadsSettings_.sort==dock::downloads::Sort::Date);append(sort,322,L"Name",downloadsSettings_.sort==dock::downloads::Sort::Name);append(sort,323,L"Type",downloadsSettings_.sort==dock::downloads::Sort::Type);
-        AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(display),L"Display as");AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(view),L"View content as");AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(sort),L"Sort by");
-        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,330,L"Remove from Dock");
+        AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(display),docky::ui::Text(L"Display as"));AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(view),docky::ui::Text(L"View content as"));AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(sort),docky::ui::Text(L"Sort by"));
+        AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,330,docky::ui::Text(L"Remove from Dock"));
         POINT pt{};GetCursorPos(&pt);SetForegroundWindow(hwnd_);auto popupItems=liquid::popup::FromNative(menu);DestroyMenu(menu);
         liquid::popup::Show(hwnd_,pt,std::move(popupItems),[this](const liquid::menu::MenuItem& chosen){
         const UINT cmd=chosen.commandId;auto next=downloadsSettings_;bool changed=true;
@@ -2621,7 +2816,7 @@ void App::OnRButtonUp(float x, float y) {
         case 311:next.view=dock::downloads::View::Fan;break;case 312:next.view=dock::downloads::View::Grid;break;case 313:next.view=dock::downloads::View::List;break;
         case 321:next.sort=dock::downloads::Sort::Date;break;case 322:next.sort=dock::downloads::Sort::Name;break;case 323:next.sort=dock::downloads::Sort::Type;break;default:changed=false;break;}
         if(changed){std::wstring error;if(!downloadsSettingsValid_||!dock::downloads::SaveSettings(downloadsSettingsPath_,next,error)){
-            if(error.empty())error=downloadsSettingsError_;MessageBoxW(hwnd_,error.c_str(),L"Downloads settings",MB_OK|MB_ICONWARNING);
+            if(error.empty())error=downloadsSettingsError_;MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Downloads settings"),MB_OK|MB_ICONWARNING);
         }else{bool displayChanged=downloadsSettings_.display!=next.display;downloadsSettings_=next;dock::downloads::Close();
             if(displayChanged){for(auto& item:items_)if(item.isDownloads)ResolveItem(item);BuildIcons();}needsFrame_=true;}} });
         return;
@@ -2646,74 +2841,111 @@ void App::OnRButtonUp(float x, float y) {
     if (hit >= 0 && sepHit < 0 && !items_[hit].isSeparator) {
         const bool finder = IsFinderSlot(items_[hit]);
         if (finder) {
-            AppendMenuW(menu, MF_STRING, kMenuNewFinder, L"New Finder Window");
+            AppendMenuW(menu, MF_STRING, kMenuNewFinder, docky::ui::Text(L"New Finder Window"));
             jumpEntries = dock::jump::QuickAccessFolders(kJumpMax);
         } else {
             jumpEntries = dock::jump::RecentForApp(dock::jump::AppIdFor(items_[hit]), kJumpMax);
-            if (items_[hit].running) AppendMenuW(menu, MF_STRING, kMenuNewWindow, L"New Window");
+            if (items_[hit].running) AppendMenuW(menu, MF_STRING, kMenuNewWindow, docky::ui::Text(L"New Window"));
         }
         if (!jumpEntries.empty()) {
             HMENU sub = CreatePopupMenu();
             for (size_t j = 0; j < jumpEntries.size(); ++j) AppendMenuW(sub, MF_STRING, kMenuJumpBase + static_cast<UINT>(j), jumpEntries[j].label.c_str());
-            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), finder ? L"Quick Access" : L"Recent");
+            AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(sub), finder ? docky::ui::Text(L"Quick Access") : docky::ui::Text(L"Recent"));
         }
         if (GetMenuItemCount(menu) > 0) AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
     if (sepHit >= 0) {
-        AppendMenuW(menu, MF_STRING, kMenuRemoveSep, items_[sepHit].isSystemSeparator ? L"Remove Divider" : L"Remove Separator");
+        AppendMenuW(menu, MF_STRING, kMenuRemoveSep, items_[sepHit].isSystemSeparator ? docky::ui::Text(L"Remove Divider") : docky::ui::Text(L"Remove Separator"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     } else {  // blank Dock area or an icon: the pointer's side of the nearest tile centre decides the slot
-        AppendMenuW(menu, MF_STRING | (insertAt >= 0 ? 0 : MF_GRAYED), kMenuInsertSep, L"Insert Separator");
+        AppendMenuW(menu, MF_STRING | (insertAt >= 0 ? 0 : MF_GRAYED), kMenuInsertSep, docky::ui::Text(L"Insert Separator"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
     if (hit >= 0) {
-        AppendMenuW(menu, MF_STRING, kMenuOpen, (L"Open " + items_[hit].label).c_str());
-        if (items_[hit].isTransient) AppendMenuW(menu, MF_STRING, kMenuKeep, L"Keep in Dock");
-        else AppendMenuW(menu, MF_STRING, kMenuUnpin, L"Remove from Dock");
-        AppendMenuW(menu, MF_STRING, kMenuRename, L"Rename…");
-        AppendMenuW(menu, MF_STRING, kMenuChangeIcon, L"Change Icon…");
-        AppendMenuW(menu, MF_STRING, kMenuEditIcon, L"Edit Icon…");
-        AppendMenuW(menu, MF_STRING | (iconStore_.Find(items_[hit].stableId) ? 0 : MF_GRAYED), kMenuResetIcon, L"Reset Icon");
+        AppendMenuW(menu, MF_STRING, kMenuOpen, (docky::ui::Text(L"Open ") + items_[hit].label).c_str());
+        if (items_[hit].isTransient) AppendMenuW(menu, MF_STRING, kMenuKeep, docky::ui::Text(L"Keep in Dock"));
+        else AppendMenuW(menu, MF_STRING, kMenuUnpin, docky::ui::Text(L"Remove from Dock"));
+        AppendMenuW(menu, MF_STRING, kMenuRename, docky::ui::Text(L"Rename…"));
+        AppendMenuW(menu, MF_STRING, kMenuChangeIcon, docky::ui::Text(L"Change Icon…"));
+        AppendMenuW(menu, MF_STRING, kMenuEditIcon, docky::ui::Text(L"Edit Icon…"));
+        AppendMenuW(menu, MF_STRING | (iconStore_.Find(items_[hit].stableId) ? 0 : MF_GRAYED), kMenuResetIcon, docky::ui::Text(L"Reset Icon"));
         AppendMenuW(menu, MF_STRING | (items_[hit].fileLocation.empty() ? MF_GRAYED : 0), kMenuLocation,
                     L"Open file location");
         if (items_[hit].running && !IsFinderSlot(items_[hit])) {  // macOS: Quit closes every window of the app
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(menu, MF_STRING, kMenuQuitApp, L"Quit");
+            AppendMenuW(menu, MF_STRING, kMenuQuitApp, docky::ui::Text(L"Quit"));
         }
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
     {   // Show in Dock: every removable system item, checked while it is in the Dock; choosing one adds or removes it.
         HMENU show = CreatePopupMenu();
-        AppendMenuW(show, MF_STRING | (showDivider_ ? MF_CHECKED : 0), kMenuShowBase + 0, L"Divider");
-        AppendMenuW(show, MF_STRING | (showDownloads_ ? MF_CHECKED : 0), kMenuShowBase + 1, L"Downloads");
-        AppendMenuW(show, MF_STRING | (showTrash_ ? MF_CHECKED : 0), kMenuShowBase + 2, L"Recycle Bin");
+        AppendMenuW(show, MF_STRING | (showDivider_ ? MF_CHECKED : 0), kMenuShowBase + 0, docky::ui::Text(L"Divider"));
+        AppendMenuW(show, MF_STRING | (showDownloads_ ? MF_CHECKED : 0), kMenuShowBase + 1, docky::ui::Text(L"Downloads"));
+        AppendMenuW(show, MF_STRING | (showTrash_ ? MF_CHECKED : 0), kMenuShowBase + 2, docky::ui::Text(L"Recycle Bin"));
         AppendMenuW(show, MF_SEPARATOR, 0, nullptr);
         for (UINT i = 0; i < ARRAYSIZE(kStatusMenuIds); ++i) {
             const bool on = std::find(statusCells_.begin(), statusCells_.end(), kStatusMenuIds[i]) != statusCells_.end();
-            AppendMenuW(show, MF_STRING | (on ? MF_CHECKED : 0), kMenuShowBase + 10 + i, i == 0 ? L"Status (Battery, Wi-Fi, Volume)" : dock::statusgroup::CellLabel(kStatusMenuIds[i]).c_str());
+            AppendMenuW(show, MF_STRING | (on ? MF_CHECKED : 0), kMenuShowBase + 10 + i, i == 0 ? docky::ui::Text(L"Status (Battery, Wi-Fi, Volume)") : dock::statusgroup::CellLabel(kStatusMenuIds[i]).c_str());
             if (i == 2) AppendMenuW(show, MF_SEPARATOR, 0, nullptr);
         }
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(show), L"Show in Dock");
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(show), docky::ui::Text(L"Show in Dock"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
-    AppendMenuW(menu, MF_STRING, kMenuApplications, L"Applications…");
-    AppendMenuW(menu, MF_STRING, kMenuTaskManager, L"Task Manager");
-    AppendMenuW(menu, MF_STRING, kMenuDockySettings, L"DockOver Settings…");
+    AppendMenuW(menu, MF_STRING, kMenuApplications, docky::ui::Text(L"Applications…"));
+#ifdef DOCKY_PHONE_PAIRING
+    AppendMenuW(menu, MF_STRING, kMenuPairPhone, docky::ui::Text(L"Pair a phone…"));
+#endif
+    AppendMenuW(menu, MF_STRING, kMenuTaskManager, docky::ui::Text(L"Task Manager"));
+    AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuSnapshot, L"Export Dock PNG (F5)");
-    AppendMenuW(menu, MF_STRING, kMenuGlass, L"Glass Settings…");
-    AppendMenuW(menu, MF_STRING, kMenuEditConfig, L"Edit pinned items…");
-    AppendMenuW(menu, MF_STRING, kMenuReload, L"Reload (F3)");
-    AppendMenuW(menu, MF_STRING, kMenuQuit, L"Quit Dock (Esc)");
+    AppendMenuW(menu, MF_STRING, kMenuSnapshot, docky::ui::Text(L"Export Dock PNG (F5)"));
+    AppendMenuW(menu, MF_STRING, kMenuGlass, docky::ui::Text(L"Glass Settings…"));
+    AppendMenuW(menu, MF_STRING, kMenuEditConfig, docky::ui::Text(L"Edit pinned items…"));
+    AppendMenuW(menu, MF_STRING, kMenuReload, docky::ui::Text(L"Reload (F3)"));
+    AppendMenuW(menu, MF_STRING, kMenuQuit, docky::ui::Text(L"Quit Dock (Esc)"));
     POINT pt;
     GetCursorPos(&pt);
     SetForegroundWindow(hwnd_);
     auto popupItems=liquid::popup::FromNative(menu);DestroyMenu(menu);
+#ifdef DOCKY_PHONE_PAIRING
+    std::wstring pairingExecutable;
+    wchar_t modulePath[32768]{};
+    const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
+    if (moduleLength && moduleLength < ARRAYSIZE(modulePath)) {
+        const std::wstring module(modulePath, moduleLength);
+        const auto separator = module.find_last_of(L"\\/");
+        if (separator != std::wstring::npos) {
+            pairingExecutable = module.substr(0, separator + 1) + L"docky-bubble.exe";
+            const auto row = std::find_if(popupItems.begin(), popupItems.end(),
+                [](const auto& item) { return item.commandId == kMenuPairPhone; });
+            if (row != popupItems.end()) {
+                auto icon = std::make_shared<liquid::menu::Icon>();
+                if (LoadShellIconPixels(pairingExecutable, 32, icon->pixels, icon->w, icon->h))
+                    row->icon = std::move(icon);
+            }
+        }
+    }
+#endif
     const std::string selectedId=hit>=0?items_[hit].stableId:std::string{};
-    liquid::popup::Show(hwnd_,pt,std::move(popupItems),[this,hit,selectedId,sepHit,insertAt,layoutCount,jumpEntries=std::move(jumpEntries)](const liquid::menu::MenuItem& chosen){
+    liquid::popup::Show(hwnd_,pt,std::move(popupItems),[this,hit,selectedId,sepHit,insertAt,layoutCount,
+#ifdef DOCKY_PHONE_PAIRING
+        pairingExecutable=std::move(pairingExecutable),
+#endif
+        jumpEntries=std::move(jumpEntries)](const liquid::menu::MenuItem& chosen){
     const UINT cmd=chosen.commandId;
     if(cmd>=kMenuJumpBase&&cmd<kMenuJumpBase+jumpEntries.size()){dock::jump::Open(jumpEntries[cmd-kMenuJumpBase].parsingName,hwnd_);return;}
     if(cmd==kMenuApplications){OpenApplications();return;}
+#ifdef DOCKY_PHONE_PAIRING
+    if (cmd == kMenuPairPhone) {
+        if (!pairingExecutable.empty()) {
+            const auto result = reinterpret_cast<INT_PTR>(
+                ShellExecuteW(hwnd_, L"open", pairingExecutable.c_str(), L"--pair-phone", nullptr, SW_SHOWNORMAL));
+            if (result > 32) return;
+        }
+        MessageBoxW(hwnd_, L"Could not start phone pairing. Check that DockOver is fully installed.", L"DockOver", MB_OK | MB_ICONWARNING);
+        return;
+    }
+#endif
     if(cmd==kMenuTaskManager){const auto r=reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr,L"open",L"taskmgr.exe",nullptr,nullptr,SW_SHOWNORMAL));DLOG(L"menu: Task Manager (%ld)",static_cast<long>(r));return;}
     if(cmd>=kMenuShowBase&&cmd<kMenuShowBase+3){
         const char* keys[3]={"showDivider","showDownloads","showTrash"};bool* fields[3]={&showDivider_,&showDownloads_,&showTrash_};
@@ -2850,7 +3082,8 @@ void App::OnDrop(HDROP drop) {
     for (UINT i = 0; i < count; ++i) { wchar_t path[MAX_PATH * 2]; if (DragQueryFileW(drop, i, path, ARRAYSIZE(path))) paths.push_back(path); }
     DragFinish(drop);
     const int hit=model_.HitTest(frame_,Dip(pt.x),Dip(pt.y));
-    if(DropKindAt(hit)==DropKind::Launchpad)AddToLaunchpad(paths);else PinPaths(paths, Dip(pt.x));
+    if (ExternalDropKind(frame_, hit, Dip(pt.x), paths) == DropKind::Launchpad) AddToLaunchpad(paths);
+    else PinPaths(paths, DropInsertionAt(frame_, Dip(pt.x)));
 }
 
 namespace {
@@ -2895,7 +3128,7 @@ void App::RenameItem(const PinnedItem& item){
     spec.dialog.cx=216;spec.dialog.cy=60;
     if(DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&spec.dialog,hwnd_,RenameProc,reinterpret_cast<LPARAM>(&name))!=IDOK)return;
     std::wstring error;
-    if(!iconStore_.SetLabel(id,name,error)){MessageBoxW(hwnd_,error.c_str(),L"Rename icon",MB_OK|MB_ICONWARNING);return;}
+    if(!iconStore_.SetLabel(id,name,error)){MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Rename icon"),MB_OK|MB_ICONWARNING);return;}
     for(auto& tile:items_)if(tile.stableId==id)tile.label=name;
     dock::launchpad::InvalidateIcon(id);
     needsFrame_=true;StartAnimating();
@@ -2906,7 +3139,7 @@ void App::ShowLaunchpadAppMenu(const dock::launchpad::AppMenuRequest& request) {
     if(request.folder>=0){
         HMENU menu=CreatePopupMenu();
         if(!menu){dock::launchpad::MenuClosed();return;}
-        AppendMenuW(menu,MF_STRING,kLpRename,L"Rename…");
+        AppendMenuW(menu,MF_STRING,kLpRename,docky::ui::Text(L"Rename…"));
         auto items=liquid::popup::FromNative(menu);DestroyMenu(menu);
         if(!liquid::popup::Show(request.owner,request.screen,std::move(items),
             [owner=request.owner,folder=request.folder](const liquid::menu::MenuItem&){dock::launchpad::RenameFolderFromMenu(owner,folder);},
@@ -2924,16 +3157,16 @@ void App::ShowLaunchpadAppMenu(const dock::launchpad::AppMenuRequest& request) {
     const bool pinned = inDock >= 0 && !items_[inDock].isTransient;
     const bool custom = iconStore_.Find(app.stableId) || iconStore_.FindEdit(app.stableId);
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, kLpOpen, L"Open");
+    AppendMenuW(menu, MF_STRING, kLpOpen, docky::ui::Text(L"Open"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kLpDock, pinned ? L"Remove from Dock" : L"Keep in Dock");
+    AppendMenuW(menu, MF_STRING, kLpDock, pinned ? docky::ui::Text(L"Remove from Dock") : docky::ui::Text(L"Keep in Dock"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kLpRename, L"Rename…");
-    AppendMenuW(menu, MF_STRING, kLpChangeIcon, L"Change Icon…");
-    AppendMenuW(menu, MF_STRING, kLpEditIcon, L"Edit Icon…");
-    AppendMenuW(menu, MF_STRING | (custom ? 0 : MF_GRAYED), kLpResetIcon, L"Reset Icon");
+    AppendMenuW(menu, MF_STRING, kLpRename, docky::ui::Text(L"Rename…"));
+    AppendMenuW(menu, MF_STRING, kLpChangeIcon, docky::ui::Text(L"Change Icon…"));
+    AppendMenuW(menu, MF_STRING, kLpEditIcon, docky::ui::Text(L"Edit Icon…"));
+    AppendMenuW(menu, MF_STRING | (custom ? 0 : MF_GRAYED), kLpResetIcon, docky::ui::Text(L"Reset Icon"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING | (app.fileLocation.empty() ? MF_GRAYED : 0), kLpLocation, L"Show in File Explorer");
+    AppendMenuW(menu, MF_STRING | (app.fileLocation.empty() ? MF_GRAYED : 0), kLpLocation, docky::ui::Text(L"Show in File Explorer"));
     auto popupItems = liquid::popup::FromNative(menu);
     DestroyMenu(menu);
     DLOG(L"launchpad menu: '%ls' pinned=%d custom=%d", app.label.c_str(), pinned ? 1 : 0, custom ? 1 : 0);
@@ -3033,28 +3266,31 @@ void App::AddToLaunchpad(const std::vector<std::wstring>& paths){
     std::wstring error;const int added=dock::apps::AddFilesToLaunchpad(paths,dock::apps::ExtraAppsDir(),error);
     if(added)dock::launchpad::RefreshApps();
     DLOG(L"launchpad drop: added %d of %zu",added,paths.size());
-    if(!error.empty())MessageBoxW(hwnd_,error.c_str(),L"Add to Launchpad",MB_OK|MB_ICONWARNING);
+    if(!error.empty())MessageBoxW(hwnd_,error.c_str(),docky::ui::Text(L"Add to Launchpad"),MB_OK|MB_ICONWARNING);
 }
 
-void App::PinPaths(const std::vector<std::wstring>& paths, float x) {
-    int insert = 0;
-    for (const ItemGeom& g : frame_.items)
-        if (g.cx < x) ++insert;
-    // The last separator reserves the Downloads system area; all dropped items stay to its left.
-    insert=std::min(insert,static_cast<int>(PinnedEnd()));
+void App::PinPaths(const std::vector<std::wstring>& paths, int insert) {
+    insert = std::clamp(insert, 0, static_cast<int>(PinnedEnd()));
     int added = 0;
     for (const auto& pathString : paths) {
         const wchar_t* path = pathString.c_str();
         const DWORD attributes=GetFileAttributesW(path);
-        if(attributes==INVALID_FILE_ATTRIBUTES || (attributes&FILE_ATTRIBUTE_DIRECTORY)){
+        if (!pathString.starts_with(L"shell:AppsFolder\\") &&
+            (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))) {
             DLOG(L"pin: ignored missing item or directory '%ls'",path);continue;
         }
         PinnedItem item;
         item.target = path;
         ResolveItem(item);
-        if (std::any_of(items_.begin(), items_.end(), [&](const PinnedItem& e) { return !e.isSeparator && e.stableId == item.stableId; })) {
-            DLOG(L"pin: '%ls' already in Dock", item.label.c_str());
-            continue;
+        if (item.stableId.empty()) continue;
+        const auto existing = std::find_if(items_.begin(), items_.end(), [&](const PinnedItem& e) {
+            return !e.isSeparator && e.stableId == item.stableId;
+        });
+        if (existing != items_.end()) {
+            if (!existing->isTransient) continue;
+            item = std::move(*existing);
+            item.isTransient = false;
+            items_.erase(existing);
         }
         DLOG(L"pin '%ls' at %d", item.label.c_str(), insert);
         ++added;
@@ -3062,6 +3298,7 @@ void App::PinPaths(const std::vector<std::wstring>& paths, float x) {
         ++insert;
     }
     if (!added) return;
+    NormalizeSections();
     if (!SavePinnedConfig(configPath_, items_)) DLOG(L"pin: config save FAILED");
     RefreshRunningState(items_, hwnd_);
     ApplyWindowLayout(L"pin");

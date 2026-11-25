@@ -1,18 +1,108 @@
 #pragma once
-// Beat pulse for the lyrics: reads what the default audio output is playing through WASAPI loopback (the standard
-// Windows capture path audio visualisers use; no hooks, nothing injected into the player, nothing stored or sent).
-// BandSplitter turns samples into per-10 ms bass and treble energies; BeatTracker finds onsets (log-energy flux over an
-// adaptive threshold), learns the tempo from them and then pulses on the beat grid, slightly ahead of the captured
-// audio to make up for the capture delay. Started and stopped by the view (only while lyrics are shown); reconnects
-// when the output device changes.
+// WASAPI loopback publishes timestamped music features and events on the QPC
+// clock. The music views own capture lifetime and sample the same event format.
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <cmath>
-#include <deque>
 #include <thread>
-#include <vector>
 
 namespace nowplaying {
+
+enum class RhythmKind { Onset, Kick, Snare, HiHat, Beat, Downbeat, Drop, Count };
+enum class MusicState { Quiet, Steady, Building, Peak, Decaying };
+enum class MusicResponse { Instant, Balanced, Smooth };
+enum class CaptureMode { Disconnected, Events, Polling };
+
+struct RhythmEvent {
+    RhythmKind kind{};
+    double at = 0;
+    float strength = 0, confidence = 0;
+    double captured = 0, analyzed = 0, published = 0, sampleEnd = 0;
+};
+
+struct MusicFrame {
+    std::array<RhythmEvent, 8> events{};
+    unsigned count = 0, generation = 0;
+    double at = 0, captured = 0, analyzed = 0, published = 0;
+    double beatAnchor = 0, period = 0;
+    float level = 0, bass = 0, bpm = 0, confidence = 0, downbeatConfidence = 0;
+    std::array<float, 6> bands{};
+    float structureConfidence = 0;
+    MusicState state = MusicState::Quiet;
+    void Add(RhythmKind kind, double time, float strength, float certainty) {
+        if (count < events.size()) events[count++] = {kind, time, strength, certainty};
+    }
+    float Phase(double time, unsigned beats = 1) const {
+        if (!beats || period <= 0 || confidence <= 0) return 0;
+        const double cycles = (time - beatAnchor) / (period * beats);
+        return float(cycles - std::floor(cycles));
+    }
+};
+
+// Single producer and consumer. A full queue drops new frames and counts them.
+class MusicQueue {
+public:
+    bool Push(const MusicFrame& frame) {
+        const auto w = write_.load(std::memory_order_relaxed);
+        const auto next = (w + 1) % frames_.size();
+        if (next == read_.load(std::memory_order_acquire)) { ++overruns_; return false; }
+        frames_[w] = frame;
+        write_.store(next, std::memory_order_release);
+        return true;
+    }
+    bool Pop(MusicFrame& frame) {
+        const auto r = read_.load(std::memory_order_relaxed);
+        if (r == write_.load(std::memory_order_acquire)) return false;
+        frame = frames_[r];
+        read_.store((r + 1) % frames_.size(), std::memory_order_release);
+        return true;
+    }
+    unsigned Overruns() const { return overruns_.load(std::memory_order_relaxed); }
+private:
+    std::array<MusicFrame, 512> frames_{};
+    std::atomic<size_t> read_{0}, write_{0};
+    std::atomic<unsigned> overruns_{0};
+};
+
+class MusicSync {
+public:
+    void Reset() { *this = {}; }
+    template<class Deliver>
+    void Read(const MusicFrame& frame, double now, Deliver deliver) {
+        if (frame.generation != frame_.generation) Reset();
+        frame_ = frame;
+        for (unsigned i = 0; i < frame.count; ++i) {
+            const auto& event = frame.events[i];
+            if (event.at <= now) deliver(event);
+            else if (pendingCount_ < pending_.size()) pending_[pendingCount_++] = event;
+        }
+    }
+    template<class Deliver>
+    void Advance(double now, Deliver deliver) {
+        unsigned keep = 0;
+        for (unsigned i = 0; i < pendingCount_; ++i) {
+            if (pending_[i].at <= now) deliver(pending_[i]);
+            else pending_[keep++] = pending_[i];
+        }
+        pendingCount_ = keep;
+    }
+    const MusicFrame& Frame() const { return frame_; }
+private:
+    MusicFrame frame_{};
+    std::array<RhythmEvent, 8> pending_{};
+    unsigned pendingCount_ = 0;
+};
+
+struct MusicEnvelope {
+    float value = 0;
+    float Step(float target, double dt, float attack, float release) {
+        value += (target - value) * -std::expm1(-float(std::max(0.0, dt)) /
+            (target > value ? attack : release));
+        return value;
+    }
+};
 
 class AudioBeat {
 public:
@@ -21,23 +111,24 @@ public:
     AudioBeat(const AudioBeat&) = delete;
     AudioBeat& operator=(const AudioBeat&) = delete;
 
+    // Start, Stop and Pop are called by the same consumer thread.
     void Start();
     void Stop();
+    void Reset() { ++reset_; }
+    void SetSensitivity(int value) { sensitivity_.store(value, std::memory_order_relaxed); }
     bool Running() const { return thread_.joinable(); }
-    // 0..1: jumps up on a beat and decays over ~0.2 s. Read at render time.
-    float Pulse() const;
-    // 0..1: how loud the bass is relative to its recent peak (smoothed); drives the flow speed.
-    float Level() const { return loud_.load(); }
+    bool Pop(MusicFrame& frame) { return queue_.Pop(frame); }
+    unsigned Overruns() const { return queue_.Overruns(); }
+    CaptureMode Mode() const { return mode_.load(std::memory_order_relaxed); }
 
 private:
     void Loop();
     std::atomic<bool> stop_{false};
-    // Newest pulse (may start slightly in the future: grid beats are posted ahead with their exact time) and the one
-    // before it, which keeps decaying until the newest one starts.
-    std::atomic<float> level_{0}, prevLevel_{0};
-    std::atomic<double> levelTime_{0}, prevTime_{0};  // seconds (QPC)
-    void Post(float strength, double at);
-    std::atomic<float> loud_{0};
+    void* stopEvent_ = nullptr;
+    std::atomic<unsigned> reset_{0};
+    std::atomic<int> sensitivity_{50};
+    std::atomic<CaptureMode> mode_{CaptureMode::Disconnected};
+    MusicQueue queue_;
     std::thread thread_;
 };
 
@@ -81,8 +172,9 @@ private:
     float low_ = 0, high_ = 0;
 };
 
-// Pure beat tracker (unit tested). Feed one block's bass and treble energy; returns the strength (0..1) of a beat
-// pulse to start now, or 0.
+// Tempo and phase tracking shared by the music analyzer and the legacy probe.
+// Feed provides the legacy energy novelty function; FeedFlux accepts an
+// already-computed novelty function. A nonzero return carries PulseOffset().
 //  1. Onset strength: log-compressed energy rise over the previous 30 ms (bass + a quarter of treble). Onsets are its peaks
 //     above mean + 1.4 x deviation of the last ~1.5 s, at least 0.15 s apart (one block of delay).
 //  2. Tempo (every 0.25 s): autocorrelation of the last 6 s of onset strength over 75-200 BPM, with its double and
@@ -101,7 +193,6 @@ public:
     double PulseOffset() const { return pulseOffset_; }
 
     float Feed(float low, float high, float dt) {
-        t_ += double(dt); dt_ = dt;
         const bool silent = low + high < 1e-9f;
         const float l = std::log1p(low * 1e4f), h = std::log1p(high * 1e4f);
         float flux = 0;
@@ -110,6 +201,26 @@ public:
             flux = std::max(0.f, l - pl) + .25f * std::max(0.f, h - ph);
         }
         hl_[pos_] = l; hh_[pos_] = h; pos_ = (pos_ + 1) % 3; filled_ = silent ? 0 : std::min(3, filled_ + 1);
+        return FeedFlux(flux, silent, dt);
+    }
+
+    void EnableMusicTracking() { musicTracking_ = true; }
+    float FeedFlux(float flux, bool silent, float dt, bool kick = false) {
+        t_ += double(dt);
+        dt_ = dt;
+        if (kick) {
+            const float interval = float(t_ - lastKick_);
+            if (interval >= .27f && interval <= 1.02f) {
+                if (std::abs(interval - kickPeriod_) <= std::max(.028f, .10f * interval)) {
+                    kickPeriod_ += .25f * (interval - kickPeriod_);
+                    kickVotes_ = std::min(8, kickVotes_ + 1);
+                } else if (--kickVotes_ <= 0) {
+                    kickPeriod_ = interval;
+                    kickVotes_ = 1;
+                }
+            } else if (--kickVotes_ < 0) kickVotes_ = 0;
+            lastKick_ = t_;
+        }
         const float k = std::min(1.f, dt / 1.5f);
         mean_ += (flux - mean_) * k; dev_ += (std::fabs(flux - mean_) - dev_) * k;
         const float threshold = mean_ + 1.4f * dev_ + .04f;
@@ -124,14 +235,20 @@ public:
             pulseOffset_ = -double(dt);
         }
         prev2_ = prev_; prev_ = flux; prevThreshold_ = threshold;
-        if (silent) { locked_ = false; count_ = 0; misses_ = 0; memory_ = 0; return out; }  // silence: next track, forget the tempo
+        silenceTime_ = silent ? silenceTime_ + dt : 0.f;
+        if (silent && (!musicTracking_ || silenceTime_ >= .65f)) {
+            locked_ = false; count_ = 0; misses_ = 0; memory_ = 0; confidence_ = 0;
+            kickVotes_ = 0;
+            if (musicTracking_) releaseVotes_ = switchVotes_ = pendingLag_ = 0;
+            return musicTracking_ ? 0.f : out;
+        }
         if (++sinceEstimate_ >= 25 && count_ >= 300) { sinceEstimate_ = 0; Estimate(); }
 
         if (locked_ && t_ >= gridT_ + period_ - lead_) {
             if (!matched_) misses_ = std::min(misses_ + 1, 3);
-            gridT_ += period_; matched_ = nextMatched_; nextMatched_ = false;
+            gridT_ += period_; ++beatIndex_; matched_ = nextMatched_; nextMatched_ = false;
             if (matched_) misses_ = 0;
-            if (misses_ < 3) { out = std::max(out, std::clamp(strength_ * (misses_ ? .75f : 1.f), .4f, 1.f)); pulseOffset_ = gridT_ - t_; }
+            if (misses_ < 3 && (!musicTracking_ || silenceTime_ < .12f)) { out = std::max(out, std::clamp(strength_ * (misses_ ? .75f : 1.f), .4f, 1.f)); pulseOffset_ = gridT_ - t_; }
         }
         return out;
     }
@@ -140,6 +257,11 @@ public:
     struct Stats { int locks = 0, tempoChanges = 0, phaseJumps = 0; };
     const Stats& GetStats() const { return stats_; }
     bool Locked() const { return locked_; }
+    float Confidence() const { return locked_ ? confidence_ * (1.f - .28f * misses_) : 0.f; }
+    double GridOffset() const { return gridT_ - t_; }
+    double Period() const { return locked_ ? period_ : 0; }
+    unsigned BeatIndex() const { return beatIndex_; }
+    unsigned GridRevision() const { return gridRevision_; }
 
 private:
     static constexpr int kHistory = 600;  // 6 s of 10 ms blocks
@@ -160,26 +282,46 @@ private:
 
     void Estimate() {
         const int n = count_;
-        auto& x = x_; auto& c = c_;  // reused between estimates (no allocation every 0.25 s)
-        x.resize(size_t(n)); c.resize(size_t(n));
+        auto& x = x_; auto& c = c_;
         for (int i = 0; i < n; ++i) x[size_t(i)] = history_[size_t((head_ - n + i + kHistory) % kHistory)];
-        float mean = 0; for (float v : x) mean += v; mean /= float(n);
+        float mean = 0; for (int i = 0; i < n; ++i) mean += x[size_t(i)]; mean /= float(n);
         for (int i = 0; i < n; ++i) c[size_t(i)] = x[size_t(i)] - mean;
-        double ac0 = 0; for (float v : c) ac0 += double(v) * v;
-        if (ac0 <= 1e-9) return;
+        double ac0 = 0; for (int i = 0; i < n; ++i) ac0 += double(c[size_t(i)]) * c[size_t(i)];
+        if (ac0 <= 1e-9) { if (musicTracking_) { confidence_ = 0; locked_ = false; } return; }
         ac0 /= n;
         const float bd = std::max(1e-3f, dt_);
-        const int minLag = std::max(2, int(.3f / bd)), maxLag = int(.8f / bd);
+        const int minLag = std::max(2, int((musicTracking_ ? .2727f : .3f) / bd));
+        const int maxLag = std::min((n - 3) / 3, int((musicTracking_ ? 1.f : .8f) / bd));
         if (3 * maxLag + 2 >= n) return;
         auto ac = [&](int lag) { double s = 0; for (int i = lag; i < n; ++i) s += double(c[size_t(i)]) * c[size_t(i - lag)]; return float(s / (n - lag) / ac0); };
-        auto& raw = raw_; raw.assign(size_t(3 * maxLag + 3), 0.f);
+        auto& raw = raw_;
         for (int lag = minLag - 1; lag <= 3 * maxLag + 2; ++lag) raw[size_t(lag)] = ac(lag);
-        auto& score = score_; score.assign(size_t(maxLag + 1), -1e9f);
+        auto& score = score_;
         int best = -1;
         for (int lag = minLag; lag <= maxLag; ++lag) {
             const float octaves = std::log2(float(lag) * bd / .5f);
             score[size_t(lag)] = (raw[size_t(lag)] + .5f * raw[size_t(2 * lag)] + .33f * raw[size_t(3 * lag)]) * std::exp(-.5f * octaves * octaves / (.9f * .9f));
             if (best < 0 || score[size_t(lag)] > score[size_t(best)]) best = lag;
+        }
+        if (musicTracking_) {
+            // Prefer the shortest equally supported period, while allowing alternating
+            // accents to favor the slower candidate when its correlation is stronger.
+            const int half = (best + 1) / 2;
+            if (half >= minLag && raw[size_t(half)] > .65f &&
+                raw[size_t(half)] >= .9f * raw[size_t(best)] &&
+                score[size_t(half)] >= .82f * score[size_t(best)]) best = half;
+            if (kickVotes_ >= 4 && t_ - lastKick_ < 1.5 * kickPeriod_) {
+                const int expected = int(kickPeriod_ / bd + .5f);
+                int candidate = -1;
+                for (int lag = std::max(minLag, expected - 2); lag <= std::min(maxLag, expected + 2); ++lag)
+                    if (candidate < 0 || raw[size_t(lag)] > raw[size_t(candidate)]) candidate = lag;
+                const float ratio = candidate > 0 ? float(best) / candidate : 0.f;
+                if (candidate > 0 && (std::abs(ratio - 2.f) < .12f || std::abs(ratio - .5f) < .04f) &&
+                    raw[size_t(candidate)] >= std::max(.25f, .43f * raw[size_t(best)])) {
+                    score[size_t(candidate)] = std::max(score[size_t(candidate)], 1.35f * score[size_t(best)]);
+                    best = candidate;
+                }
+            }
         }
         // Stay with the tempo already locked (or, after a break, the one remembered from before it) unless another is
         // clearly and repeatedly better (no flipping between related tempos such as half, double or 3:2).
@@ -194,17 +336,45 @@ private:
             int near = -1;
             for (int lag = lo; lag <= hi; ++lag) if (near < 0 || score[size_t(lag)] > score[size_t(near)]) near = lag;
             if (near >= 0 && best != near) {
-                if (score[size_t(best)] < 1.3f * score[size_t(near)] || ++switchVotes_ < 3) best = near;
-                else switchVotes_ = 0;
+                if (!musicTracking_) {
+                    if (score[size_t(best)] < 1.3f * score[size_t(near)] || ++switchVotes_ < 3) best = near;
+                    else switchVotes_ = 0;
+                } else {
+                    const bool stronger = score[size_t(best)] >= 1.3f * score[size_t(near)] &&
+                        raw[size_t(best)] >= lockAt_;
+                    // A sequence of different challengers is not evidence of a
+                    // tempo change. Count only estimates for the same candidate.
+                    if (!stronger) { pendingLag_ = 0; switchVotes_ = 0; }
+                    else if (std::abs(best - pendingLag_) > std::max(2, pendingLag_ / 20)) {
+                        pendingLag_ = best;
+                        switchVotes_ = 1;
+                    } else ++switchVotes_;
+                    if (switchVotes_ < 3) best = near;
+                    else { pendingLag_ = 0; switchVotes_ = 0; }
+                }
             } else switchVotes_ = 0;
         }
         const float confidence = raw[size_t(best)];  // of the chosen lag
+        if (musicTracking_) {
+            float competitor = 0;
+            for (int lag = minLag; lag <= maxLag; ++lag) {
+                if (std::abs(lag - best) <= 3) continue;
+                competitor = std::max(competitor, score[size_t(lag)]);
+            }
+            const float margin = std::clamp(1.f - competitor / std::max(.01f, score[size_t(best)]), 0.f, 1.f);
+            const float quality = std::clamp(confidence, 0.f, 1.f) * (.72f + .28f * margin);
+            confidence_ = locked_ ? confidence_ + .25f * (quality - confidence_) : quality;
+        }
         // Sub-block period from a parabola through the neighbours.
         const float a = raw[size_t(best - 1)], b = raw[size_t(best)], cc = raw[size_t(best + 1)];
         const float shift = (a - 2 * b + cc) < 0 ? std::clamp(.5f * (a - cc) / (a - 2 * b + cc), -.5f, .5f) : 0.f;
         const float period = (float(best) + shift) * bd;
         if (!locked_ && confidence < lockAt_) return;
-        if (locked_ && confidence < releaseAt_) { locked_ = false; return; }
+        if (locked_ && confidence < releaseAt_) {
+            if (!musicTracking_ || ++releaseVotes_ >= 3) locked_ = false;
+            return;
+        }
+        releaseVotes_ = 0;
         // Phase: the grid offset collecting the most onset strength (recent beats count more).
         const float lagBlocks = period / bd;
         int bestPhase = 0; float bestSum = -1;
@@ -218,11 +388,12 @@ private:
         }
         const double beat = t_ - double(bestPhase) * bd;
         if (!locked_) {
-            ++stats_.locks;
+            if (musicTracking_) switchVotes_ = pendingLag_ = 0;
+            ++stats_.locks; ++gridRevision_; beatIndex_ = 0;
             locked_ = true; period_ = period; memory_ = period; gridT_ = beat; matched_ = true; misses_ = 0; jumps_ = 0;
             return;
         }
-        if (std::fabs(period - period_) / period_ >= .06f) ++stats_.tempoChanges;
+        if (std::fabs(period - period_) / period_ >= .06f) { ++stats_.tempoChanges; ++gridRevision_; }
         period_ = std::fabs(period - period_) / period_ < .06f ? period_ + (period - period_) * .1f : period;
         memory_ = period_;
         double diff = std::fmod(beat - gridT_, double(period_));
@@ -232,7 +403,7 @@ private:
         if (std::fabs(diff) < .1) { gridT_ += .2 * diff; period_ += float(.03 * diff); memory_ = period_; jumps_ = 0; }
         else {  // a clear phase change only when three estimates in a row point to the same new phase
             if (jumps_ > 0 && std::fabs(diff - pendingDiff_) < .04) ++jumps_; else { jumps_ = 1; pendingDiff_ = diff; }
-            if (jumps_ >= 3) { gridT_ += diff; jumps_ = 0; ++stats_.phaseJumps; }
+            if (jumps_ >= 3) { gridT_ += diff; jumps_ = 0; ++stats_.phaseJumps; ++gridRevision_; }
         }
     }
 
@@ -240,13 +411,19 @@ private:
     double pulseOffset_ = 0;
     float memory_ = 0; double pendingDiff_ = 0;
     Stats stats_;  // last locked period, kept through breaks
-    std::vector<float> x_, c_, raw_, score_;
+    std::array<float, kHistory> x_{}, c_{}, raw_{}, score_{};
     double t_ = 0, lastOnset_ = -1, gridT_ = 0;
     float hl_[3]{}, hh_[3]{}; int pos_ = 0, filled_ = 0;
     float mean_ = 0, dev_ = 0, prev_ = 0, prev2_ = 0, prevThreshold_ = 1e9f, strength_ = .6f;
     float history_[kHistory]{}; int head_ = 0, count_ = 0, sinceEstimate_ = 0;
     bool locked_ = false, matched_ = false, nextMatched_ = false; int misses_ = 0, jumps_ = 0, switchVotes_ = 0;
     float period_ = .5f;
+    bool musicTracking_ = false;
+    float silenceTime_ = 0, confidence_ = 0;
+    float kickPeriod_ = 0;
+    double lastKick_ = -10;
+    int kickVotes_ = 0, pendingLag_ = 0, releaseVotes_ = 0;
+    unsigned beatIndex_ = 0, gridRevision_ = 0;
 };
 
 }  // namespace nowplaying

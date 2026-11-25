@@ -123,7 +123,7 @@ void PaintGlass(ID2D1RenderTarget* rt, D2D1_RECT_F shape, float radius, const RE
 // Widget plate for the current style. Solid: an opaque rounded plate (light plate for `lightPlate` kinds such as the
 // digital clock, a black one for `darkPlate`, else the theme's dark or light surface) with the liquid glass rim and a
 // soft shadow. Returns the theme the content should use on that plate.
-enum class PlateTone { Theme, Light, Black, Glass };
+enum class PlateTone { Theme, Light, Black, Glass, SubtleGradient };
 Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, const Theme& theme, PlateTone tone);
 
 // The liquid glass rim (Prefs::glassRim; the Dock shader's fixed reflection): `outline` is a closed clockwise polygon.

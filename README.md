@@ -31,6 +31,8 @@
 
 <p align="center"><sub>截图均来自演示环境：Windows 默认壁纸、Windows 自带应用和示例数据。</sub></p>
 
+[1.1.0 更新说明](docs/releases/1.1.0.md) · [DockDrop 独立版](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player 独立版](https://github.com/Davizcbia/DockOver-Music-Player)
+
 ---
 
 ## Dock

@@ -5,7 +5,9 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef LIQUID_BUILD_ID)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/liquid_build_id.h" "#pragma once\n#define LIQUID_BUILD_MARKER \"LiquidDesktopBuild:${LIQUID_BUILD_ID}\"\n")
 # Software update (Settings > About): the version is the GitHub release tag; see package_docky.ps1.
-set(DOCKY_VERSION "1.0.0")  # the GitHub release tag of this version; raise it for every release
+set(DOCKY_VERSION "1.1.0")  # the GitHub release tag of this version; raise it for every release
+set(DOCKDROP_VERSION "0.1.0")
+set(DOCKOVER_MUSIC_VERSION "0.1.0")
 set(DOCKY_UPDATE_REPO "Davizcbia/DockOver")  # GitHub repository whose releases carry updates (public)
 set(DOCKY_UPDATE_ASSET "DockOver-Windows-Portable")  # name prefix of the release's portable zip
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/docky_version.h.tmp" "#pragma once\n#define DOCKY_VERSION \"${DOCKY_VERSION}\"\n#define DOCKY_UPDATE_REPO \"${DOCKY_UPDATE_REPO}\"\n#define DOCKY_UPDATE_ASSET \"${DOCKY_UPDATE_ASSET}\"\n")
@@ -35,6 +37,19 @@ add_shader(silk.hlsl PSMain ps_5_0 g_SilkPS silk_ps.h)
 add_shader(roi_compare.hlsl CSMain cs_5_0 g_RoiCompareCS roi_compare_cs.h)
 add_shader(genie.hlsl VSMain vs_5_0 g_GenieVS genie_vs.h)
 add_shader(genie.hlsl PSMain ps_5_0 g_GeniePS genie_ps.h)
+add_shader(blackhole.hlsl VSMain vs_5_0 g_BlackHoleVS blackhole_vs.h)
+add_shader(blackhole.hlsl PSMain ps_5_0 g_BlackHolePS blackhole_ps.h)
+add_shader(blackhole_debris.hlsl VSDebris vs_5_0 g_BlackHoleDebrisVS blackhole_debris_vs.h)
+add_shader(blackhole_debris.hlsl PSDebris ps_5_0 g_BlackHoleDebrisPS blackhole_debris_ps.h)
+add_shader(orb.hlsl VSFull vs_5_0 g_OrbVSFull orb_vs_full.h)
+add_shader(orb.hlsl VSParticle vs_5_0 g_OrbVSParticle orb_vs_particle.h)
+add_shader(orb.hlsl PSGlass ps_5_0 g_OrbPSGlass orb_ps_glass.h)
+add_shader(orb.hlsl PSParticle ps_5_0 g_OrbPSParticle orb_ps_particle.h)
+add_shader(orb.hlsl PSOverlay ps_5_0 g_OrbPSOverlay orb_ps_overlay.h)
+add_shader(bubble.hlsl VSFull vs_5_0 g_BubbleVS bubble_vs.h)
+add_shader(bubble.hlsl PSBubble ps_5_0 g_BubblePS bubble_ps.h)
+add_shader(bubble.hlsl PSRays ps_5_0 g_BubbleRaysPS bubble_rays_ps.h)
+add_shader(bubble.hlsl PSPcPairing ps_5_0 g_PcPairingPS pc_pairing_ps.h)
 add_custom_target(LiquidDockShaders DEPENDS ${SHADER_HEADERS})
 
 add_executable(LiquidDock WIN32
@@ -476,17 +491,29 @@ target_include_directories(DockyUpdateVersionTest PRIVATE src "${CMAKE_CURRENT_B
 target_link_libraries(DockyUpdateVersionTest PRIVATE winhttp bcrypt)
 
 # ---- Version resources (FileDescription is the name Windows shows: Task Manager, notification settings, the Dock) ----
-string(REPLACE "." ";" DOCKY_VERSION_PARTS "${DOCKY_VERSION}")
-list(APPEND DOCKY_VERSION_PARTS 0 0 0)
-list(GET DOCKY_VERSION_PARTS 0 DOCKY_V0)
-list(GET DOCKY_VERSION_PARTS 1 DOCKY_V1)
-list(GET DOCKY_VERSION_PARTS 2 DOCKY_V2)
 function(docky_version_resource target description)
+  set(product DockOver)
+  set(version "${DOCKY_VERSION}")
+  set(icon "${CMAKE_CURRENT_SOURCE_DIR}/assets/dockover.ico")
+  if(target STREQUAL "DockDrop")
+    set(product DockDrop)
+    set(version "${DOCKDROP_VERSION}")
+  elseif(target STREQUAL "DockOverMusic")
+    set(product "DockOver Music Player")
+    set(version "${DOCKOVER_MUSIC_VERSION}")
+  endif()
+  string(REPLACE "." ";" version_parts "${version}")
+  list(GET version_parts 0 version_major)
+  list(GET version_parts 1 version_minor)
+  list(GET version_parts 2 version_patch)
+  if(target MATCHES "^(DockDrop|DockyBubble|DockyOrb)$")
+    set(icon "${CMAKE_CURRENT_SOURCE_DIR}/assets/dockdrop.ico")
+  endif()
   set(rc "${CMAKE_CURRENT_BINARY_DIR}/${target}_version.rc")
   file(WRITE "${rc}.tmp" "#include <winver.h>
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION ${DOCKY_V0},${DOCKY_V1},${DOCKY_V2},0
-PRODUCTVERSION ${DOCKY_V0},${DOCKY_V1},${DOCKY_V2},0
+FILEVERSION ${version_major},${version_minor},${version_patch},0
+PRODUCTVERSION ${version_major},${version_minor},${version_patch},0
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -496,9 +523,9 @@ BEGIN
     BEGIN
       VALUE \"CompanyName\", \"DockOver\"
       VALUE \"FileDescription\", \"${description}\"
-      VALUE \"FileVersion\", \"${DOCKY_VERSION}\"
-      VALUE \"ProductName\", \"DockOver\"
-      VALUE \"ProductVersion\", \"${DOCKY_VERSION}\"
+      VALUE \"FileVersion\", \"${version}\"
+      VALUE \"ProductName\", \"${product}\"
+      VALUE \"ProductVersion\", \"${version}\"
     END
   END
   BLOCK \"VarFileInfo\"
@@ -507,9 +534,10 @@ BEGIN
   END
 END
 ")
-  file(APPEND "${rc}.tmp" "1 ICON \"${CMAKE_CURRENT_SOURCE_DIR}/assets/dockover.ico\"
-")  # app icon (taskbar, Explorer, Alt+Tab)
+  file(APPEND "${rc}.tmp" "1 ICON \"${icon}\"
+")
   configure_file("${rc}.tmp" "${rc}" COPYONLY)
+  set_property(SOURCE "${rc}" APPEND PROPERTY OBJECT_DEPENDS "${icon}")
   target_sources(${target} PRIVATE "${rc}")
 endfunction()
 docky_version_resource(LiquidDesktopManager "DockOver")
@@ -520,6 +548,115 @@ docky_version_resource(DockyDesktop "DockOver Desktop")
 docky_version_resource(docky-updater "DockOver Updater")
 docky_version_resource(DockyTaskbarGuardian "DockOver Taskbar Guardian")
 docky_version_resource(DockyNowPlaying "DockOver Now Playing")
+add_executable(DockOverMusic WIN32 tools/music_launcher.cpp)
+target_compile_definitions(DockOverMusic PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_link_libraries(DockOverMusic PRIVATE LiquidDesktopSettings user32 shell32)
+if(MSVC)
+  target_compile_options(DockOverMusic PRIVATE /utf-8 /W4 /permissive-)
+endif()
+docky_version_resource(DockOverMusic "DockOver Music Player")
+
+# Black Hole Visualizer (DockDrop visual base, standalone test entry; docs/blackhole-visualizer-v01.md). Not started by the
+# manager and not linked into the Dock, menu bar, Control Center or Now Playing.
+add_executable(DockyBlackHole WIN32 src/blackhole/blackhole_main.cpp src/blackhole/blackhole_renderer.cpp)
+set_target_properties(DockyBlackHole PROPERTIES OUTPUT_NAME docky-blackhole)
+target_compile_features(DockyBlackHole PRIVATE cxx_std_20)
+target_compile_definitions(DockyBlackHole PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockyBlackHole PRIVATE ${SHADER_OUT})
+add_dependencies(DockyBlackHole LiquidDockShaders)
+target_link_libraries(DockyBlackHole PRIVATE user32 gdi32 shell32 shcore ole32 uuid comctl32 d3d11 dxgi dcomp dwmapi pdh)
+if(MSVC)
+  target_compile_options(DockyBlackHole PRIVATE /utf-8 /W4 /permissive-)
+endif()
+docky_version_resource(DockyBlackHole "DockOver Black Hole Visualizer")
+add_executable(DockyBlackHoleTest tests/blackhole_lut_test.cpp)
+target_compile_features(DockyBlackHoleTest PRIVATE cxx_std_20)
+target_compile_definitions(DockyBlackHoleTest PRIVATE UNICODE _UNICODE NOMINMAX)
+if(MSVC)
+  target_compile_options(DockyBlackHoleTest PRIVATE /utf-8 /W4 /permissive-)
+endif()
+
+# ---- DockDrop pairing orb (standalone prototype; changes nothing else) ----
+add_executable(DockyOrb WIN32 src/pairing/orb_main.cpp)
+set_target_properties(DockyOrb PROPERTIES OUTPUT_NAME docky-orb)
+target_compile_features(DockyOrb PRIVATE cxx_std_20)
+target_compile_definitions(DockyOrb PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockyOrb PRIVATE ${SHADER_OUT})
+add_dependencies(DockyOrb LiquidDockShaders)
+target_link_libraries(DockyOrb PRIVATE user32 gdi32 shell32 shcore ole32 uuid d3d11 dxgi dcomp dwmapi bcrypt)
+if(MSVC)
+  target_compile_options(DockyOrb PRIVATE /utf-8 /W4 /permissive-)
+endif()
+docky_version_resource(DockyOrb "DockOver DockDrop Pairing Orb (prototype)")
+# ---- Optical Bubble visual prototype (Phase 2: the liquid-glass ball, no code yet; changes nothing else) ----
+add_executable(DockyBubble WIN32 src/pairing/bubble_main.cpp)
+set_target_properties(DockyBubble PROPERTIES OUTPUT_NAME docky-bubble)
+target_compile_features(DockyBubble PRIVATE cxx_std_20)
+target_compile_definitions(DockyBubble PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+target_include_directories(DockyBubble PRIVATE ${SHADER_OUT})
+add_dependencies(DockyBubble LiquidDockShaders)
+target_link_libraries(DockyBubble PRIVATE user32 gdi32 shell32 shcore ole32 uuid d3d11 dxgi dcomp dwmapi windowscodecs)
+option(DOCKY_PHONE_PAIRING "Build the native DockDrop phone pairing host" ON)
+if(DOCKY_PHONE_PAIRING)
+  include(FetchContent)
+  if(POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+  endif()
+  FetchContent_Declare(dockdrop_webview2
+    URL https://api.nuget.org/v3-flatcontainer/microsoft.web.webview2/1.0.2903.40/microsoft.web.webview2.1.0.2903.40.nupkg
+    URL_HASH SHA256=ef128016dd1e51c59178c827ed5b8aa3322c57afa8675d930f8109505542ad74
+    DOWNLOAD_NAME webview2.zip)
+  FetchContent_MakeAvailable(dockdrop_webview2)
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID STREQUAL "ARM64")
+    set(DOCKDROP_WEBVIEW2_ARCH arm64)
+  elseif(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    set(DOCKDROP_WEBVIEW2_ARCH x64)
+  else()
+    set(DOCKDROP_WEBVIEW2_ARCH x86)
+  endif()
+  set(DOCKDROP_HOST_RC "${CMAKE_CURRENT_BINARY_DIR}/phone_host.rc")
+  configure_file(src/pairing/phone_host.rc.in "${DOCKDROP_HOST_RC}" @ONLY)
+  set_property(SOURCE "${DOCKDROP_HOST_RC}" APPEND PROPERTY OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pairing/phone_host.html"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/dockdrop-scan/pair.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/dockdrop-scan/config.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/dockdrop-scan/bubble/bubble-code.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/dockdrop-scan/bubble/qr.js"
+    "${CMAKE_CURRENT_SOURCE_DIR}/web/dockdrop-scan/bubble/transfer.js")
+  add_executable(DockDrop WIN32 EXCLUDE_FROM_ALL src/pairing/bubble_main.cpp
+    "${SHADER_OUT}/bubble_vs.h" "${SHADER_OUT}/bubble_ps.h" "${SHADER_OUT}/bubble_rays_ps.h"
+    "${SHADER_OUT}/pc_pairing_ps.h")
+  target_compile_features(DockDrop PRIVATE cxx_std_20)
+  target_compile_definitions(DockDrop PRIVATE DOCKDROP_STANDALONE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_include_directories(DockDrop PRIVATE ${SHADER_OUT})
+  target_link_libraries(DockDrop PRIVATE user32 gdi32 shell32 shcore ole32 uuid d3d11 dxgi dcomp dwmapi windowscodecs)
+  if(MSVC)
+    target_compile_options(DockDrop PRIVATE /utf-8 /W4 /permissive-)
+  endif()
+  docky_version_resource(DockDrop "DockDrop")
+  install(TARGETS DockDrop RUNTIME DESTINATION . COMPONENT DockDrop EXCLUDE_FROM_ALL)
+  foreach(target IN ITEMS DockyBubble DockDrop)
+    target_sources(${target} PRIVATE src/pairing/phone_host.cpp src/pairing/phone_transfer.cpp src/desktop_settings.cpp
+      src/glass_params.cpp src/json_lite.cpp "${DOCKDROP_HOST_RC}")
+    target_include_directories(${target} PRIVATE "${dockdrop_webview2_SOURCE_DIR}/build/native/include")
+    target_link_libraries(${target} PRIVATE shlwapi version gdiplus msimg32 d2d1 dwrite comctl32 crypt32 advapi32
+      "${dockdrop_webview2_SOURCE_DIR}/build/native/${DOCKDROP_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib")
+    target_compile_definitions(${target} PRIVATE DOCKY_PHONE_PAIRING)
+  endforeach()
+  target_compile_definitions(LiquidDock PRIVATE DOCKY_PHONE_PAIRING)
+  add_dependencies(LiquidDock DockyBubble)
+endif()
+if(MSVC)
+  target_compile_options(DockyBubble PRIVATE /utf-8 /W4 /permissive-)
+endif()
+docky_version_resource(DockyBubble "DockOver Optical Bubble (visual prototype)")
+add_executable(DockyOrbTest tests/orb_code_test.cpp)
+set_target_properties(DockyOrbTest PROPERTIES OUTPUT_NAME docky-orb-test)
+target_compile_features(DockyOrbTest PRIVATE cxx_std_20)
+target_compile_definitions(DockyOrbTest PRIVATE UNICODE _UNICODE NOMINMAX)
+if(MSVC)
+  target_compile_options(DockyOrbTest PRIVATE /utf-8 /W4 /permissive-)
+endif()
 
 # ---- Release launcher: DockOver.exe in a release folder starts runtime\LiquidDesktopManager.exe (package_docky.ps1 -Release) ----
 add_executable(DockOverLauncher WIN32 tools/launcher_main.cpp)

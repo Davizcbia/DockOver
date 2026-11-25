@@ -2,6 +2,7 @@
 // docky Desktop widgets: built-in kinds and the template renderer used by third-party widgets.
 #include "canvas.h"
 #include "../json_lite.h"
+#include <span>
 #include <string>
 #include <vector>
 
@@ -42,7 +43,29 @@ PlateTone PlateToneOf(const std::wstring& kind);  // the digital Clock: white, o
 IDWriteTextFormat* IconFont(float size);  // Segoe Fluent Icons / MDL2 Assets glyphs  // solid style: drawn on a light plate (the digital clock)
 
 // Paints one widget body (glass is painted by the caller) into `r` (DIP).
-void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D1_RECT_F r, const Theme& theme, const ExtWidget* ext);
+enum class DropWidgetNotice { None, InvalidDrop, Unavailable, EmptyClipboard };
+struct DropWidgetEntry {
+    std::wstring preview;
+    bool clipboard = false;
+    std::vector<std::uint32_t> icon;
+    UINT iconW = 0, iconH = 0;
+};
+struct DropWidgetLayout {
+    D2D1_RECT_F open{}, first{}, preview{}, footer{}, previous{}, next{};
+    int columns = 1, rows = 1;
+    int Capacity() const { return columns * rows; }
+    D2D1_RECT_F Tile(int slot) const;
+};
+DropWidgetLayout LayoutDropWidget(D2D1_RECT_F frame);
+struct DropWidgetState {
+    std::span<const DropWidgetEntry> entries;
+    int page = 0, hovered = -1;
+    bool hovering = false;
+    bool focused = false;
+    DropWidgetNotice notice = DropWidgetNotice::None;
+};
+void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D1_RECT_F r,
+                 const Theme& theme, const ExtWidget* ext, const DropWidgetState* drop = nullptr);
 // Row under a point for list templates (-1 none), used for widget.clicked events.
 int ListRowAt(const ExtWidget& ext, Size size, D2D1_RECT_F r, D2D1_POINT_2F p);
 UINT RefreshMs(const std::wstring& kind);

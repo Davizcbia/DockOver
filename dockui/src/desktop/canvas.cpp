@@ -1,4 +1,5 @@
 #include "canvas.h"
+#include "../ui_language.h"
 #include "../desktop_settings.h"
 #include "../music_wallpaper_frame.h"
 #include "../theme_state.h"
@@ -63,12 +64,13 @@ void Text(ID2D1RenderTarget* rt, const std::wstring& text, IDWriteTextFormat* fo
     if (!rt || !format || text.empty()) return;
     ComPtr<ID2D1SolidColorBrush> brush;
     if (FAILED(rt->CreateSolidColorBrush(color, &brush))) return;
-    rt->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), format, box, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    const auto translated = docky::ui::Text(text.c_str());
+    rt->DrawTextW(translated, static_cast<UINT32>(wcslen(translated)), format, box, brush.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 float TextWidth(const std::wstring& text, IDWriteTextFormat* format) {
     ComPtr<IDWriteTextLayout> layout;
-    if (text.empty() || !format || FAILED(DWrite()->CreateTextLayout(text.c_str(), static_cast<UINT32>(text.size()), format, 4096.f, 200.f, &layout))) return 0;
+    if (text.empty() || !format || FAILED(DWrite()->CreateTextLayout(docky::ui::Text(text.c_str()), static_cast<UINT32>(wcslen(docky::ui::Text(text.c_str()))), format, 4096.f, 200.f, &layout))) return 0;
     DWRITE_TEXT_METRICS m{}; layout->GetMetrics(&m); return m.widthIncludingTrailingWhitespace;
 }
 
@@ -515,14 +517,36 @@ Theme PaintLiquidPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& scr
 }
 
 Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, const Theme& theme, PlateTone tone) {
-    if (tone == PlateTone::Glass && !theme.contrast) return PaintLiquidPlate(rt, shape, screen, theme);
+    const bool gradient = tone == PlateTone::SubtleGradient;
+    if (!theme.contrast && (tone == PlateTone::Glass || (gradient && CurrentPrefs().style == 1)))
+        return PaintLiquidPlate(rt, shape, screen, theme);
     if (CurrentPrefs().style == 1 || theme.contrast) { PaintGlass(rt, shape, kRadius, screen, theme, 0.6f + 0.4f * CurrentPrefs().glass); return theme; }
     const bool lightPlate = tone == PlateTone::Light, blackPlate = tone == PlateTone::Black;
     ComPtr<ID2D1SolidColorBrush> brush;
-    rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.05f), &brush);
+    if (FAILED(rt->CreateSolidColorBrush(D2D1::ColorF(0, 0, 0, 0.05f), &brush))) return theme;
     for (int i = 5; i >= 1; --i) {  // soft shadow
         const float g = i * 1.6f;
         if (auto layer = WidgetShape(D2D1::RectF(shape.left, shape.top + 2.f, shape.right, shape.bottom + 2.f), rt, g)) rt->FillGeometry(layer.Get(), brush.Get());
+    }
+    auto outline = WidgetShape(shape, rt);
+    if (!outline) return theme;
+    if (gradient) {
+        const auto top = Rgb(theme.dark ? 0x212121 : 0xf9f9fa);
+        const auto bottom = Rgb(theme.dark ? 0x0e0e0e : 0xececee);
+        const D2D1_GRADIENT_STOP colors[] = {{0.f, top}, {1.f, bottom}};
+        ComPtr<ID2D1GradientStopCollection> stops;
+        ComPtr<ID2D1LinearGradientBrush> fill;
+        if (SUCCEEDED(rt->CreateGradientStopCollection(colors, ARRAYSIZE(colors), &stops)) &&
+            SUCCEEDED(rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(
+                D2D1::Point2F(shape.left, shape.top), D2D1::Point2F(shape.left, shape.bottom)), stops.Get(), &fill))) {
+            rt->FillGeometry(outline.Get(), fill.Get());
+        } else {
+            brush->SetColor(top);
+            rt->FillGeometry(outline.Get(), brush.Get());
+        }
+        brush->SetColor(theme.dark ? Rgb(0xffffff, 0.10f) : Rgb(0x000000, 0.10f));
+        if (auto hairline = WidgetShape(shape, rt, -0.5f)) rt->DrawGeometry(hairline.Get(), brush.Get(), 1.f);
+        return theme;
     }
     const bool light = !blackPlate && (lightPlate || !theme.dark);
     Theme t = theme;
@@ -533,8 +557,6 @@ Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, c
         t.dark = true; t.ink = D2D1::ColorF(1, 1, 1, blackPlate ? 1.f : 0.96f); t.secondary = D2D1::ColorF(0.92f, 0.92f, 0.96f, 0.55f);
         brush->SetColor(blackPlate ? D2D1::ColorF(0.015f, 0.015f, 0.018f, 1) : D2D1::ColorF(0.11f, 0.11f, 0.12f, 0.94f));
     }
-    auto outline = WidgetShape(shape, rt);
-    if (!outline) return t;
     rt->FillGeometry(outline.Get(), brush.Get());
     PaintGlassRim(rt, WidgetOutline(shape, -0.5f, 28), light);  // the liquid glass rim (hairline on a light plate)
     return t;

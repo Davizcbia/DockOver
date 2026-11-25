@@ -67,7 +67,8 @@ int wmain(int argc, wchar_t** argv) {
     for(const auto* bad:{"{\"schemaVersion\":1,\"appearance\":{\"settingsScalePercent\":90.5}}","{\"schemaVersion\":1,\"appearance\":{\"applicationsScalePercent\":\"80\"}}"})ok=ok&&put(bad)&&Load(file).status==LoadStatus::Invalid;
     ok=ok&&put("{\"schemaVersion\":1}")&&Load(file).value.appearance.language=="en";
     ok=ok&&WriteLanguage(file,"en")==SaveStatus::Saved&&Load(file).value.appearance.language=="en";
-    ok=ok&&WriteLanguage(file,"zh-CN")==SaveStatus::Invalid&&Load(file).value.appearance.language=="en";
+    ok=ok&&WriteLanguage(file,"zh-CN")==SaveStatus::Saved&&Load(file).value.appearance.language=="zh-CN";
+    ok=ok&&WriteLanguage(file,"unsupported")==SaveStatus::Invalid&&Load(file).value.appearance.language=="zh-CN";
     // Legacy default, persisted scale bounds, invalid writes and noninteger/type rejection.
     ok=ok&&put("{\"schemaVersion\":1}")&&Load(file).value.menuBar.scalePercent==100;
     ok=ok&&WriteMenuBarScale(file,80)==SaveStatus::Saved&&Load(file).value.menuBar.scalePercent==80;
@@ -156,6 +157,13 @@ int wmain(int argc, wchar_t** argv) {
     auto read=[&](){std::ifstream in(file,std::ios::binary);return std::string((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());};
     ok=ok&&put("{\"schemaVersion\":1,\"dock\":{\"iconSize\":64}}")&&Load(file).value.dock.iconSize==64;
     ok=ok&&put("{\"schemaVersion\":1}")&&!Load(file).value.controlCenter.mediaArtworkBackground;
+    ok=ok&&Load(file).value.controlCenter.musicSensitivity==50;
+    for (const int sensitivity : {0, 50, 100})
+        ok=ok&&WriteControlCenterInt(file,"musicSensitivity",sensitivity)==SaveStatus::Saved&&
+            Load(file).value.controlCenter.musicSensitivity==sensitivity;
+    {const auto saved=read();
+     ok=ok&&WriteControlCenterInt(file,"musicSensitivity",-1)==SaveStatus::Invalid&&
+         WriteControlCenterInt(file,"musicSensitivity",101)==SaveStatus::Invalid&&read()==saved;}
     ok=ok&&WriteBool(file,"controlCenter","mediaArtworkBackground",true)==SaveStatus::Saved&&Load(file).value.controlCenter.mediaArtworkBackground;
     ok=ok&&WriteBool(file,"controlCenter","mediaArtworkBackground",false)==SaveStatus::Saved&&!Load(file).value.controlCenter.mediaArtworkBackground;
     ok=ok&&put("{\"schemaVersion\":1,\"controlCenter\":{\"mediaArtworkBackground\":1}}")&&Load(file).status==LoadStatus::Invalid;

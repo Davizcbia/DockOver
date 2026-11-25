@@ -33,7 +33,7 @@ if (-not $NoBuild) {
     $dev = Join-Path $vs 'Common7\Tools\VsDevCmd.bat'
     $cmake = Join-Path $vs 'Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe'
     $identity = $(if ($NoIdentity) { 'OFF' } else { 'ON' })
-    $command = 'call "{0}" -arch=x64 >nul && "{1}" -S "{2}" -B "{3}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TRY_COMPILE_CONFIGURATION=Release -DDOCKY_SPARSE_IDENTITY={4} && "{1}" --build "{3}"' -f $dev, $cmake, $source, $BuildDir, $identity
+    $command = 'call "{0}" -arch=x64 >nul && "{1}" -S "{2}" -B "{3}" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TRY_COMPILE_CONFIGURATION=Release -DDOCKY_SPARSE_IDENTITY={4} -DDOCKY_PHONE_PAIRING=ON && "{1}" --build "{3}"' -f $dev, $cmake, $source, $BuildDir, $identity
     & $env:ComSpec /d /s /c $command
     if ($LASTEXITCODE -ne 0) { throw "Build failed with exit code $LASTEXITCODE" }
 }
@@ -43,7 +43,8 @@ if ($built -notmatch "DOCKY_VERSION `"$([regex]::Escape($version))`"") { throw "
 # Program files only. User settings, packs and logs live in %LOCALAPPDATA% and are never part of the package.
 $programs = 'LiquidDesktopManager.exe', 'LiquidDock.exe', 'LiquidMenuBar.exe', 'LiquidDesktopSettings.exe',
             'docky-taskbar-guardian.exe', 'docky-taskbar-restore.exe', 'docky-taskbar-guard-sim.exe',
-            'docky-wifi-list.exe', 'docky-ext.exe', 'docky-updater.exe', 'docky-now-playing.exe'
+            'docky-wifi-list.exe', 'docky-ext.exe', 'docky-updater.exe', 'docky-now-playing.exe',
+            'docky-bubble.exe', 'docky-blackhole.exe'
 $name = $(if ($Release) { "$asset-$version" } else { "DockOver-Windows-Dev-$version" })
 $stage = Join-Path $root "dist\$name"
 if (Test-Path -LiteralPath $stage) { $stage = "$stage-build-$([guid]::NewGuid().ToString('N'))" }

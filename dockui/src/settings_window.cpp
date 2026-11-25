@@ -1,4 +1,5 @@
 #include "desktop_settings.h"
+#include "ui_language.h"
 #include "mydockfinder_import.h"
 #include "settings_search.h"
 #include "settings_motion.h"
@@ -41,6 +42,8 @@ using Microsoft::WRL::ComPtr;
 static volatile const char buildMarker[]=LIQUID_BUILD_MARKER;
 namespace {
 constexpr wchar_t ClassName[]=L"LiquidDesktopSettingsV01";
+constexpr wchar_t MusicClassName[]=L"DockOverMusicSettings";
+bool musicOnly=false;
 constexpr const wchar_t* titles[]={L"General",L"Appearance",L"Dock",L"Menu Bar",L"Launchpad",L"Control Center",L"Windows Taskbar",L"Workshop",L"Migration",L"About",L"Music"};
 ComPtr<ID2D1Factory> factory; ComPtr<ID2D1HwndRenderTarget> fallbackTarget;
 ID2D1RenderTarget* target=nullptr; ComPtr<ID2D1SolidColorBrush> brush;
@@ -282,7 +285,7 @@ void DrawSettingsSwitch(HWND hwnd,int index,D2D1_RECT_F hit,bool on,bool pressed
  brush->SetColor(C(contrast?colors.primary:0xFFFFFF,pressed&&!contrast?.82f:1.f));target->FillRoundedRectangle(D2D1::RoundedRect(knob,kh*.5f,kh*.5f),brush.Get());
  if(!contrast){brush->SetColor(C(0x000000,.12f));target->DrawRoundedRectangle(D2D1::RoundedRect(knob,kh*.5f,kh*.5f),brush.Get(),.7f);}
 }
-void Text(const wchar_t* text,IDWriteTextFormat* fmt,D2D1_RECT_F r,unsigned color){brush->SetColor(C(color));target->DrawTextW(text,static_cast<UINT32>(wcslen(text)),fmt,r,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);}
+void Text(const wchar_t* text,IDWriteTextFormat* fmt,D2D1_RECT_F r,unsigned color){text=docky::ui::Text(text);brush->SetColor(C(color));target->DrawTextW(text,static_cast<UINT32>(wcslen(text)),fmt,r,brush.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);}
 struct FormRow {float top=0,bottom=0;D2D1_RECT_F title{},detail{},control{};};
 float DetailHeight(const wchar_t* text,float width){
  if(!text||!*text)return 0;
@@ -349,6 +352,7 @@ FormSpec SpecFor(int id){switch(id){
  case 52:return {L"Hide desktop icons too",L"The Hide DockOver Desktop shortcut also hides the Windows desktop icons, and shows them again with the widgets."};
  case 38:return {L"Flow with the music",L"Behind the lyrics, the album artwork's colours flow and move with the music, faster when it is loud and swelling on the beat. The music is read from what your speakers play; nothing is recorded or sent."};
  case 39:return {L"Lyrics timing",L"Shows the lyrics earlier (+) or later (-) when they run behind or ahead of the music. In full-screen Now Playing, [ and ] adjust it while you listen."};
+ case 53:return {L"Music response",L"Controls how quickly the visuals react to music."};
  case 40:return {L"Frame rate",L"Limits how often the music wallpaper and full-screen Now Playing draw while the background flows. Lower uses less GPU."};
  case 33:return {L"Return to the current line after scrolling",L"In full-screen Now Playing, lyrics you scroll with the mouse wheel or by dragging go back to the line being sung after a second. Off: they stay where you left them."};
  case 29:return {L"Keep artwork clear of the Dock and menu bar",L"The album artwork is fitted between the menu bar and the Dock. The blurred artwork still fills the area behind them."};
@@ -385,6 +389,7 @@ FormRow FormFor(int id,float left,float right){float top=80;switch(id){
  case 28:top=FormFor(44,left,right).bottom;break;
  case 52:top=FormFor(37,left,right).bottom;break;
  case 40:top=FormFor(52,left,right).bottom+12;break;
+ case 53:top=FormFor(40,left,right).bottom+12;break;
  case 29:top=FormFor(28,left,right).bottom;break;
  case 31:top=FormFor(29,left,right).bottom;break;
  case 50:top=FormFor(31,left,right).bottom;break;
@@ -397,13 +402,18 @@ FormRow FormFor(int id,float left,float right){float top=80;switch(id){
  case 30:top=FormFor(39,left,right).bottom;break;
  case 34:top=FormFor(30,left,right).bottom+12;break;
  case 35:case 36:case 37:top=FormFor(id-1,left,right).bottom;break;
- }return MeasureFormRow(top,left,right,SpecFor(id).detail,id==27||id==30?124.f:id>=34&&id<=37?170.f:id==39?136.f:id==40?330.f:48.f);}
+ }return MeasureFormRow(top,left,right,SpecFor(id).detail,id==27||id==30?124.f:id>=34&&id<=37?170.f:id==39?136.f:id==40?330.f:id==53?254.f:48.f);}
 // Menu Bar page, Games list row: opens game-compat.txt (created with instructions when missing) in the default editor.
 // Control Center page, shortcut rows (34..37): a button shows the combination; clicking it records the next one.
 // Stored in controlCenter as (MOD_* << 8) | virtual key; the Manager registers them.
 void Refresh();
 // Music page, Frame rate row (40): 30 / 60 / 120 / 240 / Unlimited (0).
-const int kMusicFps[5]={30,60,120,240,0};int musicFps=60;
+const int kMusicFps[5]={30,60,120,240,0};int musicFps=60, musicResponse=1, musicSensitivity=50;
+const wchar_t* const kMusicResponses[]={L"Instant",L"Balanced",L"Smooth"};
+D2D1_RECT_F ResponseButton(int i,float left,float right){
+ const auto row=FormFor(53,left,right);const float cy=(row.top+row.bottom)*.5f;
+ const float x=right-20-(3-i)*78.f;return D2D1::RectF(x,cy-14,x+72,cy+14);
+}
 D2D1_RECT_F FpsButton(int i,float left,float right){const auto row=FormFor(40,left,right);const float cy=(row.top+row.bottom)*.5f;
  const float widths[5]={46,46,52,52,86},gap=6;float x=right-20;for(int k=4;k>=i;--k){x-=widths[k];if(k>i)x-=gap;}
  return D2D1::RectF(x,cy-14,x+widths[i],cy+14);}
@@ -411,7 +421,7 @@ const char* const kShortcutKeys[4]={"shortcutLyrics","shortcutArtwork","shortcut
 D2D1_RECT_F ShortcutButton(int i,float left,float right){const auto row=FormFor(34+i,left,right);const float cy=(row.top+row.bottom)*.5f;return D2D1::RectF(right-20-170,cy-15,right-20,cy+15);}
 void StartShortcut(HWND h,int i){recordingShortcut=i;SetFocus(h);InvalidateRect(h,nullptr,FALSE);}
 void SaveShortcut(HWND h,int value){const int i=recordingShortcut;recordingShortcut=-1;
- if(i>=0&&liquid::settings::WriteControlCenterInt(settingsPath,kShortcutKeys[i],value)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+ if(i>=0&&liquid::settings::WriteControlCenterInt(settingsPath,kShortcutKeys[i],value)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
  Refresh();InvalidateRect(h,nullptr,FALSE);}
 // Next key with Ctrl/Alt/Shift held is the new shortcut; Esc cancels; Backspace/Delete removes it.
 void RecordShortcutKey(HWND h,UINT vk){
@@ -428,7 +438,7 @@ void OpenLyricsFolder(HWND h){wchar_t base[MAX_PATH]{};if(!GetEnvironmentVariabl
  if(reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",dir.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(h,(L"Put lyrics files in this folder:\n"+dir).c_str(),L"DockOver Settings",MB_OK|MB_ICONINFORMATION);}
 D2D1_RECT_F GamesListButton(float left,float right){const auto row=FormFor(27,left,right);const float cy=(row.top+row.bottom)*.5f;return D2D1::RectF(right-20-124,cy-15,right-20,cy+15);}
 void OpenGamesList(HWND h){const std::wstring path=docky::game::ListPath(settingsPath);
- if(!docky::game::EnsureList(path)){MessageBoxW(h,L"The games list could not be created next to the settings file.",L"DockOver Settings",MB_OK|MB_ICONWARNING);return;}
+ if(!docky::game::EnsureList(path)){MessageBoxW(h,docky::ui::Text(L"The games list could not be created next to the settings file."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);return;}
  if(reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",path.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32)MessageBoxW(h,(L"Open this file to edit the games list:\n"+path).c_str(),L"DockOver Settings",MB_OK|MB_ICONINFORMATION);}
 FormRow CurrentForm(int id){const auto [left,right]=CurrentContentEdges();return FormFor(id,left,right);}
 float UpdateSwitchCardTop(int row){return CurrentForm(14+row).top;}
@@ -481,7 +491,12 @@ void StepHistory(HWND h,int delta){
 }
 void UpdateSearch(HWND h){
  wchar_t query[128]{}; if(searchBox)GetWindowTextW(searchBox,query,128);
- visibleCategories=liquid::settings::SearchCategories(query); sidebarFirst=0;sidebarScroll.Reset();
+ visibleCategories=liquid::settings::SearchCategories(query);
+ if(docky::ui::chinese&&*query){for(int i=0;i<static_cast<int>(std::size(titles));++i)
+ if(std::wstring_view(docky::ui::Text(titles[i])).find(query)!=std::wstring_view::npos&&
+ std::find(visibleCategories.begin(),visibleCategories.end(),i)==visibleCategories.end())visibleCategories.push_back(i);}
+ if(musicOnly)std::erase_if(visibleCategories,[](int i){return i!=1&&i!=10;});
+ sidebarFirst=0;sidebarScroll.Reset();
  if(!visibleCategories.empty() && std::find(visibleCategories.begin(),visibleCategories.end(),selected)==visibleCategories.end()){
   SelectCategory(h,visibleCategories.front());
  }
@@ -504,7 +519,7 @@ LRESULT CALLBACK SearchProc(HWND h,UINT message,WPARAM w,LPARAM l){
   const LRESULT result=CallWindowProcW(originalSearchProc,h,message,w,l);
   HDC dc=GetDC(h);if(dc){const int old=SetBkMode(dc,TRANSPARENT);const COLORREF color=SetTextColor(dc,searchText);
    HFONT font=reinterpret_cast<HFONT>(SendMessageW(h,WM_GETFONT,0,0));HGDIOBJ prior=font?SelectObject(dc,font):nullptr;
-   RECT r{};GetClientRect(h,&r);DrawTextW(dc,L"Search",-1,&r,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+   RECT r{};GetClientRect(h,&r);DrawTextW(dc,docky::ui::Text(L"Search"),-1,&r,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
    if(prior)SelectObject(dc,prior);SetTextColor(dc,color);SetBkMode(dc,old);ReleaseDC(h,dc);}return result;
  }
  if(message==WM_SYSKEYDOWN&&(w==VK_LEFT||w==VK_RIGHT)){StepHistory(settingsWindowHandle,w==VK_LEFT?-1:1);return 0;}
@@ -618,36 +633,36 @@ bool RefreshTaskbarStatus(){docky::taskbar::Status next;const bool read=docky::t
  const bool changed=live!=tbLive||next.state!=tbStatus.state||next.guardian!=tbStatus.guardian||next.hotkey!=tbStatus.hotkey||next.hotkeyText!=tbStatus.hotkeyText||next.message!=tbStatus.message;
  tbStatus=next;tbLive=live;return changed;}
 bool LoginItemEnabled();
-void Refresh(){const auto r=liquid::settings::Load(settingsPath);gameCompatibility=r.value.dock.gameCompatibility;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging)dockMagnification=r.value.dock.magnification;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
+void Refresh(){const auto r=liquid::settings::Load(settingsPath);docky::ui::SetLanguage(r.value.appearance.language);gameCompatibility=r.value.dock.gameCompatibility;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging)dockMagnification=r.value.dock.magnification;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;musicResponse=r.value.controlCenter.musicResponse;if(!menuSliderDragging||activeSizeSlider!=9)musicSensitivity=r.value.controlCenter.musicSensitivity;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
 void OpenWindowsTaskbarSettings(HWND h){
  const auto result=reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",L"ms-settings:taskbar",nullptr,nullptr,SW_SHOWNORMAL));
- if(result<=32)MessageBoxW(h,L"Windows Taskbar Settings could not be opened. Open Personalization > Taskbar in Windows Settings.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+ if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Taskbar Settings could not be opened. Open Personalization > Taskbar in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
 }
 void OpenVisualEffects(HWND h){
  const auto result=reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",L"ms-settings:easeofaccess-visualeffects",nullptr,nullptr,SW_SHOWNORMAL));
- if(result<=32)MessageBoxW(h,L"Windows Settings could not be opened. Open Accessibility > Visual effects in Windows Settings.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+ if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Settings could not be opened. Open Accessibility > Visual effects in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
 }
 void ToggleDockSetting(HWND h,int row){
  if(row<0||row>=5)return;const char* keys[]={"useMacIconMask","autoHide","diagnostics","hideSnapLayouts","genieMinimize"};const bool now[]={iconMask,autoHide,diagnostics,hideSnap,genie};
  const auto status=liquid::settings::WriteBool(settingsPath,"dock",keys[row],!now[row]);
- if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
 }
 void SetAppearance(HWND h,int mode){
- if(liquid::settings::WriteAppearanceMode(settingsPath,mode)!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save appearance. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(liquid::settings::WriteAppearanceMode(settingsPath,mode)!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save appearance. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);
 }
 void SetDownloadsCount(HWND h,int value){
- if(liquid::settings::WriteDockInt(settingsPath,"downloadsCount",std::clamp(value,3,10))!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(liquid::settings::WriteDockInt(settingsPath,"downloadsCount",std::clamp(value,3,10))!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
 }
 void SetCcBlur(HWND h,int value){
- if(liquid::settings::WriteControlCenterInt(settingsPath,"backdropBlur",std::clamp(value,0,100))!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(liquid::settings::WriteControlCenterInt(settingsPath,"backdropBlur",std::clamp(value,0,100))!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
 }
 void SetDensity(HWND h,const char* key,int value){
  const auto status=liquid::settings::WriteDensityInt(settingsPath,key,value);
- if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
 }
 void ActivateDensity(HWND h,int control){
@@ -679,7 +694,7 @@ void TaskbarRestoreNow(HWND h){
  RefreshTaskbarState();InvalidateRect(h,nullptr,FALSE);
 }
 void SaveTaskbarBool(HWND h,const char* key,bool value){
- if(liquid::settings::WriteBool(settingsPath,"taskbar",key,value)!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);}else Refresh();
+ if(liquid::settings::WriteBool(settingsPath,"taskbar",key,value)!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
 }
 bool SaveHotkey(UINT mods,UINT vk){
@@ -847,7 +862,7 @@ float SettingsContentBottom(){namespace lay=liquid::design::settings;
  switch(selected){case 0:return CurrentForm(26).bottom;
  case 1:return 822;case 2:return CurrentDockForm().rows.back().bottom;
  case 3:return SizeSpec(5).top+146;case 4:return CurrentForm(13).bottom;
- case 5:return CurrentForm(19).bottom;case 10:return CurrentForm(40).bottom;case 6:{const auto [left,right]=CurrentContentEdges();const std::wstring feedback=!taskbarFeedback.empty()?taskbarFeedback:tbLive?tbStatus.message:L"";return CurrentForm(5).bottom+88+(feedback.empty()?0:12+DetailHeight(feedback.c_str(),right-left-32));}
+ case 5:return CurrentForm(19).bottom;case 10:return SizeSpec(9).top+146;case 6:{const auto [left,right]=CurrentContentEdges();const std::wstring feedback=!taskbarFeedback.empty()?taskbarFeedback:tbLive?tbStatus.message:L"";return CurrentForm(5).bottom+88+(feedback.empty()?0:12+DetailHeight(feedback.c_str(),right-left-32));}
  case 7:return lay::CardTop+318;case 8:{const auto [left,right]=CurrentContentEdges();return MeasureMigration(left,right)[1].bounds.bottom;}
  case 9:return CurrentForm(15).bottom;default:return lay::CardTop+lay::CardHeight;}
 }
@@ -878,9 +893,11 @@ SizeSliderSpec SizeSpec(int index){switch(index){
  case 6:case 7:{const auto [left,right]=CurrentContentEdges();const float top=FormFor(46,left,right).bottom+12+(index-6)*158.f;
   return index==6?SizeSliderSpec{0,100,top,L"Gradient opacity",L"Set how strong the black or white shade is at the top edge."}
                  :SizeSliderSpec{40,100,top,L"Gradient length",L"Set how far down the menu bar the gradient reaches before becoming transparent."};}
+case 9:{const auto [left,right]=CurrentContentEdges();
+ return {0,100,FormFor(53,left,right).bottom+12,L"Detection sensitivity",L"Higher values pick up softer rhythmic hits. Lower values filter out more weak hits."};}
 case 8:return {0,150,liquid::design::settings::CardTop,L"Magnification",L"How much Dock icons grow under the pointer. 0% turns magnification off."};
 case 3:return {0,100,NcSliderTop(3),L"Notification Center blur",kNcBlurDetail};case 4:return {40,400,NcSliderTop(4),L"Blur fade width",kNcFadeDetail,L""};case 5:return {0,100,NcSliderTop(5),L"Background shade",kNcShadeDetail};case 1:return {75,125,242,L"Settings interface size",L"Scale the whole Settings window. Applies when you release the slider."};case 2:return {60,120,400,L"Applications window size",L"Scale the window opened with the Windows key."};default:return {80,160,80,L"Menu bar size",L"Scale text, icons and the height of the top menu bar."};}}
-int& SizeValue(int index){return index==8?dockMagnification:index==1?settingsUiPercent:index==2?applicationsUiPercent:index==3?ncBlur:index==4?ncFade:index==5?ncShade:index==6?gradientOpacity:index==7?gradientLength:menuScalePercent;}
+int& SizeValue(int index){return index==9?musicSensitivity:index==8?dockMagnification:index==1?settingsUiPercent:index==2?applicationsUiPercent:index==3?ncBlur:index==4?ncFade:index==5?ncShade:index==6?gradientOpacity:index==7?gradientLength:menuScalePercent;}
 // Appearance > Applications window size: "Reset Size" returns the Win-key window to its default size (it saves the size
 // the user dragged to in applications-window.json next to the shared settings; the window notices the file is gone).
 std::wstring ApplicationsWindowSizePath(){const auto slash=settingsPath.find_last_of(L"\\/");return (slash==std::wstring::npos?std::wstring():settingsPath.substr(0,slash+1))+L"applications-window.json";}
@@ -907,11 +924,12 @@ void UpdateMenuSlider(HWND h,float x){const auto [left,right]=CurrentContentEdge
 void SaveMenuScale(HWND h){
  const int index=activeSizeSlider;
  const auto saved=index==0?liquid::settings::WriteMenuBarScale(settingsPath,menuScalePercent)
+  :index==9?liquid::settings::WriteControlCenterInt(settingsPath,"musicSensitivity",musicSensitivity)
   :index==8?liquid::settings::WriteDockInt(settingsPath,"magnification",dockMagnification)
   :index>=3?liquid::settings::WriteMenuBarInt(settingsPath,index==3?"notificationBlur":index==4?"notificationBlurFade":index==5?"notificationShade":index==6?"gradientOpacity":"gradientLength",SizeValue(index))
   :liquid::settings::WriteUiScale(settingsPath,index==1?"settingsScalePercent":"applicationsScalePercent",SizeValue(index));
  Refresh();PreviewMenuScale();if(index==1)ResizeSettingsUi(h);
- if(saved!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous setting was preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+ if(saved!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous setting was preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
  InvalidateRect(h,nullptr,FALSE);
 }
 D2D1_RECT_F ApplicationsResetButton(float right){const float top=SizeSpec(2).top;return D2D1::RectF(right-224,top+12,right-100,top+40);}
@@ -928,7 +946,7 @@ void DrawSizeSlider(HWND h,int index,float left,float right,const liquid::design
  const bool gpu=allowTransparency&&drawingChromeGlass;
  dock::DrawLabSlider(target,brush.Get(),shape,liquid::theme::IsDark(appearanceMode,systemDark),gpu);
  const auto knob=shape.thumb;
- const bool focused=keyboardFocusVisible&&GetFocus()==h&&(index==0?menuKeyboardControl==0:appearanceKeyboard==index+2);
+ const bool focused=keyboardFocusVisible&&GetFocus()==h&&(index==9?selected==10:index==0?menuKeyboardControl==0:appearanceKeyboard==index+2);
  if(focused){brush->SetColor(C(colors.focused));const float r=(knob.bottom-knob.top)*.5f+3;target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(knob.left-3,knob.top-3,knob.right+3,knob.bottom+3),r,r),brush.Get(),2);}
  if(index!=0){Text((std::to_wstring(spec.lo)+spec.unit).c_str(),fontSmall.Get(),D2D1::RectF(left+16,top+118,left+90,top+138),colors.secondary);
  Text((std::to_wstring(spec.hi)+spec.unit).c_str(),trailingSmall.Get(),D2D1::RectF(right-90,top+114,right-16,top+138),colors.secondary);}
@@ -938,13 +956,16 @@ void DrawSizeSlider(HWND h,int index,float left,float right,const liquid::design
  const auto plate=overlay.plate;auto pill=[plate](ID2D1DeviceContext* dc,float alpha){if(alpha<=.001f)return;ComPtr<ID2D1SolidColorBrush>b;const float r=(plate.bottom-plate.top)*.5f;if(SUCCEEDED(dc->CreateSolidColorBrush(C(0xFFFFFF,alpha),&b)))dc->FillRoundedRectangle(D2D1::RoundedRect(plate,r,r),b.Get());};
  overlay.after=[pill,press](ID2D1DeviceContext* dc){pill(dc,1-press);};overlay.fallback=[pill](ID2D1DeviceContext* dc){pill(dc,1);};drawingChromeGlass->push_back(std::move(overlay));
 }
-void SetEnglishLanguage(HWND h){if(liquid::settings::WriteLanguage(settingsPath,"en")!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save the language preference.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);}
+void SetLanguage(HWND h,int option){if(liquid::settings::WriteLanguage(settingsPath,option==0?"en":"zh-CN")!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save the language preference."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();SetWindowTextW(h,docky::ui::Text(musicOnly?L"Music settings":L"DockOver Settings"));
+ if(searchBox)SendMessageW(searchBox,EM_SETCUEBANNER,TRUE,reinterpret_cast<LPARAM>(docky::ui::Text(L"Search Settings")));
+ UpdateSearch(h);}
 void DrawLanguageCard(HWND h,float left,float right,const liquid::design::Palette& colors){
  Round(D2D1::RectF(left,558,right,698),SettingsCardRadius,colors.surface);Text(L"Language",normal.Get(),D2D1::RectF(left+16,570,right-16,596),colors.primary);
  const float width=(right-left-44)*.5f;const auto english=D2D1::RectF(left+16,604,left+16+width,636),chinese=D2D1::RectF(left+28+width,604,right-16,636);
- Round(english,8,colors.selected);Text(L"English",centerSmall.Get(),english,colors.primary);Round(chinese,8,colors.background);Text(L"Chinese (coming soon)",centerSmall.Get(),chinese,colors.secondary);
- if(keyboardFocusVisible&&GetFocus()==h&&appearanceKeyboard==5){brush->SetColor(C(colors.focused));target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(english.left-2,602,english.right+2,638),10,10),brush.Get(),2);}
- Text(L"English is available. Chinese is planned.",fontSmall.Get(),D2D1::RectF(left+16,650,right-16,686),colors.secondary);
+ Round(english,8,docky::ui::chinese?colors.background:colors.selected);Text(L"English",centerSmall.Get(),english,colors.primary);
+ Round(chinese,8,docky::ui::chinese?colors.selected:colors.background);Text(L"简体中文",centerSmall.Get(),chinese,colors.primary);
+ if(keyboardFocusVisible&&GetFocus()==h&&(appearanceKeyboard==5||appearanceKeyboard==6)){const auto box=appearanceKeyboard==5?english:chinese;brush->SetColor(C(colors.focused));target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(box.left-2,602,box.right+2,638),10,10),brush.Get(),2);}
+ Text(L"Change the language used in DockOver.",fontSmall.Get(),D2D1::RectF(left+16,650,right-16,686),colors.secondary);
 }
 D2D1_RECT_F ApplicationsSortOption(float left,float right,int index){
  const float width=(right-left-48)/3.f,x=left+16+index*(width+8);
@@ -952,7 +973,7 @@ D2D1_RECT_F ApplicationsSortOption(float left,float right,int index){
 }
 void SetApplicationsOrder(HWND h,int index){
  if(liquid::settings::WriteApplicationsSort(settingsPath,index)!=liquid::settings::SaveStatus::Saved)
-  MessageBoxW(h,L"Could not save the applications sort order.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+  MessageBoxW(h,docky::ui::Text(L"Could not save the applications sort order."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
  Refresh();InvalidateRect(h,nullptr,FALSE);
 }
 void DrawApplicationsOrder(HWND h,float left,float right,const liquid::design::Palette& colors){
@@ -961,7 +982,7 @@ void DrawApplicationsOrder(HWND h,float left,float right,const liquid::design::P
  const wchar_t* labels[]={L"Name (A–Z)",L"Most used",L"Recently opened"};
  for(int i=0;i<3;++i){const auto box=ApplicationsSortOption(left,right,i);
   Round(box,8,i==applicationsSort?colors.selected:colors.background);Text(labels[i],centerSmall.Get(),box,colors.primary);
-  if(keyboardFocusVisible&&GetFocus()==h&&appearanceKeyboard==6+i){brush->SetColor(C(colors.focused));target->DrawRoundedRectangle(D2D1::RoundedRect(box,8,8),brush.Get(),2);}
+  if(keyboardFocusVisible&&GetFocus()==h&&appearanceKeyboard==7+i){brush->SetColor(C(colors.focused));target->DrawRoundedRectangle(D2D1::RoundedRect(box,8,8),brush.Get(),2);}
  }
 }
 D2D1_RECT_F AppearanceOption(float left,float right,int index){
@@ -1274,6 +1295,12 @@ void DrawContent(HWND h){
   {const auto row=FormFor(40,left,right);Round(D2D1::RectF(left,row.top,right,row.bottom),SettingsCardRadius,colors.surface);const auto spec=SpecFor(40);DrawFormText(row,spec.title,spec.detail,colors);
    for(int i=0;i<5;++i){const auto b=FpsButton(i,left,right);const bool on=musicFps==kMusicFps[i];Round(b,8,on?0x007AFF:colors.background);
     Text(i==4?L"Unlimited":std::to_wstring(kMusicFps[i]).c_str(),centerSmall.Get(),b,on?0xFFFFFF:colors.primary);}}
+  {const auto row=FormFor(53,left,right);Round(D2D1::RectF(left,row.top,right,row.bottom),SettingsCardRadius,colors.surface);
+   const auto spec=SpecFor(53);DrawFormText(row,spec.title,spec.detail,colors);
+   for(int i=0;i<3;++i){const auto b=ResponseButton(i,left,right);const bool active=musicResponse==i;
+    Round(b,8,active?0x007AFF:colors.background);
+    Text(kMusicResponses[i],centerSmall.Get(),b,active?0xFFFFFF:colors.primary);}}
+  DrawSizeSlider(h,9,left,right,colors);
  }else{
  const float cardBottom=lay::CardTop+(selected==2?lay::CardHeight:lay::CardHeight+sp::S);
  Round(D2D1::RectF(left,lay::CardTop,right,cardBottom),SettingsCardRadius,colors.surface);
@@ -1299,11 +1326,12 @@ void EnsureKeyboardControl(HWND h){
  namespace lay=liquid::design::settings;
  float top=lay::CardTop,bottom=top+60;
  if(selected==2){const auto row=CurrentDockForm().rows[dockKeyboardRow];top=row.top;bottom=row.bottom;}
- else if(selected==1&&appearanceKeyboard>=3){top=appearanceKeyboard>=6?710:appearanceKeyboard==5?558:SizeSpec(appearanceKeyboard-2).top;bottom=top+(appearanceKeyboard>=6?112:146);}
+ else if(selected==1&&appearanceKeyboard>=3){top=appearanceKeyboard>=7?710:appearanceKeyboard>=5?558:SizeSpec(appearanceKeyboard-2).top;bottom=top+(appearanceKeyboard>=7?112:146);}
  else if(selected==3){const int id=menuKeyboardControl==1?46:18;top=menuKeyboardControl==0?80:CurrentForm(id).top;bottom=menuKeyboardControl==0?80+MenuSizeRowHeight:CurrentForm(id).bottom;}
  else if(selected==6){const auto [left,right]=CurrentContentEdges();const auto r=TaskbarControlRect(taskbarKeyboardControl,left,right);top=r.top;bottom=r.bottom;}
  else if(selected==4){top=lay::CardTop+(densityKeyboardControl>=4?60+((densityKeyboardControl-4)/2)*36:16);bottom=top+40;}
  else if(selected==5){top=CurrentForm(19).top;bottom=CurrentForm(19).bottom;}
+ else if(selected==10&&activeSizeSlider==9){top=SizeSpec(9).top;bottom=top+146;}
  else if(selected==7){top=lay::CardTop+(workshopKeyboardControl>=2?228+((workshopKeyboardControl-2)/3)*40:168);bottom=top+40;}
  else if(selected==9){top=UpdateCardTop()+22;bottom=top+32;}
  RECT rc{};GetClientRect(h,&rc);const float old=contentScroll[selected].Target();
@@ -1391,9 +1419,9 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   if(x>=12&&x<liquid::design::settings::SidebarWidth-12&&y>=74&&y<106){FocusSearch();return 0;}
   if(GetFocus()==searchBox)SetFocus(h);
   if(selected==1){const auto [left,right]=CurrentContentEdges();const float by=y-BodyShift();const auto b=ApplicationsResetButton(right);
-   if(x>=b.left&&x<b.right&&by>=b.top&&by<b.bottom){if(ApplicationsWindowResized()&&!DeleteFileW(ApplicationsWindowSizePath().c_str()))MessageBoxW(h,L"Could not reset the Applications window size.",L"DockOver Settings",MB_OK|MB_ICONWARNING);InvalidateRect(h,nullptr,FALSE);return 0;}}
-  if(selected==3||selected==1||selected==2){const auto [left,right]=CurrentContentEdges();const float by=y-BodyShift();
-   for(int index:selected==2?std::vector<int>{8}:selected==3?(menuBarThemeGradient?std::vector<int>{0,6,7,3,4,5}:std::vector<int>{0,3,4,5}):std::vector<int>{1,2}){const auto track=SizeSliderTrack(index,left,right);const auto spec=SizeSpec(index);const float cx=track.left+(track.right-track.left)*(SizeValue(index)-spec.lo)/float(spec.hi-spec.lo);
+   if(x>=b.left&&x<b.right&&by>=b.top&&by<b.bottom){if(ApplicationsWindowResized()&&!DeleteFileW(ApplicationsWindowSizePath().c_str()))MessageBoxW(h,docky::ui::Text(L"Could not reset the Applications window size."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);InvalidateRect(h,nullptr,FALSE);return 0;}}
+  if(selected==3||selected==1||selected==2||selected==10){const auto [left,right]=CurrentContentEdges();const float by=y-BodyShift();
+   for(int index:selected==10?std::vector<int>{9}:selected==2?std::vector<int>{8}:selected==3?(menuBarThemeGradient?std::vector<int>{0,6,7,3,4,5}:std::vector<int>{0,3,4,5}):std::vector<int>{1,2}){const auto track=SizeSliderTrack(index,left,right);const auto spec=SizeSpec(index);const float cx=track.left+(track.right-track.left)*(SizeValue(index)-spec.lo)/float(spec.hi-spec.lo);
     if(x>=track.left-22&&x<=track.right+22&&by>=track.top-18&&by<=track.bottom+18){SetFocus(h);activeSizeSlider=index;if(index==0)menuKeyboardControl=0;else if(index<=2)appearanceKeyboard=index+2;menuDragStart=SizeValue(index);menuSliderDragging=true;BeginSwitchPress(h,40+index,true);menuSliderGrab=std::fabs(x-cx)<=20?x-cx:0;SetCapture(h);UpdateMenuSlider(h,x);InvalidateRect(h,nullptr,FALSE);return 0;}}}
 
   const int sw=SettingsSwitchAt(h,x,y);if(sw>=0){SetFocus(h);if(sw==46)menuKeyboardControl=1;else if(sw==18)menuKeyboardControl=2;switchPressed=sw;switchDragging=false;switchDragStartX=x;switchDragStartPosition=SettingsSwitchValue(sw)?1.f:0.f;switchDragPosition=switchDragStartPosition;BeginSwitchPress(h,sw,true);SetCapture(h);InvalidateRect(h,nullptr,FALSE);return 0;}break;}
@@ -1404,7 +1432,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    searchHost=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED|WS_EX_TRANSPARENT,host.lpszClassName,L"Settings search",WS_POPUP|WS_CLIPCHILDREN,0,0,0,0,h,nullptr,host.hInstance,nullptr);}
   if(searchHost)SetLayeredWindowAttributes(searchHost,0,0,LWA_ALPHA);
   searchBox=CreateWindowExW(0,L"EDIT",L"",WS_VISIBLE|WS_CHILD|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,searchHost,reinterpret_cast<HMENU>(1001),GetModuleHandleW(nullptr),nullptr);
-  if(searchBox){originalSearchProc=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(searchBox,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(SearchProc)));UpdateSearchFont();SendMessageW(searchBox,EM_SETLIMITTEXT,127,0);SendMessageW(searchBox,0x1501,TRUE,reinterpret_cast<LPARAM>(L"Search Settings"));PositionSearch();}
+  if(searchBox){originalSearchProc=reinterpret_cast<WNDPROC>(SetWindowLongPtrW(searchBox,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(SearchProc)));UpdateSearchFont();SendMessageW(searchBox,EM_SETLIMITTEXT,127,0);SendMessageW(searchBox,0x1501,TRUE,reinterpret_cast<LPARAM>(docky::ui::Text(L"Search Settings")));PositionSearch();}
   ApplyNativeAppearance(h);SetTimer(h,1,1000,nullptr);return 0;
  case WM_CTLCOLOREDIT: if(reinterpret_cast<HWND>(l)==searchBox&&searchBrush){SetTextColor(reinterpret_cast<HDC>(w),searchText);SetBkColor(reinterpret_cast<HDC>(w),searchBackground);return reinterpret_cast<LRESULT>(searchBrush);}break;
  case WM_SYSCOLORCHANGE: ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);break;
@@ -1422,16 +1450,16 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   if(w=='F'&&(GetKeyState(VK_CONTROL)&0x8000)){if(searchBox)FocusSearch();return 0;}
   if(visibleCategories.empty())return 0;
   if(w==VK_DOWN||w==VK_UP){MoveCategory(h,w==VK_DOWN?1:-1);return 0;}
-  if((w==VK_SPACE||w==VK_RETURN)&&selected==5){if(liquid::settings::WriteBool(settingsPath,"controlCenter","mediaArtworkBackground",!mediaArtworkBackground)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}
-  if(((selected==3&&menuKeyboardControl==0)||(selected==1&&appearanceKeyboard>=3&&appearanceKeyboard<=4))&&(w==VK_LEFT||w==VK_RIGHT||w==VK_HOME||w==VK_END)){
-   activeSizeSlider=selected==3?0:appearanceKeyboard-2;const auto spec=SizeSpec(activeSizeSlider);auto& value=SizeValue(activeSizeSlider);value=w==VK_HOME?spec.lo:w==VK_END?spec.hi:std::clamp(value+(w==VK_LEFT?-1:1)*((GetKeyState(VK_SHIFT)&0x8000)?10:1),spec.lo,spec.hi);PreviewMenuScale();SaveMenuScale(h);return 0;}
+  if((w==VK_SPACE||w==VK_RETURN)&&selected==5){if(liquid::settings::WriteBool(settingsPath,"controlCenter","mediaArtworkBackground",!mediaArtworkBackground)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}
+  if((selected==10||(selected==3&&menuKeyboardControl==0)||(selected==1&&appearanceKeyboard>=3&&appearanceKeyboard<=4))&&(w==VK_LEFT||w==VK_RIGHT||w==VK_HOME||w==VK_END)){
+   activeSizeSlider=selected==10?9:selected==3?0:appearanceKeyboard-2;const auto spec=SizeSpec(activeSizeSlider);auto& value=SizeValue(activeSizeSlider);value=w==VK_HOME?spec.lo:w==VK_END?spec.hi:std::clamp(value+(w==VK_LEFT?-1:1)*((GetKeyState(VK_SHIFT)&0x8000)?10:1),spec.lo,spec.hi);PreviewMenuScale();SaveMenuScale(h);return 0;}
 
   if(w==VK_ESCAPE&&menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();ReleaseCapture();InvalidateRect(h,nullptr,FALSE);return 0;}
   if(w==VK_TAB&&selected==3){const bool back=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((back&&menuKeyboardControl==0)||(!back&&menuKeyboardControl==2)){if(searchBox)FocusSearch();}else menuKeyboardControl+=back?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
-  if((w==VK_SPACE||w==VK_RETURN)&&selected==3&&menuKeyboardControl>0){const bool gradient=menuKeyboardControl==1;if(liquid::settings::WriteBool(settingsPath,gradient?"menuBar":"dock",gradient?"themeGradient":"gameCompatibility",gradient?!menuBarThemeGradient:!gameCompatibility)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}
-  if(w==VK_TAB&&selected==1){const bool back=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((back&&appearanceKeyboard==0)||(!back&&appearanceKeyboard==8)){if(searchBox)FocusSearch();}else appearanceKeyboard+=back?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
-  if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard>=6){SetApplicationsOrder(h,appearanceKeyboard-6);return 0;}
-  if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard==5){SetEnglishLanguage(h);return 0;}
+  if((w==VK_SPACE||w==VK_RETURN)&&selected==3&&menuKeyboardControl>0){const bool gradient=menuKeyboardControl==1;if(liquid::settings::WriteBool(settingsPath,gradient?"menuBar":"dock",gradient?"themeGradient":"gameCompatibility",gradient?!menuBarThemeGradient:!gameCompatibility)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}
+  if(w==VK_TAB&&selected==1){const bool back=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((back&&appearanceKeyboard==0)||(!back&&appearanceKeyboard==9)){if(searchBox)FocusSearch();}else appearanceKeyboard+=back?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
+  if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard>=7){SetApplicationsOrder(h,appearanceKeyboard-7);return 0;}
+  if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard>=5){SetLanguage(h,appearanceKeyboard-5);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard<3){SetAppearance(h,appearanceKeyboard);return 0;}
   if(w==VK_TAB && selected==2){const bool backwards=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((backwards&&dockKeyboardRow==0)||(!backwards&&dockKeyboardRow==4)){if(searchBox)FocusSearch();}else dockKeyboardRow+=backwards?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==6){ActivateTaskbarControl(h,taskbarKeyboardControl);return 0;}
@@ -1519,28 +1547,28 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
  case WM_LBUTTONUP:{if(menuSliderDragging){UpdateMenuSlider(h,GET_X_LPARAM(l)/scale);menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);ReleaseCapture();SaveMenuScale(h);return 0;}namespace ds=liquid::design;namespace lay=liquid::design::settings;namespace sp=liquid::design::space;
   float x=GET_X_LPARAM(l)/scale,y=GET_Y_LPARAM(l)/scale;RECT rc{};GetClientRect(h,&rc);const float contentLeft=ContentLeftForWidth(rc.right/scale),right=ContentRightForWidth(rc.right/scale,contentLeft);
   if(switchPressed>=0){const int pressed=switchPressed;const bool oldValue=SettingsSwitchValue(pressed);const bool change=!switchDragging||((switchDragPosition>=.5f)!=oldValue);if(switchDragging){auto& anim=switchMotion[pressed];anim.initialized=true;anim.on=oldValue;anim.from=switchDragPosition;anim.to=oldValue?1.f:0.f;anim.start=GetTickCount64();}switchPressed=-1;BeginSwitchPress(h,pressed,false);switchDragging=false;if(GetCapture()==h)ReleaseCapture();
-   if(change&&SettingsSwitchAt(h,x,y)==pressed&&pressed==20){if(liquid::settings::WriteBool(settingsPath,"menuBar","enabled",!menuBarOn)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
+   if(change&&SettingsSwitchAt(h,x,y)==pressed&&pressed==20){if(liquid::settings::WriteBool(settingsPath,"menuBar","enabled",!menuBarOn)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(change&&SettingsSwitchAt(h,x,y)==pressed){if(pressed==44||pressed==45||pressed==50||pressed==51||pressed==52){
      const char* key=pressed==44?"animatedArtwork":pressed==45?"lyricsDoubleClickSeek":pressed==50?"keepArtworkWhenPaused":pressed==51?"localMusicTags":"hideDesktopIconsWithWidgets";
      if(liquid::settings::WriteBool(settingsPath,"controlCenter",key,!oldValue)!=liquid::settings::SaveStatus::Saved)
-      MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+      MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
      Refresh();
-   }else if(pressed==31||pressed==32||pressed==33||pressed==38){if(liquid::settings::WriteBool(settingsPath,"controlCenter",pressed==31?"wallpaperLyrics":pressed==32?"lyricsFullArtwork":pressed==33?"lyricsAutoReturn":"lyricsBeat",!(pressed==31?wallpaperLyrics:pressed==32?lyricsFullArtwork:pressed==33?lyricsAutoReturn:lyricsBeat))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==29){if(liquid::settings::WriteBool(settingsPath,"controlCenter","wallpaperAvoidBars",!wallpaperAvoidBars)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==28){if(liquid::settings::WriteBool(settingsPath,"controlCenter","musicWallpaper",!musicWallpaper)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==19){if(liquid::settings::WriteBool(settingsPath,"controlCenter","mediaArtworkBackground",!mediaArtworkBackground)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==25){if(liquid::settings::WriteBool(settingsPath,"menuBar","hideSystemNotifications",!hideSystemNotifications)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==46){if(liquid::settings::WriteBool(settingsPath,"menuBar","themeGradient",!menuBarThemeGradient)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==24){if(liquid::settings::WriteBool(settingsPath,"menuBar","captureNotifications",!captureNotifications)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==26){if(liquid::settings::WriteBool(settingsPath,"dock","lowLatencyGlass",!lowLatencyGlass)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==18){if(liquid::settings::WriteBool(settingsPath,"dock","gameCompatibility",!gameCompatibility)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==14||pressed==15){if(liquid::settings::WriteBool(settingsPath,"updates",pressed==14?"autoCheck":"autoInstall",!SettingsSwitchValue(pressed))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
+   }else if(pressed==31||pressed==32||pressed==33||pressed==38){if(liquid::settings::WriteBool(settingsPath,"controlCenter",pressed==31?"wallpaperLyrics":pressed==32?"lyricsFullArtwork":pressed==33?"lyricsAutoReturn":"lyricsBeat",!(pressed==31?wallpaperLyrics:pressed==32?lyricsFullArtwork:pressed==33?lyricsAutoReturn:lyricsBeat))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==29){if(liquid::settings::WriteBool(settingsPath,"controlCenter","wallpaperAvoidBars",!wallpaperAvoidBars)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==28){if(liquid::settings::WriteBool(settingsPath,"controlCenter","musicWallpaper",!musicWallpaper)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==19){if(liquid::settings::WriteBool(settingsPath,"controlCenter","mediaArtworkBackground",!mediaArtworkBackground)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==25){if(liquid::settings::WriteBool(settingsPath,"menuBar","hideSystemNotifications",!hideSystemNotifications)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==46){if(liquid::settings::WriteBool(settingsPath,"menuBar","themeGradient",!menuBarThemeGradient)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==24){if(liquid::settings::WriteBool(settingsPath,"menuBar","captureNotifications",!captureNotifications)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==26){if(liquid::settings::WriteBool(settingsPath,"dock","lowLatencyGlass",!lowLatencyGlass)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==18){if(liquid::settings::WriteBool(settingsPath,"dock","gameCompatibility",!gameCompatibility)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==14||pressed==15){if(liquid::settings::WriteBool(settingsPath,"updates",pressed==14?"autoCheck":"autoInstall",!SettingsSwitchValue(pressed))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(pressed==17){std::wstring error;if(!SetLoginItem(!loginItem,error))MessageBoxW(h,error.c_str(),L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==16){if(liquid::settings::WriteBool(settingsPath,"dock","launchDesktop",!launchDesktop)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==13){if(liquid::settings::WriteBool(settingsPath,"launchpad","showWindows",!density.showWindows)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==9){if(liquid::settings::WriteBool(settingsPath,"launchpad","hideLabels",!density.hideLabels)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==12){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsPreview",!dlPreview)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
-   else if(pressed==11){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsVertical",!dlVertical)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==16){if(liquid::settings::WriteBool(settingsPath,"dock","launchDesktop",!launchDesktop)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==13){if(liquid::settings::WriteBool(settingsPath,"launchpad","showWindows",!density.showWindows)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==9){if(liquid::settings::WriteBool(settingsPath,"launchpad","hideLabels",!density.hideLabels)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==12){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsPreview",!dlPreview)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==11){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsVertical",!dlVertical)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(pressed<3||pressed==8||pressed==10){const int row=pressed==8?3:pressed==10?4:pressed;dockKeyboardRow=row;ToggleDockSetting(h,row);}else{taskbarKeyboardControl=pressed;ActivateTaskbarControl(h,pressed);}}InvalidateRect(h,nullptr,FALSE);return 0;}
   if(chromePressed>=0){const int pressed=chromePressed;chromePressed=-1;if(GetCapture()==h)ReleaseCapture();if(ChromeButtonAt(x,y)==pressed){if(pressed==0)PostMessageW(h,WM_CLOSE,0,0);else if(pressed==1)ShowWindow(h,SW_MINIMIZE);else ShowWindow(h,IsZoomed(h)?SW_RESTORE:SW_MAXIMIZE);}InvalidateRect(h,nullptr,FALSE);return 0;}
   const float nav=lay::SidebarWidth+10.f;if(x>=nav&&x<nav+88&&y>=10&&y<52){StepHistory(h,x<nav+44?-1:1);return 0;}
@@ -1552,16 +1580,19 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   }
   if(y<60)return 0;
   y=liquid::settings::SettingsBodyY(y,contentScroll[selected].Position());
-  if(selected==1){if(y>=710&&y<822){for(int i=0;i<3;++i)if(Contains(ApplicationsSortOption(contentLeft,right,i),x,y)){appearanceKeyboard=6+i;SetApplicationsOrder(h,i);break;}return 0;}if(y>=558&&y<698){const float width=(right-contentLeft-44)*.5f;if(x>=contentLeft+16&&x<contentLeft+16+width&&y>=604&&y<636){appearanceKeyboard=5;SetEnglishLanguage(h);}return 0;}for(int i=0;i<3;++i)if(Contains(AppearanceOption(contentLeft,right,i),x,y)){appearanceKeyboard=i;SetAppearance(h,i);break;}return 0;
+  if(selected==1){if(y>=710&&y<822){for(int i=0;i<3;++i)if(Contains(ApplicationsSortOption(contentLeft,right,i),x,y)){appearanceKeyboard=7+i;SetApplicationsOrder(h,i);break;}return 0;}if(y>=558&&y<698){const float width=(right-contentLeft-44)*.5f;if(y>=604&&y<636){if(x>=contentLeft+16&&x<contentLeft+16+width){appearanceKeyboard=5;SetLanguage(h,0);}else if(x>=contentLeft+28+width&&x<right-16){appearanceKeyboard=6;SetLanguage(h,1);}}return 0;}for(int i=0;i<3;++i)if(Contains(AppearanceOption(contentLeft,right,i),x,y)){appearanceKeyboard=i;SetAppearance(h,i);break;}return 0;
   }
   else if(selected==3&&Contains(GamesListButton(contentLeft,right),x,y)){OpenGamesList(h);return 0;}
   else if(selected==10&&Contains(LyricsFolderButton(contentLeft,right),x,y)){OpenLyricsFolder(h);return 0;}
+  else if(selected==10&&[&]{for(int i=0;i<3;++i)if(Contains(ResponseButton(i,contentLeft,right),x,y)){
+   if(liquid::settings::WriteControlCenterInt(settingsPath,"musicResponse",i)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
+   Refresh();InvalidateRect(h,nullptr,FALSE);return true;}return false;}())return 0;
   else if(selected==10&&[&]{for(int i=0;i<5;++i)if(Contains(FpsButton(i,contentLeft,right),x,y)){
-   if(liquid::settings::WriteControlCenterInt(settingsPath,"musicFps",kMusicFps[i])!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+   if(liquid::settings::WriteControlCenterInt(settingsPath,"musicFps",kMusicFps[i])!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
    Refresh();InvalidateRect(h,nullptr,FALSE);return true;}return false;}())return 0;
   else if(selected==10&&[&]{const auto t=FormFor(39,contentLeft,right);const float yy=(t.top+t.bottom)*.5f-14;if(y<yy||y>=yy+28)return false;
    int next=lyricsOffsetMs;if(x>=right-136&&x<right-108)next-=100;else if(x>=right-48&&x<right-20)next+=100;else return false;
-   if(liquid::settings::WriteControlCenterInt(settingsPath,"lyricsOffsetMs",std::clamp(next,-3000,3000))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+   if(liquid::settings::WriteControlCenterInt(settingsPath,"lyricsOffsetMs",std::clamp(next,-3000,3000))!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
    Refresh();InvalidateRect(h,nullptr,FALSE);return true;}())return 0;
   else if(selected==10&&[&]{for(int i=0;i<4;++i)if(Contains(ShortcutButton(i,contentLeft,right),x,y)){StartShortcut(h,i);return true;}return false;}())return 0;
   else if(selected==6){
@@ -1576,7 +1607,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    for(int row=0;row<2;++row)for(int i=0;i<5;++i){const auto b=FrameCapButton(row,i,contentLeft,right);
     if(x>=b.left&&x<b.right&&y>=b.top&&y<b.bottom){
      if(liquid::settings::WritePerformanceInt(settingsPath,row?"captureFps":"animationFps",kFrameCaps[i])!=liquid::settings::SaveStatus::Saved)
-      MessageBoxW(h,L"Could not save settings. Your previous settings were preserved.",L"DockOver Settings",MB_OK|MB_ICONWARNING);
+      MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
      Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}}
   }
   else if(selected==9&&y>=UpdateCardTop()+22&&y<UpdateCardTop()+102){
@@ -1604,7 +1635,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
     else if(index==4){action=true;const bool settings=packSelected>=0&&packSelected<static_cast<int>(packs.size())&&SettingsOnly(packs[packSelected]);ok=settings?docky::workshop::SelectSettings(workshopRoot,"",error):docky::workshop::Select(workshopRoot,"",error);}
     else if(packSelected>=0&&packSelected<static_cast<int>(packs.size())){const auto id=packs[packSelected].id;
      if(index==1&&packs[packSelected].valid){auto file=PickPackFile(h,true);if(!file.empty()){action=true;ok=docky::workshop::Export(workshopRoot,id,file,error);}}
-     else if(index==2){if(MessageBoxW(h,L"Delete the selected installed resource pack?",L"DockOver Workshop",MB_YESNO|MB_ICONQUESTION)==IDYES){action=true;ok=docky::workshop::Remove(workshopRoot,id,error);}}
+     else if(index==2){if(MessageBoxW(h,docky::ui::Text(L"Delete the selected installed resource pack?"),docky::ui::Text(L"DockOver Workshop"),MB_YESNO|MB_ICONQUESTION)==IDYES){action=true;ok=docky::workshop::Remove(workshopRoot,id,error);}}
      else if(index==3&&packs[packSelected].valid){action=true;const bool settings=SettingsOnly(packs[packSelected]);ok=settings?docky::workshop::SelectSettings(workshopRoot,id==activeSettingsPack?std::string{}:id,error):docky::workshop::Select(workshopRoot,id==activePack?std::string{}:id,error);}
     }
    }}}
@@ -1638,8 +1669,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int){
  const HRESULT ro=RoInitialize(RO_INIT_SINGLETHREADED);
  settingsPath=liquid::settings::DefaultPath();workshopRoot=docky::workshop::DefaultRoot();bool devWorkshop=false,devOpaque=false,explicitWorkshopRoot=false,explicitSettingsPath=false,devPress=false;int argc=0;auto argv=CommandLineToArgvW(GetCommandLineW(),&argc);
  if(argv){for(int i=1;i<argc;++i){const std::wstring a=argv[i];if(a==L"--settings-path"&&i+1<argc){settingsPath=argv[++i];explicitSettingsPath=true;}
-  else if(a==L"--workshop-root"&&i+1<argc){workshopRoot=argv[++i];explicitWorkshopRoot=true;}else if(a==L"--dev-workshop")devWorkshop=true;else if(a==L"--dev-press-switch")devPress=true;else if(a==L"--dev-opaque")devOpaque=true;else if(a==L"--snapshot"&&i+1<argc)snapshotPath=argv[++i];else if(a==L"--log"&&i+1<argc)dock::Log::Get().Open(argv[++i]);else if(a==L"--glass-config"&&i+1<argc)glassConfigPath=argv[++i];else if(a==L"--dev-layout-only")referenceLayoutOnly=true;else if(a==L"--dev-size"&&i+2<argc){referenceWidth=std::max(760,_wtoi(argv[++i]));referenceHeight=std::max(560,_wtoi(argv[++i]));}else if(a==L"--dev-hold")referenceInteractive=true;else if(a==L"--dev-reference"&&i+1<argc)referenceCaptureDir=argv[++i];else if(a==L"--page"&&i+1<argc){const std::wstring page=argv[++i];const wchar_t* keys[]={L"general",L"appearance",L"dock",L"menu-bar",L"launchpad",L"control-center",L"taskbar",L"workshop",L"migration",L"about",L"music"};for(int i=0;i<11;++i)if(page==keys[i]){selected=i;categoryHistory={0,selected};categoryHistoryIndex=1;}}}LocalFree(argv);}
+  else if(a==L"--workshop-root"&&i+1<argc){workshopRoot=argv[++i];explicitWorkshopRoot=true;}else if(a==L"--music-only")musicOnly=true;else if(a==L"--dev-workshop")devWorkshop=true;else if(a==L"--dev-press-switch")devPress=true;else if(a==L"--dev-opaque")devOpaque=true;else if(a==L"--snapshot"&&i+1<argc)snapshotPath=argv[++i];else if(a==L"--log"&&i+1<argc)dock::Log::Get().Open(argv[++i]);else if(a==L"--glass-config"&&i+1<argc)glassConfigPath=argv[++i];else if(a==L"--dev-layout-only")referenceLayoutOnly=true;else if(a==L"--dev-size"&&i+2<argc){referenceWidth=std::max(760,_wtoi(argv[++i]));referenceHeight=std::max(560,_wtoi(argv[++i]));}else if(a==L"--dev-hold")referenceInteractive=true;else if(a==L"--dev-reference"&&i+1<argc)referenceCaptureDir=argv[++i];else if(a==L"--page"&&i+1<argc){const std::wstring page=argv[++i];const wchar_t* keys[]={L"general",L"appearance",L"dock",L"menu-bar",L"launchpad",L"control-center",L"taskbar",L"workshop",L"migration",L"about",L"music"};for(int i=0;i<11;++i)if(page==keys[i]){selected=i;categoryHistory={0,selected};categoryHistoryIndex=1;}}}LocalFree(argv);}
 
+ if(musicOnly){
+  if(snapshotPath.empty())if(HWND existing=FindWindowW(MusicClassName,nullptr)){ShowWindow(existing,SW_RESTORE);SetForegroundWindow(existing);return 0;}
+  selected=10;visibleCategories={1,10};categoryHistory={10};categoryHistoryIndex=0;
+ }
  updState=docky::update::LoadState();
  if(!glassConfigPath.empty())dock::GlassSettingsStore::Get().LoadReadOnly(glassConfigPath);else {wchar_t local[MAX_PATH]{};if(GetEnvironmentVariableW(L"LOCALAPPDATA",local,MAX_PATH))dock::GlassSettingsStore::Get().LoadReadOnly(std::wstring(local)+L"\\LiquidDock\\glass.json");}  // Sliders & switches lens
  if((!referenceCaptureDir.empty()||referenceInteractive||referenceLayoutOnly)&&(!explicitWorkshopRoot||!explicitSettingsPath||referenceCaptureDir.empty()))return 2;
@@ -1660,11 +1695,13 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int){
  centerSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);centerSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
  trailingSmall->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);trailingSmall->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
  if(SUCCEEDED(writeFactory->CreateTextFormat(L"Segoe Fluent Icons",nullptr,DWRITE_FONT_WEIGHT_NORMAL,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,15.f,L"en-us",&categoryIcons))){categoryIcons->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);categoryIcons->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);}
- WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=Proc;wc.lpszClassName=ClassName;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+ WNDCLASSW wc{};wc.hInstance=instance;wc.lpfnWndProc=Proc;wc.lpszClassName=musicOnly?MusicClassName:ClassName;wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
  if(!RegisterClassW(&wc))return 1;
- const int initialSize=liquid::settings::Load(settingsPath).value.appearance.settingsScalePercent;
+ const auto initialAppearance=liquid::settings::Load(settingsPath).value.appearance;
+ docky::ui::SetLanguage(initialAppearance.language);
+ const int initialSize=initialAppearance.settingsScalePercent;
  settingsUiPercent=initialSize;scale=GetDpiForSystem()/96.f*initialSize/100.f;
- HWND h=CreateWindowExW(devOpaque?0:WS_EX_NOREDIRECTIONBITMAP,ClassName,L"DockOver Settings",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,static_cast<int>(std::lround(900*scale)),static_cast<int>(std::lround(760*scale)),nullptr,nullptr,instance,nullptr);
+ HWND h=CreateWindowExW(devOpaque?0:WS_EX_NOREDIRECTIONBITMAP,wc.lpszClassName,docky::ui::Text(musicOnly?L"Music settings":L"DockOver Settings"),WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,CW_USEDEFAULT,CW_USEDEFAULT,static_cast<int>(std::lround(900*scale)),static_cast<int>(std::lround(760*scale)),nullptr,nullptr,instance,nullptr);
  if(!h)return 1;
  SetWindowPos(h,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
  RECT client{};GetClientRect(h,&client);

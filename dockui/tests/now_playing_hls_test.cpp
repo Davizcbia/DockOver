@@ -2,7 +2,7 @@
 // shape of Apple Music's public album pages and HLS playlists as observed on 2026-11-20.
 #include "../src/now_playing/artwork_match.h"
 #include "../src/now_playing/artwork_source.h"
-#include "../src/now_playing/audio_beat.h"
+#include "../src/now_playing/music_analysis.h"
 #include "../src/now_playing/hls.h"
 #include "../src/now_playing/lyrics.h"
 
@@ -247,6 +247,204 @@ int main() {
         CHECK(d.Locked() && std::fabs(d.Bpm() - 120.f) < 4.f);
         CHECK(onGrid >= 20 && late <= 2);
         CHECK(filled >= 2);
+    }
+
+    {
+        using namespace nowplaying;
+        constexpr unsigned rate = 48000;
+        for (float volume : {1.f, .1f}) {
+            MusicAnalyzer analyzer;
+            analyzer.Configure(rate);
+            MusicFrame frame;
+            unsigned kicks = 0, extraKicks = 0, beats = 0;
+            double firstLock = 0;
+            for (unsigned i = 0; i < 10 * rate; ++i) {
+                const double t = double(i) / rate;
+                const double p = std::fmod(t, .5);
+                const float bass = .05f * float(std::sin(2 * std::numbers::pi * 73 * t));
+                const float kick = p < .085 ? float(.5 * std::exp(-35 * p) * std::sin(2 * std::numbers::pi * 58 * p)) : 0.f;
+                if (!analyzer.Push(volume * (bass + kick), t + 1. / rate, frame)) continue;
+                if (frame.bpm && !firstLock) firstLock = frame.at;
+                for (unsigned e = 0; e < frame.count; ++e) {
+                    const auto& event = frame.events[e];
+                    if (event.kind == RhythmKind::Kick) {
+                        ++kicks;
+                        if (std::abs(event.at - std::round(event.at * 2) / 2) > .05) ++extraKicks;
+                    }
+                    if (event.kind == RhythmKind::Beat) ++beats;
+                }
+                CHECK(frame.downbeatConfidence < .38f);  // all four accents are alike
+            }
+            CHECK(kicks >= 18 && extraKicks <= 1);
+            CHECK(beats >= 11 && firstLock > 0 && firstLock < 4.);
+            CHECK(std::abs(frame.bpm - 120.f) < 2.f);
+            for (unsigned i = 0; i < rate; ++i) analyzer.Push(0, 10. + double(i) / rate, frame);
+            CHECK(frame.bpm == 0 && frame.level < .01f);
+            analyzer.Reset();
+            for (unsigned i = 0; i < 2 * rate; ++i) {
+                const double t = double(i) / rate;
+                const float bass = (t < 1. ? .025f : .16f) * float(std::sin(2 * std::numbers::pi * 73 * t));
+                if (!analyzer.Push(bass, t, frame)) continue;
+                for (unsigned e = 0; e < frame.count; ++e)
+                    CHECK(frame.events[e].kind != RhythmKind::Drop && frame.events[e].kind != RhythmKind::Beat);
+            }
+        }
+        {
+            MusicAnalyzer analyzer;
+            analyzer.Configure(rate, 0);
+            MusicFrame frame;
+            unsigned bassKicks = 0;
+            for (unsigned i = 0; i < 6 * rate; ++i) {
+                const double t = double(i) / rate;
+                const float bass = float((.12 + .04 * std::sin(2 * std::numbers::pi * .43 * t)) *
+                    std::sin(2 * std::numbers::pi * 61 * t));
+                if (!analyzer.Push(bass, t + 1. / rate, frame) || t < .3) continue;
+                for (unsigned e = 0; e < frame.count; ++e)
+                    bassKicks += frame.events[e].kind == RhythmKind::Kick;
+            }
+            CHECK(bassKicks == 0);
+            analyzer.Reset();
+            unsigned firstHits = 0, secondHits = 0;
+            for (unsigned i = 0; i < 5 * rate; ++i) {
+                const double t = double(i) / rate, p = std::fmod(t, .5);
+                const auto note = [](double q) {
+                    return q >= 0 && q < .065 ? .55 * std::exp(-46 * q) * std::sin(2 * std::numbers::pi * 58 * q) : 0.;
+                };
+                if (!analyzer.Push(float(note(p) + note(p - .13)), t + 1. / rate, frame)) continue;
+                for (unsigned e = 0; e < frame.count; ++e) {
+                    if (frame.events[e].kind != RhythmKind::Kick) continue;
+                    const double phase = std::fmod(frame.events[e].at, .5);
+                    firstHits += phase < .055;
+                    secondHits += phase >= .13 && phase < .185;
+                }
+            }
+            CHECK(firstHits >= 9 && secondHits >= 9);
+        }
+        {
+            MusicAnalyzer analyzer;
+            analyzer.Configure(rate, 0);
+            MusicFrame frame;
+            unsigned onsets = 0, beats = 0;
+            for (unsigned i = 0; i < 8 * rate; ++i) {
+                const double t = double(i) / rate, p = std::fmod(t, .42);
+                // Repeated tonal attacks have a stable IOI, but no drum evidence.
+                const float sample = float(std::exp(-13 * p) * (.25 * std::sin(2 * std::numbers::pi * 261.63 * p) +
+                    .10 * std::sin(2 * std::numbers::pi * 523.26 * p) +
+                    .035 * std::sin(2 * std::numbers::pi * 1046.52 * p)));
+                if (!analyzer.Push(sample, t + 1. / rate, frame)) continue;
+                CHECK(frame.bpm == 0);
+                for (unsigned e = 0; e < frame.count; ++e) {
+                    onsets += frame.events[e].kind == RhythmKind::Onset;
+                    beats += frame.events[e].kind == RhythmKind::Beat;
+                }
+            }
+            CHECK(onsets >= 8 && beats == 0);
+        }
+        {
+            MusicAnalyzer analyzer;
+            analyzer.Configure(rate, 0);
+            MusicFrame frame;
+            constexpr double period = 60. / 174.;
+            unsigned wrongOctave = 0, locked = 0, downbeats = 0;
+            for (unsigned i = 0; i < 14 * rate; ++i) {
+                const double t = double(i) / rate;
+                const unsigned beat = unsigned(t / period);
+                const double p = t - beat * period;
+                const double q = p - .018;
+                const double kick = p < .11 ? (beat % 4 == 0 ? .55 : .32) * std::exp(-28 * p) *
+                    std::sin(2 * std::numbers::pi * (55 * p + 60 * p * p)) : 0;
+                const double snare = beat % 2 && q >= 0 && q < .056 ? std::exp(-55 * q) *
+                    (.3 * std::sin(2 * std::numbers::pi * 185 * q) + .10 * std::sin(2 * std::numbers::pi * 3100 * q)) : 0;
+                const float sample = float(kick + snare + .045 * std::sin(2 * std::numbers::pi * 73 * t));
+                if (!analyzer.Push(sample, t + 1. / rate, frame) || t < 5. || !frame.period) continue;
+                ++locked;
+                wrongOctave += frame.bpm < 100;
+                for (unsigned e = 0; e < frame.count; ++e) {
+                    if (frame.events[e].kind != RhythmKind::Downbeat) continue;
+                    ++downbeats;
+                    const double at = frame.events[e].at;
+                    CHECK(std::abs(at - std::round(at / (4 * period)) * 4 * period) < .06);
+                }
+            }
+            CHECK(locked > 800 && wrongOctave == 0 && std::abs(frame.bpm - 174.f) < 2.f);
+            CHECK(downbeats > 0);
+        }
+        for (unsigned hz : {60, 120, 240}) {
+            MusicQueue queue;
+            MusicSync sync;
+            unsigned beats = 0, kicks = 0;
+            MusicEnvelope envelope;
+            const auto deliver = [&](RhythmEvent event) {
+                beats += event.kind == RhythmKind::Beat;
+                kicks += event.kind == RhythmKind::Kick;
+            };
+            unsigned hop = 0;
+            for (unsigned f = 0; f <= 2 * hz; ++f) {
+                const double now = double(f) / hz;
+                for (; hop <= 190 && hop * .01 <= now; ++hop) {
+                    MusicFrame frame;
+                    frame.generation = 1;
+                    frame.at = hop * .01;
+                    frame.period = .5;
+                    frame.confidence = .8f;
+                    if (hop % 50 == 0) {
+                        frame.Add(RhythmKind::Kick, frame.at, .9f, .8f);
+                        frame.Add(RhythmKind::Beat, frame.at + .02, .8f, .8f);
+                    }
+                    CHECK(queue.Push(frame));
+                }
+                MusicFrame incoming;
+                while (queue.Pop(incoming)) sync.Read(incoming, now, deliver);
+                sync.Advance(now, deliver);
+                if (f < hz) envelope.Step(1.f, 1. / hz, .5f, .5f);
+            }
+            CHECK(beats == 4 && kicks == 4 && !queue.Overruns());
+            CHECK(std::abs(envelope.value - (1.f - std::exp(-2.f))) < .00001f);
+            CHECK(std::abs(sync.Frame().Phase(1., 4) - .5f) < .00001f);
+            CHECK(std::abs(sync.Frame().Phase(1.5, 2) - .5f) < .00001f);
+            CHECK(std::abs(sync.Frame().Phase(1., 8) - .25f) < .00001f);
+            MusicFrame future;
+            future.generation = 1;
+            future.Add(RhythmKind::Beat, 20, 1, 1);
+            sync.Read(future, 10, deliver);
+            future = {};
+            future.generation = 2;
+            sync.Read(future, 11, deliver);
+            sync.Advance(25, deliver);
+            CHECK(beats == 4);
+        }
+        {
+            BeatTracker tracker(0);
+            tracker.EnableMusicTracking();
+            for (unsigned hop = 0; hop < 800; ++hop)
+                tracker.FeedFlux(hop % 50 == 0 ? 2.f : 0.f, false, .01f);
+            CHECK(std::abs(tracker.Bpm() - 120.f) < 2.f);
+            for (unsigned hop = 0; hop < 900; ++hop)
+                tracker.FeedFlux(hop % 66 == 0 ? 2.f : 0.f, false, .01f);
+            CHECK(std::abs(tracker.Bpm() - 60.f / .66f) < 2.f);
+        }
+        for (bool lowEndReturns : {true, false}) {
+            MusicStructure structure;
+            unsigned drops = 0;
+            bool building = false;
+            for (unsigned i = 0; i < 1100; ++i) {
+                MusicFrame frame;
+                frame.at = i * .01;
+                const bool build = i >= 650 && i < 850;
+                const bool after = i >= 850;
+                const float power = build ? .015f + (i - 650) * .000075f : after ? .15f : .04f;
+                const float bass = build ? power * .01f : after ? power * (lowEndReturns ? .5f : .01f) : .014f;
+                const bool onset = i % (build ? 12 : 50) == 0;
+                structure.Feed(frame, .01f, power, bass, onset, false);
+                building |= frame.state == MusicState::Building;
+                for (unsigned e = 0; e < frame.count; ++e)
+                    if (frame.events[e].kind == RhythmKind::Drop) {
+                        ++drops;
+                        CHECK(frame.at >= 8.5 && frame.at < 9.);
+                    }
+            }
+            CHECK(building && drops == unsigned(lowEndReturns));
+        }
     }
 
     if (failures) { std::printf("%d failure(s)\n", failures); return 1; }

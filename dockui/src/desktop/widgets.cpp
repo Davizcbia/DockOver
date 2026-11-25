@@ -1,7 +1,9 @@
 #include "widgets.h"
+#include "../ui_language.h"
 #include "calendar_feed.h"
 #include "devices.h"
 #include "weather.h"
+#include "../pairing/widget_queue.h"
 #include <map>
 #include <shellapi.h>
 #include <algorithm>
@@ -457,8 +459,8 @@ void PaintCalendar(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r, const Theme&
     const bool configured = Calendars().Configured();
     WidgetScroll& sc = PaintScroll();
     auto empty = [&](D2D1_RECT_F box) {
-        Text(rt, configured ? L"No upcoming events" : L"No calendars", Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(box.left, box.top, box.right, box.top + 18), t.secondary);
-        if (!configured) Text(rt, L"Add one in Widget Settings", Font(11.5f), D2D1::RectF(box.left, box.top + 18, box.right, box.top + 34), t.secondary);
+        Text(rt, configured ? docky::ui::Text(L"No upcoming events") : docky::ui::Text(L"No calendars"), Font(12.5f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(box.left, box.top, box.right, box.top + 18), t.secondary);
+        if (!configured) Text(rt, docky::ui::Text(L"Add one in Widget Settings"), Font(11.5f), D2D1::RectF(box.left, box.top + 18, box.right, box.top + 34), t.secondary);
     };
     auto header = [&](float left, float right) {
         Text(rt, weekday, Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(left, r.top + 14, right, r.top + 30), kRed);
@@ -483,7 +485,7 @@ void PaintCalendar(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r, const Theme&
             ScrollView view(rt, D2D1::RectF(r.left, todayBox.top - 10, mid, todayBox.bottom + 10), 0, moved, moved);
             todayHidden = Timeline(rt, events, today, todayFirst, 7, todayBox, t, true);
         }
-        Text(rt, L"TOMORROW", Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(mid + 14, r.top + 14, r.right - kPad, r.top + 30), t.secondary);
+        Text(rt, docky::ui::Text(L"TOMORROW"), Font(12.f, DWRITE_FONT_WEIGHT_BOLD), D2D1::RectF(mid + 14, r.top + 14, r.right - kPad, r.top + 30), t.secondary);
         {
             const D2D1_RECT_F box = D2D1::RectF(mid + 10, r.top + 50, r.right - kPad, r.bottom - 30);
             const bool moved = std::fabs(sc.offset) > 0.5f;
@@ -541,7 +543,7 @@ void PaintCalendar(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r, const Theme&
         EventBlock(rt, *rest[used], D2D1::RectF(left - 2, y, colRight, y + h), t, true);
         y += h + 5; ++used;
     }
-    if (rest.empty()) Text(rt, configured ? L"No more events today" : L"No calendars", Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 18), t.secondary);
+    if (rest.empty()) Text(rt, configured ? docky::ui::Text(L"No more events today") : docky::ui::Text(L"No calendars"), Font(12.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 18), t.secondary);
     const float rl = mid + 5, rr = r.right - kPad, top = r.top + 14, bottom = r.bottom - 12;
     // Reference rhythm: blocks 5 apart, a day header 3 below the last block before it and 2 above its first block.
     float ry = top;
@@ -767,9 +769,9 @@ void PaintWeather(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r) {
     WidgetScroll& sc = PaintScroll();
     if (!d.valid) {
         sc.min = sc.max = 0;
-        Text(rt, L"Weather", Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.top + 14, r.right - kPad, r.top + 34), white);
-        Text(rt, d.error.empty() ? L"Loading…" : d.error, Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(left, r.top + 40, r.right - kPad, r.top + 58), soft);
-        if (!d.error.empty()) Text(rt, L"Set a city in Widget Settings", Font(11.5f), D2D1::RectF(left, r.top + 58, r.right - kPad, r.top + 74), soft);
+        Text(rt, docky::ui::Text(L"Weather"), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, r.top + 14, r.right - kPad, r.top + 34), white);
+        Text(rt, d.error.empty() ? docky::ui::Text(L"Loading…") : d.error, Font(13.f, DWRITE_FONT_WEIGHT_MEDIUM), D2D1::RectF(left, r.top + 40, r.right - kPad, r.top + 58), soft);
+        if (!d.error.empty()) Text(rt, docky::ui::Text(L"Set a city in Widget Settings"), Font(11.5f), D2D1::RectF(left, r.top + 58, r.right - kPad, r.top + 74), soft);
         return;
     }
     float end = r.bottom;
@@ -778,7 +780,7 @@ void PaintWeather(ID2D1RenderTarget* rt, Size size, D2D1_RECT_F r) {
         // Left block (all sizes): place, temperature, condition / H-L.
         const float colRight = size == Size::Small ? r.right - kPad : r.left + 170;
         float y = r.top + 13;
-        if (d.automatic) { Text(rt, L"NEARBY LOCATION", Font(10.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 13), soft); y += 13; }
+        if (d.automatic) { Text(rt, docky::ui::Text(L"NEARBY LOCATION"), Font(10.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 13), soft); y += 13; }
         Text(rt, d.place + (d.automatic ? L" ↗" : L""), Font(15.f, DWRITE_FONT_WEIGHT_SEMI_BOLD), D2D1::RectF(left, y, colRight, y + 20), white);
         Text(rt, Deg(d.temp), Font(44.f, DWRITE_FONT_WEIGHT_LIGHT), D2D1::RectF(left - 2, y + 18, colRight, y + 72), white);
         auto divider = Brush(rt, D2D1::ColorF(1, 1, 1, 0.22f));
@@ -977,19 +979,142 @@ std::vector<ExtWidget> LoadWidgetManifests(const std::wstring& root) {
 
 std::vector<Kind> BuiltinKinds() {
     return {{L"clock", L"Clock", Size::Small, L"Clock"}, {L"clock.analog", L"Clock (Analog)", Size::Small, L"Clock"}, {L"calendar", L"Calendar", Size::Medium, L"Calendar"},
-            {L"weather", L"Weather", Size::Small, L"Weather"}, {L"battery", L"Batteries", Size::Small, L"Batteries"}, {L"system", L"System", Size::Small, L"System"}};
+            {L"weather", L"Weather", Size::Small, L"Weather"}, {L"battery", L"Batteries", Size::Small, L"Batteries"},
+            {L"system", L"System", Size::Small, L"System"},
+            {docky::pairing::kDropWidgetKind, L"DockDrop", Size::Small, L"DockDrop"}};
 }
 
 WidgetScroll& PaintScroll() { static WidgetScroll scroll; return scroll; }
 bool Scrollable(const std::wstring& kind) { return kind == L"calendar" || kind == L"weather"; }
 
-void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D1_RECT_F r, const Theme& t, const ExtWidget* ext) {
+DropWidgetLayout LayoutDropWidget(D2D1_RECT_F r) {
+    DropWidgetLayout layout;
+    layout.columns = std::max(1, static_cast<int>((r.right - r.left - 24.f) / 44.f));
+    layout.rows = r.bottom - r.top > 240.f ? 3 : 1;
+    layout.open = D2D1::RectF(r.right - 62.f, r.top + 9.f, r.right - 12.f, r.top + 32.f);
+    layout.first = D2D1::RectF(r.left + 14.f, r.top + 39.f, r.left + 54.f, r.top + 80.f);
+    layout.preview = D2D1::RectF(r.left + 14.f, r.top + 42.f + layout.rows * 46.f, r.right - 14.f, r.bottom - 33.f);
+    layout.footer = D2D1::RectF(r.left + 14.f, r.bottom - 29.f, r.right - 14.f, r.bottom - 11.f);
+    layout.previous = D2D1::RectF(r.right - 69.f, r.bottom - 31.f, r.right - 43.f, r.bottom - 9.f);
+    layout.next = D2D1::RectF(r.right - 40.f, r.bottom - 31.f, r.right - 14.f, r.bottom - 9.f);
+    return layout;
+}
+
+D2D1_RECT_F DropWidgetLayout::Tile(int slot) const {
+    const float dx = static_cast<float>(slot % columns) * 44.f;
+    const float dy = static_cast<float>(slot / columns) * 46.f;
+    return D2D1::RectF(first.left + dx, first.top + dy, first.right + dx, first.bottom + dy);
+}
+
+static void PaintDropPreview(ID2D1RenderTarget* rt, const std::wstring& text, D2D1_RECT_F r, const Theme& theme) {
+    static ComPtr<IDWriteTextFormat> format;
+    if (!format && SUCCEEDED(DWrite()->CreateTextFormat(L"Segoe UI Variable Text", nullptr, DWRITE_FONT_WEIGHT_REGULAR,
+                        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 12.f, L"", &format))) {
+        format->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        DWRITE_TRIMMING trimming{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
+        ComPtr<IDWriteInlineObject> ellipsis;
+        if (SUCCEEDED(DWrite()->CreateEllipsisTrimmingSign(format.Get(), &ellipsis))) format->SetTrimming(&trimming, ellipsis.Get());
+    }
+    Text(rt, text, format.Get(), r, theme.ink);
+}
+
+static void PaintDockDrop(ID2D1RenderTarget* rt, D2D1_RECT_F r, const Theme& theme,
+                          const DropWidgetState& state) {
+    const auto center = D2D1::Point2F((r.left + r.right) * 0.5f, (r.top + r.bottom) * 0.5f - 12.f);
+    const auto layout = LayoutDropWidget(r);
+    Caption(rt, L"DockDrop", r, theme.secondary);
+    ComPtr<ID2D1SolidColorBrush> brush;
+    auto tint = theme.accent;
+    tint.a = state.hovering ? 0.26f : 0.14f;
+    if (FAILED(rt->CreateSolidColorBrush(tint, &brush))) return;
+    if (state.entries.empty()) {
+        rt->FillEllipse(D2D1::Ellipse(center, 23.f, 23.f), brush.Get());
+        brush->SetColor(theme.accent);
+        rt->DrawLine(D2D1::Point2F(center.x, center.y - 11.f), D2D1::Point2F(center.x, center.y + 5.f), brush.Get(), 1.8f);
+        rt->DrawLine(D2D1::Point2F(center.x - 5.f, center.y), D2D1::Point2F(center.x, center.y + 5.f), brush.Get(), 1.8f);
+        rt->DrawLine(D2D1::Point2F(center.x + 5.f, center.y), D2D1::Point2F(center.x, center.y + 5.f), brush.Get(), 1.8f);
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(
+            D2D1::RectF(center.x - 11.f, center.y + 9.f, center.x + 11.f, center.y + 12.f), 1.5f, 1.5f), brush.Get(), 1.5f);
+        Text(rt, docky::ui::Text(L"Drop files or text"), Font(12.f, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_TEXT_ALIGNMENT_CENTER),
+            D2D1::RectF(r.left + 8.f, center.y + 31.f, r.right - 8.f, center.y + 49.f), theme.secondary);
+    } else {
+        const int count = static_cast<int>(state.entries.size());
+        const int start = state.page * layout.Capacity();
+        const int end = std::min(count, start + layout.Capacity());
+        for (int index = start; index < end; ++index) {
+            const auto tile = layout.Tile(index - start);
+            const auto& item = state.entries[index];
+            auto fill = index == state.hovered ? theme.accent : theme.ink;
+            fill.a = index == state.hovered ? 0.24f : 0.08f;
+            brush->SetColor(fill);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(tile, 9.f, 9.f), brush.Get());
+            const auto image = D2D1::RectF(tile.left + 7.f, tile.top + 7.f, tile.right - 7.f, tile.bottom - 7.f);
+            if (!item.clipboard && !item.icon.empty()) {
+                const auto bitmap = MakeBitmap(rt, item.icon.data(), item.iconW, item.iconH);
+                if (bitmap) rt->DrawBitmap(bitmap.Get(), image);
+            } else if (item.clipboard) {
+                const float x = (image.left + image.right) * 0.5f, y = (image.top + image.bottom) * 0.5f;
+                brush->SetColor(theme.accent);
+                rt->DrawRoundedRectangle(D2D1::RoundedRect(
+                    D2D1::RectF(x - 8, y - 7, x + 8, y + 10), 2.5f, 2.5f), brush.Get(), 1.5f);
+                rt->FillRoundedRectangle(D2D1::RoundedRect(
+                    D2D1::RectF(x - 4, y - 10, x + 4, y - 5), 2.f, 2.f), brush.Get());
+                rt->DrawLine(D2D1::Point2F(x - 4, y), D2D1::Point2F(x + 4, y), brush.Get(), 1.25f);
+                rt->DrawLine(D2D1::Point2F(x - 4, y + 4), D2D1::Point2F(x + 2, y + 4), brush.Get(), 1.25f);
+            } else {
+                Text(rt, L"\uE8A5", IconFont(21.f), image, theme.ink);
+            }
+        }
+        if (state.hovered >= start && state.hovered < end) {
+            auto box = layout.preview;
+            const int visibleRows = (end - start + layout.columns - 1) / layout.columns;
+            box.top -= (layout.rows - visibleRows) * 46.f;
+            auto fill = theme.ink;
+            fill.a = 0.085f;
+            brush->SetColor(fill);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(box, 8.f, 8.f), brush.Get());
+            PaintDropPreview(rt, state.entries[state.hovered].preview,
+                D2D1::RectF(box.left + 7.f, box.top + 4.f, box.right - 7.f, box.bottom - 4.f), theme);
+        }
+    }
+    if (state.hovering || state.focused) {
+        auto border = theme.accent;
+        border.a = state.hovering ? 0.72f : 0.42f;
+        brush->SetColor(border);
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(
+            D2D1::RectF(r.left + 2.f, r.top + 2.f, r.right - 2.f, r.bottom - 2.f), 21.f, 21.f), brush.Get(), 1.25f);
+    }
+    brush->SetColor(tint);
+    rt->FillRoundedRectangle(D2D1::RoundedRect(layout.open, 11.5f, 11.5f), brush.Get());
+    Text(rt, docky::ui::Text(L"Open"), Font(11.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER), layout.open, theme.ink);
+
+    auto footer = layout.footer;
+    const int pages = (static_cast<int>(state.entries.size()) + layout.Capacity() - 1) / layout.Capacity();
+    if (pages > 1) {
+        footer.right = layout.previous.left - 3;
+        Text(rt, L"\u2039", Font(17.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER),
+            layout.previous, state.page > 0 ? theme.ink : theme.secondary);
+        Text(rt, L"\u203A", Font(17.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER),
+            layout.next, state.page + 1 < pages ? theme.ink : theme.secondary);
+    }
+    std::wstring status = pages > 1 ? std::to_wstring(state.page + 1) + L" / " + std::to_wstring(pages) :
+        state.focused || state.entries.empty() ? L"Ctrl+V to paste" : L"Hover to preview";
+    if (state.hovering) status = L"Release to stage";
+    else if (state.notice == DropWidgetNotice::InvalidDrop) status = L"Couldn't stage item";
+    else if (state.notice == DropWidgetNotice::Unavailable) status = L"DockDrop unavailable";
+    else if (state.notice == DropWidgetNotice::EmptyClipboard) status = L"No text to paste";
+    Text(rt, status, Font(11.f, DWRITE_FONT_WEIGHT_MEDIUM), footer, state.hovering ? theme.ink : theme.secondary);
+}
+
+void PaintWidget(ID2D1RenderTarget* rt, const std::wstring& kind, Size size, D2D1_RECT_F r,
+                 const Theme& t, const ExtWidget* ext, const DropWidgetState* drop) {
     if (kind == L"clock") PaintDigital(rt, size, r, t);
     else if (kind == L"clock.analog") PaintAnalog(rt, size, r, t);
     else if (kind == L"calendar") PaintCalendar(rt, size, r, t);
     else if (kind == L"battery") PaintBattery(rt, size, r, t);
     else if (kind == L"weather") PaintWeather(rt, size, r);
     else if (kind == L"system") PaintSystem(rt, size, r, t);
+    else if (kind == docky::pairing::kDropWidgetKind) PaintDockDrop(rt, r, t, drop ? *drop : DropWidgetState{});
     else if (ext) PaintExt(rt, size, r, t, *ext);
     else {
         Caption(rt, L"Widget", r, t.secondary);
@@ -1007,6 +1132,7 @@ int ListRowAt(const ExtWidget& e, Size, D2D1_RECT_F r, D2D1_POINT_2F p) {
 PlateTone PlateToneOf(const std::wstring& kind) {
     if (kind == L"clock") return CurrentPrefs().clockDark ? PlateTone::Black : PlateTone::Light;
     if (kind == L"battery" && CurrentPrefs().batteryGlass) return PlateTone::Glass;
+    if (kind == docky::pairing::kDropWidgetKind) return PlateTone::SubtleGradient;
     return PlateTone::Theme;
 }
 
@@ -1016,6 +1142,7 @@ UINT RefreshMs(const std::wstring& kind) {
     if (kind == L"weather") return 60000;  // also repainted when new data arrives
     if (kind == L"system") return 2000;
     if (kind == L"battery") return 60000;  // also repainted when the device list changes
+    if (kind == docky::pairing::kDropWidgetKind) return 1000;
     return 60000;
 }
 

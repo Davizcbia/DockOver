@@ -1,4 +1,5 @@
 #include "unified_menu.h"
+#include "ui_language.h"
 #include "menu_surface.h"
 #include "popup_dismiss_watch.h"
 #include "menu_navigation.h"
@@ -127,7 +128,7 @@ std::wstring GridFooter(const Popup* p){const auto* item=ItemAt(p,p->hover);retu
 std::vector<dock::MenuRowVisual> VisualRows(const Popup* p){
  std::vector<dock::MenuRowVisual> rows;const int count=Grid(p)?GridCount(p):VisibleRows(p);
  for(int k=0;k<count;++k){int row=k+(Grid(p)?0:p->scroll);if(row>=RowCount(p))break;const auto* item=ItemAt(p,row);const bool back=!p->path.empty()&&row==0;
-  dock::MenuRowVisual visual;visual.text=back?L"‹  Back":(item?item->text:L"");visual.enabled=back||(item&&item->enabled);visual.hover=row==p->hover;
+  dock::MenuRowVisual visual;visual.text=back?(docky::ui::chinese?L"‹  返回":L"‹  Back"):(item?item->text:L"");visual.enabled=back||(item&&item->enabled);visual.hover=row==p->hover;
   if(item){visual.checked=item->checked;visual.separator=item->kind==menu::ItemKind::Separator;visual.submenu=item->kind==menu::ItemKind::Submenu;visual.icon=item->icon;}rows.push_back(std::move(visual));}
  return rows;
 }
@@ -235,7 +236,7 @@ LRESULT CALLBACK Proc(HWND h,UINT msg,WPARAM w,LPARAM l){
    if(row==p->hover&&(back||(item&&item->enabled))){HBRUSH highlight=CreateSolidBrush(RGB(0,105,249));HGDIOBJ oldBrush=SelectObject(dc,highlight);HPEN pen=CreatePen(PS_NULL,0,0);HGDIOBJ oldPen=SelectObject(dc,pen);RoundRect(dc,box.left,box.top,box.right,box.bottom,Px(p,16),Px(p,16));SelectObject(dc,oldPen);DeleteObject(pen);SelectObject(dc,oldBrush);DeleteObject(highlight);}
    if(item&&item->kind==menu::ItemKind::Separator){HBRUSH line=CreateSolidBrush(themeForeground);RECT sep{Px(p,14),top+Px(p,11),r.right-Px(p,14),top+Px(p,12)};FillRect(dc,&sep,line);DeleteObject(line);continue;}
    const bool enabled=back||(item&&item->enabled);const COLORREF disabled=RGB((GetRValue(themeForeground)*2+GetRValue(themeBackground))/3,(GetGValue(themeForeground)*2+GetGValue(themeBackground))/3,(GetBValue(themeForeground)*2+GetBValue(themeBackground))/3);SetTextColor(dc,row==p->hover&&enabled?RGB(255,255,255):enabled?themeForeground:disabled);
-   std::wstring label=back?L"‹  Back":(item?item->text:L"");if(item&&item->checked)label=L"✓  "+label;
+   std::wstring label=back?(docky::ui::chinese?L"‹  返回":L"‹  Back"):(item?docky::ui::Text(item->text.c_str()):L"");if(item&&item->checked)label=L"✓  "+label;
    RECT text{Px(p,16),top,r.right-Px(p,26),top+Px(p,24)};DrawTextW(dc,label.c_str(),-1,&text,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
    if(item&&item->kind==menu::ItemKind::Submenu){RECT arrow{r.right-Px(p,25),top,r.right-Px(p,10),top+Px(p,24)};DrawTextW(dc,L"›",-1,&arrow,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);}
   }

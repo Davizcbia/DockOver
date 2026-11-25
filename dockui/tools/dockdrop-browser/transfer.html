@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DockDrop</title>
+<style nonce="SCRIPT_NONCE">
+  :root { color-scheme: light dark; font: 17px/1.5 system-ui, sans-serif; }
+  body { margin: 0; padding: 16vh 1.25rem 2rem; background: #111822; color: #edf5ff; }
+  main { max-width: 30rem; margin: auto; padding: clamp(1.25rem, 5vw, 2.5rem); background: #1b2736; border: 1px solid #344759; border-radius: 1.25rem; }
+  h1 { margin: 0 0 1.5rem; font-size: 1rem; font-weight: 600; color: #b5dfff; }
+  h2 { margin: 0 0 .75rem; font-size: 1.75rem; line-height: 1.16; }
+  p { overflow-wrap: anywhere; }
+  a, button { display: inline-block; border: 0; border-radius: .625rem; background: #a4d7ff; color: #112032; padding: .65rem 1rem; font: inherit; font-weight: 650; text-decoration: none; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  input { width: 100%; font: inherit; }
+  progress { width: 100%; margin-top: 1rem; accent-color: #a4d7ff; }
+  [hidden], [data-mode="download"] #upload-view, [data-mode="upload"] #download-view { display: none; }
+</style>
+<main data-mode="MODE_PLACEHOLDER">
+  <h1>DockDrop</h1>
+  <section id="download-view">
+    <h2>Receive a file</h2>
+    <p>DOWNLOAD_NAME</p>
+    <a id="download" download href="">Download</a>
+  </section>
+  <section id="upload-view">
+    <h2>Send a file</h2>
+    <p><input id="file" type="file" aria-label="Choose a file"></p>
+    <button id="send" type="button" disabled>Send file</button>
+    <progress id="progress" aria-label="Transfer progress" max="1" value="0" hidden></progress>
+    <p id="status" role="status"></p>
+  </section>
+</main>
+<script nonce="SCRIPT_NONCE">
+  const endpoint = location.pathname + '/file';
+  document.getElementById('download').href = endpoint;
+  const picker = document.getElementById('file');
+  const send = document.getElementById('send');
+  const status = document.getElementById('status');
+  const progress = document.getElementById('progress');
+  picker.addEventListener('change', () => { send.disabled = !picker.files.length; });
+  send.addEventListener('click', () => {
+    const file = picker.files[0];
+    if (!file) return;
+    if (file.size > 2 * 1024 ** 3) {
+      status.textContent = 'Files must be 2 GiB or smaller.';
+      return;
+    }
+    const upload = new XMLHttpRequest();
+    upload.open('POST', endpoint);
+    upload.setRequestHeader('Content-Type', 'application/octet-stream');
+    upload.setRequestHeader('X-DockDrop-Name', encodeURIComponent(file.name));
+    picker.disabled = send.disabled = true;
+    progress.hidden = false;
+    progress.value = 0;
+    status.textContent = 'Sending…';
+    upload.upload.addEventListener('progress', event => {
+      if (event.lengthComputable && event.total > 0) progress.value = event.loaded / event.total;
+    });
+    upload.onload = () => {
+      if (upload.status === 200) {
+        progress.value = 1;
+        picker.value = '';
+      }
+      status.textContent = upload.responseText || 'The host could not accept this file.';
+    };
+    upload.onerror = () => { status.textContent = 'Connection lost. Try again.'; };
+    upload.onloadend = () => {
+      picker.disabled = false;
+      send.disabled = !picker.files.length;
+    };
+    upload.send(file);
+  });
+</script>
+</html>
