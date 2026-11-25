@@ -12,8 +12,8 @@ inline const wchar_t* Ui(const wchar_t* source) {
     static const struct { const wchar_t* key; const wchar_t* zh; const wchar_t* en; } labels[] = {
         {L"扫描球大小", L"扫描球大小", L"Bubble size"},
         {L"扫描球大小  ", L"扫描球大小  ", L"Bubble size  "},
-        {L"显示玻璃球", L"显示玻璃球", L"Show bubble"},
-        {L"改用二维码", L"改用二维码", L"Use QR code"},
+        {L"返回水球", L"返回水球", L"Back to bubble"},
+        {L"备用光纹", L"备用光纹", L"Backup pattern"},
         {L"暂时无法打开剪贴板", L"暂时无法打开剪贴板", L"Clipboard unavailable"},
         {L"文字已复制", L"文字已复制", L"Text copied"},
         {L"无法复制文字", L"无法复制文字", L"Could not copy text"},
@@ -100,6 +100,7 @@ inline const wchar_t* Ui(const wchar_t* source) {
         {L"正在验证…", L"正在验证…", L"Verifying…"},
         {L"正在建立直连…", L"正在建立直连…", L"Connecting to phone…"},
         {L"连接中断，正在重试…", L"连接中断，正在重试…", L"Reconnecting…"},
+        {L"配对服务暂时不可用，稍后自动重试…", L"配对服务暂时不可用，稍后自动重试…", L"Pairing service unavailable · retrying later…"},
     };
     for (const auto& label : labels) {
         if (std::wcscmp(source, label.key)) continue;

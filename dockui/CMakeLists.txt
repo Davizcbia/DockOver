@@ -5,8 +5,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef LIQUID_BUILD_ID)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/liquid_build_id.h" "#pragma once\n#define LIQUID_BUILD_MARKER \"LiquidDesktopBuild:${LIQUID_BUILD_ID}\"\n")
 # Software update (Settings > About): the version is the GitHub release tag; see package_docky.ps1.
-set(DOCKY_VERSION "1.2.0")  # the GitHub release tag of this version; raise it for every release
-set(DOCKDROP_VERSION "0.2.0")
+set(DOCKY_VERSION "1.3.0")  # the GitHub release tag of this version; raise it for every release
+set(DOCKDROP_VERSION "0.3.0")
 set(DOCKOVER_MUSIC_VERSION "0.2.0")
 set(DOCKY_UPDATE_REPO "Davizcbia/DockOver")  # GitHub repository whose releases carry updates (public)
 set(DOCKY_UPDATE_ASSET "DockOver-Windows-Portable")  # name prefix of the release's portable zip
@@ -640,9 +640,18 @@ if(DOCKY_PHONE_PAIRING)
   endif()
   docky_version_resource(DockDrop "DockDrop")
   install(TARGETS DockDrop RUNTIME DESTINATION . COMPONENT DockDrop EXCLUDE_FROM_ALL)
+  find_program(DOCKDROP_DOTNET dotnet REQUIRED)
+  set(pc_helper_dir "${CMAKE_BINARY_DIR}/dockdrop-pc")
+  set(pc_project "${CMAKE_CURRENT_SOURCE_DIR}/tools/dockdrop-pc/DockDropPc.csproj")
+  add_custom_command(OUTPUT "${pc_helper_dir}/DockDropPc.exe" "${pc_helper_dir}/DockDropPc.dll"
+    COMMAND "${DOCKDROP_DOTNET}" publish "${pc_project}" -c Release -o "${pc_helper_dir}" --no-self-contained
+    DEPENDS "${pc_project}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/dockdrop-pc/Program.cs" VERBATIM)
+  add_custom_target(DockDropLan DEPENDS "${pc_helper_dir}/DockDropPc.exe" "${pc_helper_dir}/DockDropPc.dll")
+  install(DIRECTORY "${pc_helper_dir}/" DESTINATION dockdrop-pc COMPONENT DockDrop EXCLUDE_FROM_ALL)
   foreach(target IN ITEMS DockyBubble DockDrop)
+    add_dependencies(${target} DockDropLan)
     target_sources(${target} PRIVATE src/pairing/phone_host.cpp src/pairing/phone_transfer.cpp src/desktop_settings.cpp
-      src/glass_params.cpp src/json_lite.cpp "${DOCKDROP_HOST_RC}")
+      src/glass_params.cpp src/liquid_glass.cpp src/json_lite.cpp "${DOCKDROP_HOST_RC}")
     target_include_directories(${target} PRIVATE "${dockdrop_webview2_SOURCE_DIR}/build/native/include")
     target_link_libraries(${target} PRIVATE shlwapi version gdiplus msimg32 d2d1 dwrite comctl32 crypt32 advapi32
       "${dockdrop_webview2_SOURCE_DIR}/build/native/${DOCKDROP_WEBVIEW2_ARCH}/WebView2LoaderStatic.lib")

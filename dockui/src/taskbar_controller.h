@@ -35,6 +35,8 @@ inline constexpr int kMaxRehides = 3;  // per 60 s
 
 enum class State { Visible, Hidden, Conflict };
 const wchar_t* StateName(State s);
+// With the record lock held: moves a <record>.tmp older than 10 s aside (renamed, never deleted). True when none remains.
+bool SetAsideStaleTempRecord(const std::wstring& path, std::wstring& log);
 
 class Controller {
 public:

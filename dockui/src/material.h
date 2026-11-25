@@ -41,6 +41,7 @@ struct GpuPaint {
     float pointerX = 0, pointerY = 0;     // window pixels (smoothed)
     float hover = 0, press = 0;
     float rotationDeg = 0;                // plate rotation about its centre (Downloads Fan capsules); 0 elsewhere
+    const RECT* clipPx = nullptr;         // optional window-local viewport, in physical pixels
 };
 
 class IPlateMaterial {

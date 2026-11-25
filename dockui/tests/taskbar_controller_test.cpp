@@ -99,6 +99,30 @@ int wmain() {
         CHECK(!p.Show(why) && p.Current() == State::Conflict && !shell.Visible(100));  // ambiguous: left as is
         std::wstring log; CHECK(RecoverTaskbarRecord(pend, log) == RecoverResult::Refused);
     }
+    // ---- a leftover temp record from an interrupted save no longer blocks hiding; a fresh one still does ----
+    {
+        const auto rec = dir + L"\\record-d.txt", tmp = rec + L".tmp";
+        FakeShell shell; shell.Add(100, L"Shell_TrayWnd");
+        { std::ofstream f(tmp); f << "sentinel"; }
+        Controller c(rec, shell.Make()); std::wstring why;
+        CHECK(!c.Hide(why) && c.Current() == State::Visible && shell.Visible(100));  // recent: maybe a live write
+        HANDLE h = CreateFileW(tmp.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        FILETIME old{}; GetSystemTimeAsFileTime(&old);
+        ULARGE_INTEGER u{}; u.LowPart = old.dwLowDateTime; u.HighPart = old.dwHighDateTime; u.QuadPart -= 3600ull * 10000000ull;
+        old.dwLowDateTime = u.LowPart; old.dwHighDateTime = u.HighPart;
+        CHECK(h != INVALID_HANDLE_VALUE && SetFileTime(h, &old, nullptr, &old)); CloseHandle(h);
+        why.clear();
+        CHECK(c.Hide(why) && c.Current() == State::Hidden && !shell.Visible(100));
+        CHECK(GetFileAttributesW(tmp.c_str()) == INVALID_FILE_ATTRIBUTES);
+        WIN32_FIND_DATAW fd{}; HANDLE fh = FindFirstFileW((tmp + L".stale-*").c_str(), &fd);
+        CHECK(fh != INVALID_HANDLE_VALUE);
+        if (fh != INVALID_HANDLE_VALUE) {
+            FindClose(fh);
+            std::ifstream f(dir + L"\\" + fd.cFileName); std::string s; f >> s; CHECK(s == "sentinel");  // kept for review
+            DeleteFileW((dir + L"\\" + fd.cFileName).c_str());
+        }
+        CHECK(c.Show(why) && shell.Visible(100));
+    }
     // ---- hotkey model ----
     {
         using namespace docky::hotkey;

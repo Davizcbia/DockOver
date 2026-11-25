@@ -20,7 +20,63 @@ Console.OutputEncoding = Encoding.UTF8;
 
 try
 {
-    if (args is ["receive", var folder])
+    if (args is ["picker-list", var resultPath])
+    {
+        var peers = await Discover();
+        await File.WriteAllLinesAsync(resultPath, peers.Select(p => $"{p.Id:N}\t{p.Name}"), Encoding.Unicode);
+    }
+    else if (args is ["picker-receive", var receiverWindow])
+    {
+        string? destination = null;
+        var chooser = new Thread(() =>
+        {
+            using var dialog = new System.Windows.Forms.FolderBrowserDialog { Description = "DockDrop · 选择电脑接收文件夹 / Receive folder", UseDescriptionForTitle = true };
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) destination = dialog.SelectedPath;
+        });
+        chooser.SetApartmentState(ApartmentState.STA);
+        chooser.Start();
+        chooser.Join();
+        if (destination is null) return 0;
+        await Receive(destination, PopupPath(receiverWindow));
+    }
+    else if (args is ["picker-send", var selectedId, var windowExe] && Guid.TryParseExact(selectedId, "N", out var id))
+    {
+        var popup = PopupPath(windowExe);
+        var peer = (await Discover()).FirstOrDefault(p => p.Id == id);
+        if (peer.Addresses is null) throw new InvalidDataException("This PC is no longer available.");
+        string? path = null;
+        var chooser = new Thread(() =>
+        {
+            using var dialog = new System.Windows.Forms.OpenFileDialog { Title = $"DockDrop · {peer.Name}", CheckFileExists = true };
+            if (dialog.ShowDialog() == System.Windows.Forms.DialogResult.OK) path = dialog.FileName;
+        });
+        chooser.SetApartmentState(ApartmentState.STA);
+        chooser.Start();
+        chooser.Join();
+        if (path is null) return 0;
+        // The code is asked again (up to 3 times) when it is malformed or does not match the receiver's certificate,
+        // instead of ending with the TLS exception text.
+        var hint = "";
+        for (var attempt = 0; attempt < 3; attempt++)
+        {
+            var code = AskCode(peer.Name, hint);
+            if (string.IsNullOrEmpty(code)) return 0;
+            if (code.Length != 16 || !code.All(Uri.IsHexDigit))
+            {
+                hint = "配对码应为 16 位（0-9、A-F）/ The code has 16 characters (0-9, A-F).\n\n";
+                continue;
+            }
+            using var file = File.OpenRead(path);
+            try { return await Send(peer.Addresses, file, Convert.FromHexString(code), popup, peer.Name) ? 0 : 1; }
+            catch (AuthenticationException)
+            {
+                hint = "配对码不正确，请核对接收电脑上显示的配对码。/ The code does not match the receiving PC.\n\n";
+            }
+        }
+        System.Windows.Forms.MessageBox.Show("配对码多次不正确，已取消发送。/ The code did not match; nothing was sent.", "DockDrop");
+        return 1;
+    }
+    else if (args is ["receive", var folder])
         await Receive(Path.GetFullPath(folder), null);
     else if (args is ["receive", var popupFolder, "--popup", var executable])
     {
@@ -61,8 +117,20 @@ try
 }
 catch (Exception ex) when (IsTransferError(ex) || ex is UnauthorizedAccessException or ArgumentException)
 {
+    if (args.FirstOrDefault() is "picker-send" or "picker-receive") System.Windows.Forms.MessageBox.Show(ex.Message, "DockDrop");
     Console.Error.WriteLine(ex.Message);
     return 1;
+}
+
+static string AskCode(string peerName, string hint)
+{
+    string code = "";
+    var thread = new Thread(() => code = Microsoft.VisualBasic.Interaction.InputBox(
+        hint + "输入接收电脑显示的配对码 / Enter the code shown on the receiving PC", "DockDrop · " + peerName));
+    thread.SetApartmentState(ApartmentState.STA);
+    thread.Start();
+    thread.Join();
+    return code.Trim().Replace("-", "").Replace(" ", "");
 }
 
 static int Usage()
@@ -78,7 +146,7 @@ static string PopupPath(string executable)
     return path;
 }
 
-async Task<List<(string Name, IPAddress[] Addresses)>> Discover()
+async Task<List<(Guid Id, string Name, IPAddress[] Addresses)>> Discover()
 {
     using var socket = new UdpClient(AddressFamily.InterNetwork) { EnableBroadcast = true };
     var nonce = Convert.ToHexString(RandomNumberGenerator.GetBytes(16));
@@ -95,7 +163,13 @@ async Task<List<(string Name, IPAddress[] Addresses)>> Discover()
         }
         while (true)
         {
-            var reply = await socket.ReceiveAsync(timeout.Token);
+            UdpReceiveResult reply;
+            try { reply = await socket.ReceiveAsync(timeout.Token); }
+            catch (SocketException e) when (e.SocketErrorCode == SocketError.ConnectionReset)
+            {
+                // Windows reports ICMP port-unreachable for an unanswered probe.
+                continue;
+            }
             if (reply.RemoteEndPoint.Port != discoveryPort || reply.Buffer.Length > 512) continue;
             string message;
             try { message = utf8.GetString(reply.Buffer); }
@@ -116,7 +190,7 @@ async Task<List<(string Name, IPAddress[] Addresses)>> Discover()
         }
     }
     catch (OperationCanceledException) when (timeout.IsCancellationRequested) { }
-    return peers.Values.Select(peer => (peer.Name, Addresses: peer.Addresses
+    return peers.Select(entry => (Id: entry.Key, entry.Value.Name, Addresses: entry.Value.Addresses
             .OrderBy(address => IPAddress.IsLoopback(address))
             .ThenBy(address => address.ToString(), StringComparer.Ordinal).ToArray()))
         .OrderBy(peer => peer.Name, StringComparer.OrdinalIgnoreCase)
@@ -178,9 +252,18 @@ async Task Receive(string folder, string? popup)
     var pin = Convert.ToHexString(serverCertificate.GetCertHash(HashAlgorithmName.SHA256).AsSpan(0, 8));
 
     using var server = new TcpListener(IPAddress.Any, transferPort);
-    using var discovery = new UdpClient(new IPEndPoint(IPAddress.Any, discoveryPort));
+    UdpClient discovery;
+    try
+    {
+        discovery = new UdpClient(new IPEndPoint(IPAddress.Any, discoveryPort));
+        server.Start(4);
+    }
+    catch (SocketException e) when (e.SocketErrorCode == SocketError.AddressAlreadyInUse)
+    {
+        throw new IOException("这台电脑已在接收文件（另一个接收窗口仍开着）。/ This PC is already receiving files in another window.");
+    }
+    using var discoveryOwner = discovery;
     using var stopping = new CancellationTokenSource();
-    server.Start(4);
     var advertise = Advertise(discovery, stopping.Token);
     Console.WriteLine($"Ready on {localName}. Receiving into {folder}");
     Console.WriteLine($"Device code: {pin[..4]}-{pin[4..8]}-{pin[8..12]}-{pin[12..]}");
@@ -237,14 +320,6 @@ async Task HandleOffer(TcpClient client, X509Certificate2 certificate, string fo
         return;
     }
 
-    var finalPath = Path.Combine(folder, name);
-    if (File.Exists(finalPath) || Directory.Exists(finalPath))
-    {
-        writer.Write((byte)2);
-        prompt?.Update("failed");
-        Console.Error.WriteLine($"A file or folder already exists at {finalPath}.");
-        return;
-    }
     var staging = Path.Combine(folder, $".dockdrop-{Guid.NewGuid():N}.part");
     var ownsStaging = false;
     var saved = false;
@@ -263,7 +338,18 @@ async Task HandleOffer(TcpClient client, X509Certificate2 certificate, string fo
                 throw new InvalidDataException("File hash did not match.");
             file.Flush(flushToDisk: true);
         }
-        File.Move(staging, finalPath);
+        // An existing file keeps its name: the new one is saved as "name (2).ext", "name (3).ext", ...
+        var finalPath = Path.Combine(folder, name);
+        for (var copy = 2; ; copy++)
+        {
+            if (!File.Exists(finalPath) && !Directory.Exists(finalPath))
+            {
+                try { File.Move(staging, finalPath); break; }
+                catch (IOException) when (File.Exists(finalPath) || Directory.Exists(finalPath)) { /* taken meanwhile */ }
+            }
+            if (copy > 9999) throw new IOException($"No free file name for {name} in {folder}.");
+            finalPath = Path.Combine(folder, $"{Path.GetFileNameWithoutExtension(name)} ({copy}){Path.GetExtension(name)}");
+        }
         ownsStaging = false;
         saved = true;
         prompt?.Update("done");
@@ -381,7 +467,7 @@ static bool ValidFileName(string name)
     var stem = name.Split('.')[0].TrimEnd().ToUpperInvariant();
     if (stem is "CON" or "PRN" or "AUX" or "NUL" or "CONIN$" or "CONOUT$") return false;
     return !(stem.Length == 4 && (stem.StartsWith("COM") || stem.StartsWith("LPT")) &&
-        "0123456789¹²³".Contains(stem[3]));
+        "0123456789¹²³".Contains(stem[3]));  // COM1..COM9, COM¹..COM³ (and LPT)
 }
 
 static bool IsTransferError(Exception ex) =>

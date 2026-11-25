@@ -38,6 +38,12 @@ namespace Gdiplus{using std::min;using std::max;}
 #include <fstream>
 #include "log.h"
 #include "menu_model.h"
+#include <commctrl.h>
+#include <powrprof.h>
+// Power commands (Restart…, Shut Down…, Sign Out…) confirm with a TaskDialog (Common Controls 6); Sleep uses PowrProf.
+#pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "PowrProf.lib")
+#pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #include "native_menu.h"
 #include "system_status.h"
 #include "unified_menu.h"
@@ -196,6 +202,9 @@ LRESULT CALLBACK InputProc(HWND h,UINT msg,WPARAM w,LPARAM l){
 }
 void SyncInputWindow(HWND bar,int width,int height){
  if(!inputWindow)return;
+ // Hidden bar (full screen): its click catcher must not stay over the top of the full-screen window, where it took the
+ // clicks meant for the title bar and the restore button.
+ if(!IsWindowVisible(bar)){if(IsWindowVisible(inputWindow))ShowWindow(inputWindow,SW_HIDE);return;}
  std::vector<RECT> slots=headings;slots.push_back(appRect);for(const auto& r:statusRects)if(r.right>r.left)slots.push_back(r);for(const auto& e:extras)slots.push_back(e.rect);
  bool changed=inputWidth!=width||inputHeight!=height||inputDpi!=dpi||slots.size()!=inputSlots.size();
  if(!changed)for(size_t i=0;i<slots.size();++i)if(!EqualRect(&slots[i],&inputSlots[i])){changed=true;break;}
@@ -376,7 +385,7 @@ void RemoveAppBar(HWND h){if(!appBarRegistered)return;APPBARDATA a{sizeof(a)};a.
 // A drag that starts on a maximized window (Windows restores it under the cursor) gets its limits once it has restored.
 // Apps that move their windows themselves (no system move loop) are corrected when the button is released.
 // Optionally (Settings > Dock) the Windows snap-layout bar that appears at the top during a drag is hidden.
-constexpr UINT_PTR kDragClipTimer=13,kReleaseCheckTimer=15,kFullscreenGrowTimer=18,kUnsnapTimer=19;
+constexpr UINT_PTR kDragClipTimer=13,kReleaseCheckTimer=15,kUnsnapTimer=19;
 extern HWND fullscreenWindow;
 constexpr UINT kDockFullscreenMsg=WM_APP+79;  // to the Dock: wParam 1 = a full-screen app owns the monitor
 bool hideSnapLayouts=false,rawMouseRegistered=false;
@@ -585,8 +594,8 @@ void OnLeftDown(){
 // * Split (Windows Snap: screen edges, Win+arrows, snap layouts) is turned into the same kind of normal window at the
 //   snapped size, so it keeps rounded corners and is not in Windows' arranged state either.
 // * The maximize button (macOS's green button) is real full screen: the window stays maximized (square corners, its own
-//   maximize/restore state), and while it is in front the menu bar and the Dock hide and release their reserved space,
-//   so Windows grows the maximized window to the whole monitor. Restore (button, double-click, Win+Down) leaves it.
+//   maximize/restore state), and while it is in front the menu bar and the Dock hide and that monitor's work area is
+//   the whole monitor (WorkOverride), so it covers the screen. Restore (button, double-click, Win+Down) leaves it.
 struct FullscreenWindow{HWND w=nullptr;};
 std::vector<FullscreenWindow> buttonFullscreen;
 struct FilledWindow{HWND w=nullptr;RECT normal{};};  // normal: the size to give back, in workspace coordinates
@@ -650,22 +659,42 @@ void MaintainFilled(){
     }
 }
 void SetFullscreenApp(HWND h,bool full);
+// Full screen covers the whole monitor by setting that monitor's work area to the monitor while the window is in front,
+// without broadcasting (Explorer reverts a broadcast change; see taskbar_workarea.h), so other maximized windows are
+// not resized. The bars and the hidden taskbar keep their AppBar registrations: unregistering the menu bar and
+// registering it again left Explorer without its space (work area from y 0 after leaving). Leaving full screen
+// broadcasts the work area from before, which Explorer agrees with since no AppBar changed.
+struct WorkOverride{bool active=false;HMONITOR monitor=nullptr;RECT before{};}workOverride;
+void RestoreWorkOverride(){
+    if(!workOverride.active)return;
+    workOverride.active=false;
+    MONITORINFO mi{sizeof(mi)};
+    if(GetMonitorInfoW(workOverride.monitor,&mi)&&EqualRect(&mi.rcWork,&mi.rcMonitor)&&!IsRectEmpty(&workOverride.before)){
+        SystemParametersInfoW(SPI_SETWORKAREA,0,&workOverride.before,SPIF_SENDCHANGE);
+        DLOG(L"menu: work area put back after full screen %ld,%ld-%ld,%ld",workOverride.before.left,workOverride.before.top,workOverride.before.right,workOverride.before.bottom);
+    }
+}
+void GrowFullscreen();
 void EnterFullscreen(HWND w){
     if(!IsZoomed(w))return;
     for(const auto& f:buttonFullscreen)if(f.w==w)return;
+    if(!workOverride.active){MONITORINFO mi{sizeof(mi)};if(GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi))workOverride.before=mi.rcWork;}
     buttonFullscreen.push_back({w});
     fullscreenWindow=w;
-    // The bar and the Dock hide and give back their space (SetFullscreenApp / the Dock's kDockFullscreenMsg 2): the work
-    // area becomes the monitor and Windows grows the maximized window over it.
-    if(barWindow){SetFullscreenApp(barWindow,true);SetTimer(barWindow,kFullscreenGrowTimer,300,nullptr);}
-    wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: maximize button -> full screen (maximized, bars released) class=%ls",cls);
+    // The bar and the Dock hide (SetFullscreenApp); GrowFullscreen then gives the window the whole monitor.
+    if(barWindow){SetFullscreenApp(barWindow,true);GrowFullscreen();}
+    wchar_t cls[96]{};GetClassNameW(w,cls,96);DLOG(L"menu: maximize button -> full screen (maximized over the whole monitor) class=%ls",cls);
 }
-// Normally Windows has already resized the maximized window to the new work area; some apps keep their old size.
 void GrowFullscreen(){
     for(const auto& f:buttonFullscreen){
-        if(!IsWindow(f.w)||!IsZoomed(f.w)||CoversMonitor(f.w))continue;
-        MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(MonitorFromWindow(f.w,MONITOR_DEFAULTTONEAREST),&mi))continue;
-        if(!EqualRect(&mi.rcWork,&mi.rcMonitor))continue;  // space not released (yet)
+        if(!IsWindow(f.w)||!IsZoomed(f.w)||CoversMonitor(f.w)||f.w!=fullscreenWindow)continue;
+        const HMONITOR monitor=MonitorFromWindow(f.w,MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(monitor,&mi))continue;
+        if(!EqualRect(&mi.rcWork,&mi.rcMonitor)){
+            if(!SystemParametersInfoW(SPI_SETWORKAREA,0,&mi.rcMonitor,0))continue;
+            if(!workOverride.active){workOverride.active=true;workOverride.monitor=monitor;}
+            DLOG(L"menu: full screen: work area set to the whole monitor (was %ld,%ld-%ld,%ld)",mi.rcWork.left,mi.rcWork.top,mi.rcWork.right,mi.rcWork.bottom);
+        }
         fullscreenBusy=true;PlaceVisible(f.w,mi.rcMonitor);fullscreenBusy=false;
         DLOG(L"menu: full-screen window grown to the monitor");
     }
@@ -881,10 +910,10 @@ void SetFullscreenApp(HWND h,bool full){
 
     {wchar_t cls[64]{};if(full)GetClassNameW(fullscreenWindow?fullscreenWindow:GetForegroundWindow(),cls,64);DLOG(L"menu: full-screen app %ls %ls",full?L"on: bar and Dock hidden; window":L"off: bar and Dock shown",cls);}
     if(full){ReleaseDragClip();ClosePopup();if(inputWindow)ShowWindow(inputWindow,SW_HIDE);ShowWindow(h,SW_HIDE);
-        if(IsButtonFullscreen(fullscreenWindow))RemoveAppBar(h);  // Place() registers it again when full screen ends
+
         // Game mode: EVENT_OBJECT_LOCATIONCHANGE also fires for every pointer move, and raw input for every mouse packet.
         if(locationHook){UnhookWinEvent(locationHook);locationHook=nullptr;}DropRawMouse();}
-    else{Place(h);ShowWindow(h,SW_SHOWNOACTIVATE);if(inputWindow)ShowWindow(inputWindow,SW_SHOWNOACTIVATE);Render(h);
+    else{Place(h);RestoreWorkOverride();ShowWindow(h,SW_SHOWNOACTIVATE);if(inputWindow)ShowWindow(inputWindow,SW_SHOWNOACTIVATE);Render(h);
         if(!locationHook&&shellHooksEnabled)locationHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,OnLocationChange,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         if(shellHooksEnabled)EnsureRawMouse();}
 }
@@ -915,9 +944,7 @@ void SyncGameCompatibility(HWND h) {
     }
     static HWND sentWindow=nullptr;static WPARAM sentFull=0;static bool sentSuppressed=false;
     HWND dockWindow=FindWindowW(L"LiquidDockV01",nullptr);
-    // 2: the maximize-button full screen on the Dock's monitor, which also takes the Dock's reserved space.
-    const WPARAM full=!fullscreenApp?0:(IsButtonFullscreen(fullscreenWindow)&&dockWindow&&
-        MonitorFromWindow(dockWindow,MONITOR_DEFAULTTONEAREST)==MonitorFromWindow(fullscreenWindow,MONITOR_DEFAULTTONEAREST))?2:1;
+    const WPARAM full=fullscreenApp?1:0;
     if(dockWindow&&(dockWindow!=sentWindow||sentFull!=full||sentSuppressed!=gameSuppressed)){
         if(PostMessageW(dockWindow,kDockFullscreenMsg,full,gameSuppressed?1:0)){
             sentWindow=dockWindow;sentFull=full;sentSuppressed=gameSuppressed;
@@ -929,7 +956,9 @@ void Place(HWND h) {
     if(!GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi))return;
     const UINT monitorDpi=GetDpiForWindow(h);
     dpi=MulDiv(monitorDpi?monitorDpi:96,menuScalePercent,100);
-    ApplyAppBar(h,mi.rcMonitor);
+    // During the maximize-button full screen the work area is the whole monitor (WorkOverride). The bar stays
+    // registered but is not positioned again: an ABM_SETPOS makes Explorer derive the work area again.
+    if(!(fullscreenApp&&IsButtonFullscreen(fullscreenWindow)))ApplyAppBar(h,mi.rcMonitor);
     if(fullscreenApp)return;  // hidden while a full-screen app owns the monitor
     SetWindowPos(h,HWND_TOPMOST,mi.rcMonitor.left,mi.rcMonitor.top,mi.rcMonitor.right-mi.rcMonitor.left,Px(30),SWP_NOACTIVATE|SWP_SHOWWINDOW);
 }
@@ -1382,19 +1411,61 @@ void RequestSettings(){
     DLOG(L"menu: Settings started directly (no Desktop Manager) result=%lld",static_cast<long long>(r));
     if(r<=32)MessageBoxW(nullptr,L"Could not open DockOver Settings.",L"DockOver",MB_OK|MB_ICONWARNING);
 }
+// ---- Power commands (DockOver menu: Sleep, Restart…, Shut Down…, Lock Screen, Sign Out…) ---------------------------------
+// The same calls Windows' own Start menu makes: apps may still ask to save their work (nothing is forced), Shut Down keeps
+// Fast Startup (hybrid), and the commands with "…" ask first, like macOS.
+bool EnableShutdownPrivilege(){
+    HANDLE token=nullptr;if(!OpenProcessToken(GetCurrentProcess(),TOKEN_ADJUST_PRIVILEGES|TOKEN_QUERY,&token))return false;
+    TOKEN_PRIVILEGES tp{};tp.PrivilegeCount=1;tp.Privileges[0].Attributes=SE_PRIVILEGE_ENABLED;
+    const bool ok=LookupPrivilegeValueW(nullptr,SE_SHUTDOWN_NAME,&tp.Privileges[0].Luid)&&AdjustTokenPrivileges(token,FALSE,&tp,0,nullptr,nullptr)&&GetLastError()==ERROR_SUCCESS;
+    CloseHandle(token);return ok;
+}
+bool ConfirmPower(const wchar_t* question,const wchar_t* action){
+    const std::wstring title=docky::ui::Text(question);const std::wstring button=docky::ui::Text(action);
+    TASKDIALOG_BUTTON buttons[]{{IDOK,button.c_str()}};
+    TASKDIALOGCONFIG d{};d.cbSize=sizeof(d);d.hwndParent=barWindow;d.dwFlags=TDF_ALLOW_DIALOG_CANCELLATION|TDF_POSITION_RELATIVE_TO_WINDOW;
+    d.dwCommonButtons=TDCBF_CANCEL_BUTTON;d.pszWindowTitle=L"DockOver";d.pszMainInstruction=title.c_str();
+    d.pszContent=docky::ui::Text(L"Apps that have unsaved work can ask you to save it first.");d.cButtons=1;d.pButtons=buttons;d.nDefaultButton=IDOK;
+    int choice=IDCANCEL;if(barWindow)SetForegroundWindow(barWindow);
+    return SUCCEEDED(TaskDialogIndirect(&d,&choice,nullptr,nullptr))&&choice==IDOK;
+}
+bool SystemPowerCommand(UINT id){
+    using namespace liquid::menu;
+    const DWORD reason=SHTDN_REASON_MAJOR_OTHER|SHTDN_REASON_MINOR_OTHER|SHTDN_REASON_FLAG_PLANNED;
+    auto fail=[](const wchar_t* what){DLOG(L"menu: %ls failed error=%lu",what,GetLastError());MessageBoxW(barWindow,docky::ui::Text(L"Windows did not carry out the command."),L"DockOver",MB_OK|MB_ICONWARNING);};
+    switch(id){
+    case kCmdSleep:{
+        DLOG(L"menu: Sleep");EnableShutdownPrivilege();
+        // Modern Standby PCs have no S3 sleep to request: turning the display off is how Windows enters standby there.
+        if(!SetSuspendState(FALSE,FALSE,FALSE))PostMessageW(HWND_BROADCAST,WM_SYSCOMMAND,SC_MONITORPOWER,2);
+        return true;}
+    case kCmdRestart:
+        if(ConfirmPower(L"Restart your computer now?",L"Restart")){DLOG(L"menu: Restart");EnableShutdownPrivilege();if(!ExitWindowsEx(EWX_REBOOT,reason))fail(L"Restart");}
+        return true;
+    case kCmdShutDown:
+        if(ConfirmPower(L"Shut down your computer now?",L"Shut Down")){DLOG(L"menu: Shut Down");EnableShutdownPrivilege();if(!ExitWindowsEx(EWX_SHUTDOWN|EWX_POWEROFF|EWX_HYBRID_SHUTDOWN,reason))fail(L"Shut Down");}
+        return true;
+    case kCmdLock:
+        DLOG(L"menu: Lock Screen");if(!LockWorkStation())fail(L"Lock Screen");return true;
+    case kCmdSignOut:
+        if(ConfirmPower(L"Sign out of Windows now?",L"Sign Out")){DLOG(L"menu: Sign Out");if(!ExitWindowsEx(EWX_LOGOFF,reason))fail(L"Sign Out");}
+        return true;
+    }
+    return false;
+}
 std::vector<liquid::menu::MenuItem> CustomizeItems();bool HandleCustomize(UINT id);void TogglePanel(HWND h,int selected);constexpr UINT kCmdWidgetsId=0xE6F1;
 void TogglePopup(HWND h,int selected) {
     if(popup){const bool same=activeMenu==selected;ClosePopup();if(same)return;}
     if(selected<0||static_cast<size_t>(selected)>=menus.menus.size()||static_cast<size_t>(selected)>=headings.size())return;
     openMenu=menus.menus[selected];activeMenu=selected;hoverTime=GetTickCount64();RECT r{};GetWindowRect(h,&r);
-    if(openMenu.source==liquid::menu::ProviderKind::Internal){  // before the Quit separator
-        using liquid::menu::ItemKind;auto at=openMenu.items.end();for(auto i=openMenu.items.begin();i!=openMenu.items.end();++i)if(i->kind==ItemKind::Separator)at=i;
+    if(openMenu.source==liquid::menu::ProviderKind::Internal){  // right after Settings (above the power commands)
+        using liquid::menu::ItemKind;auto at=openMenu.items.end();for(auto i=openMenu.items.begin();i!=openMenu.items.end();++i)if(i->commandId==0xF0F2){at=i+1;break;}
         std::vector<liquid::menu::MenuItem> extra;extra.push_back({L"Menu Bar Items",ItemKind::Submenu,true,false,CustomizeItems()});
         if(docky::ext::FindDesktopHost())extra.push_back({L"Edit Desktop Widgets…",ItemKind::Command,true,false,{},kCmdWidgetsId});
         openMenu.items.insert(at,extra.begin(),extra.end());}
     POINT anchor{r.left+headings[selected].left,r.bottom};const auto target=openMenu;
     popup=liquid::popup::Show(h,anchor,openMenu.items,[target](const liquid::menu::MenuItem& item){
-        if(target.source==liquid::menu::ProviderKind::Internal){if(item.commandId==0xF0F1)RequestUnifiedQuit();else if(item.commandId==0xF0F2)RequestSettings();else HandleCustomize(item.commandId);return;}
+        if(target.source==liquid::menu::ProviderKind::Internal){if(item.commandId==0xF0F1)RequestUnifiedQuit();else if(item.commandId==0xF0F2)RequestSettings();else if(!SystemPowerCommand(item.commandId))HandleCustomize(item.commandId);return;}
         const bool queued=liquid::menu::DispatchNativeCommand(target,item);DLOG(L"menu: native command queued=%d id=%u",queued,item.commandId);
     },[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
@@ -1648,9 +1719,8 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(w==kHostsRetryTimer){if(StartHosts(h))KillTimer(h,kHostsRetryTimer);return 0;}
         if(w==kInputTimer){const HKL now=ForegroundLayout();if(now!=inputLayout){inputLayout=now;if(extrasConfig.input)Render(h);}return 0;}
         if(w==kTrayTimer){KillTimer(h,kTrayTimer);trayIcons=docky::tray::Get().Snapshot();extraImages.clear();Render(h);return 0;}
-        if(w==kFullscreenGrowTimer){KillTimer(h,kFullscreenGrowTimer);GrowFullscreen();return 0;}
         if(w==kUnsnapTimer){KillTimer(h,kUnsnapTimer);UnsnapPending();return 0;}
-        if(w==kFullscreenTimer){MaintainButtonFullscreen();
+        if(w==kFullscreenTimer){MaintainButtonFullscreen();if(fullscreenApp)GrowFullscreen();
             {const bool listed=!menuGameWatch.Poll(themeSettingsPath,gameCompatibility).empty();if(listed!=listedGameMenu){listedGameMenu=listed;DLOG(L"menu: games list %ls",listed?L"program running: bar hidden":L"no listed program running");}}
             SetFullscreenApp(h,FullscreenForeground()||listedGameMenu);SyncGameCompatibility(h);
             if(gameSuppressed){DropRawMouse();return 0;}

@@ -2,7 +2,7 @@
 <meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'unsafe-inline'; connect-src wss://dockdrop-signal.dockdrop-signal.workers.dev">
 <script type="module">
-  import { pair } from './pair.js';
+  import { pair, listenDoorbell, DOORBELL_CAPABILITY } from './pair.js';
   import { SIGNAL_URL } from './config.js';
   import { encode } from './bubble-code.js';
   import { qrEncode } from './qr.js';
@@ -65,7 +65,18 @@
     if (data === 'trust-refresh') discovery?.abort();
   });
 
-  function offerRemembering(connection, computer) {
+  // A phone that can knock (capability) gets this computer's doorbell; once it confirms, the computer stops keeping a
+  // room open for it and waits for its knock instead (trust-knock).
+  function offerDoorbell(connection, phoneId, doorbell) {
+    const {channel, peerCapabilities} = connection;
+    if (!doorbell || !peerCapabilities?.includes(DOORBELL_CAPABILITY) || channel.readyState !== 'open') return;
+    channel.addEventListener('message', ({data}) => {
+      if (data === 'dockdrop-doorbell:ok') writeToComputer('trust-knock:' + phoneId).catch(() => {});
+    });
+    channel.send('dockdrop-doorbell:' + doorbell);
+  }
+
+  function offerRemembering(connection, computer, doorbell) {
     const {channel, peerName} = connection;
     let enrolled = false;
     channel.addEventListener('message', async ({data}) => {
@@ -77,13 +88,16 @@
         await writeToComputer('trust-add:' + phone.id + ':' + phone.secret + ':' + phone.name);
         if (channel.readyState === 'open')
           channel.send('dockdrop-remember:ok:' + JSON.stringify({id: phone.id, secret: phone.secret, name: computer}));
+        offerDoorbell(connection, phone.id, doorbell);
       } catch {
         if (channel.readyState === 'open') channel.send('dockdrop-remember:error');
       }
     });
   }
 
-  async function listen(phone, computer, signal) {
+  // `answer`: one short attempt for a phone that just knocked (it is already waiting in its room).
+  async function listen(phone, computer, signal, answer = false) {
+    let failures = 0;  // consecutive failures other than a normal wait timeout
     while (!signal.aborted) {
       const secret = phone?.secret || secretHex(8);
       const cells = phone ? null : encode({ version: 1, flags: 1, secret: BigInt('0x' + secret) }).flat().join('');
@@ -93,7 +107,9 @@
         return await pair({
           signalUrl: SIGNAL_URL, secret, role: 'host', name: computer,
           remembered: Boolean(phone), capabilities: [CAPABILITY],
-          timeoutMs: 60000, peerWaitMs: 0, signal,
+          // Waiting in a room is free for the relay (WebSocket hibernation); every new connection is not. So each
+          // connection waits long: 30 min for a remembered phone, 5 min for the QR code (its secret then changes).
+          timeoutMs: answer ? 45000 : phone ? 30 * 60000 : 5 * 60000, peerWaitMs: 0, keepAliveMs: 45000, signal,
           onStatus(text) {
             if (phone || signal.aborted) return;
             if (!shown && text === '正在等待手机…') {
@@ -105,12 +121,16 @@
           },
         });
       } catch (error) {
-        if (signal.aborted) return;
+        if (signal.aborted || answer) return null;
+        const timedOut = error.message === 'timeout';
+        failures = timedOut ? 0 : failures + 1;
         if (!phone) {
           send('clear');
-          if (error.message !== 'timeout') send('status:连接中断，正在重试…');
+          // The relay refusing every room (e.g. its daily quota is used up) used to show "Reconnecting..." for hours:
+          // after three failures in a row say the service is unavailable, and back off up to 30 s between attempts.
+          if (!timedOut) send(failures >= 3 ? 'status:配对服务暂时不可用，稍后自动重试…' : 'status:连接中断，正在重试…');
         }
-        await wait(error.message === 'timeout' ? 25 : 1800);
+        await wait(timedOut ? 25 : Math.min(30000, 1800 * 2 ** Math.max(0, failures - 1)));
       }
     }
   }
@@ -122,16 +142,34 @@
       const controller = new AbortController();
       discovery = controller;
       let winner = null;
-      await Promise.race([null, ...settings.phones].map(async (phone) => {
-        const connection = await listen(phone, computer, controller.signal);
-        if (!connection) return;
-        if (winner || controller.signal.aborted) {
-          connection.pc.close();
-          return;
+      // Rooms held open: the QR code only while the phone page is on screen (settings.visible), each remembered phone
+      // that cannot knock yet, and one doorbell for all phones that can. A change arrives as 'trust-refresh', which
+      // aborts this round and reads the list again.
+      await new Promise((resolve) => {
+        controller.signal.addEventListener('abort', resolve, {once: true});
+        const start = (phone, answer = false) => listen(phone, computer, controller.signal, answer).then((connection) => {
+          if (!connection) return;
+          if (winner || controller.signal.aborted) { connection.pc.close(); return; }
+          winner = {connection, phone};
+          controller.abort();
+        });
+        if (settings.visible === false) send('clear');
+        else start(null);
+        for (const phone of settings.phones) if (!phone.knock) start(phone);
+        const knocking = settings.phones.filter((phone) => phone.knock);
+        if (knocking.length && settings.doorbell) {
+          const answering = new Set();
+          listenDoorbell({
+            signalUrl: SIGNAL_URL, doorbell: settings.doorbell, signal: controller.signal,
+            onKnock(id) {
+              const phone = knocking.find((item) => item.id === id);
+              if (!phone || answering.has(id)) return;  // unknown or removed phones are ignored
+              answering.add(id);
+              start(phone, true).finally(() => answering.delete(id));
+            },
+          }).catch(() => {});
         }
-        winner = {connection, phone};
-        controller.abort();
-      }));
+      });
       controller.abort();
       discovery = null;
       if (!winner) continue;
@@ -139,7 +177,8 @@
       if (phone) {
         try { await writeToComputer('trust-check:' + phone.id); }
         catch { connection.pc.close(); continue; }
-      } else offerRemembering(connection, computer);
+        if (!phone.knock) offerDoorbell(connection, phone.id, settings.doorbell);  // phones remembered before the doorbell
+      } else offerRemembering(connection, computer, settings.doorbell);
       window.dockdropLink = connection;
       send(phone ? 'paired:' + phone.id : 'paired');
       serveTransfer(connection.channel, {

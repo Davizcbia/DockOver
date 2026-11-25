@@ -27,6 +27,9 @@ public:
  bool Resize(UINT width,UINT height,float dpi);
  // gridColumns > 0 draws `rows` as a grid with `footer` below (dock::kMenuGrid* layout).
  bool Draw(const std::vector<dock::MenuRowVisual>& rows,int gridColumns=0,const std::wstring& footer={});
+ // The same menu glass (Glass Studio "Menu" category) with caller-drawn content in DIPs instead of rows, and the
+ // plate's corner radius in DIPs (the window preview: a larger panel than a menu, its cards drawn concentric to it).
+ bool DrawCustom(float radius,const std::function<void(ID2D1DeviceContext*,bool)>& content);
  bool Capture();
  bool Complete();
  bool CheckHealth();
@@ -42,6 +45,8 @@ public:
  bool UsedGpu() const{return renderer_.LastUsedGpu();}
  std::uint64_t ContentVersion();
 private:
+ bool Render(const std::vector<dock::MenuRowVisual>& rows,int gridColumns,const std::wstring& footer,float radius,
+             const std::function<void(ID2D1DeviceContext*,bool)>* content);
  HWND window_=nullptr;UINT width_=0,height_=0;float dpi_=96;
  bool captureDisabled_=false;float materialize_=1.f;bool backdropSeen_=false;
  ULONGLONG startedAt_=0;  // Start(): the static (wallpaper-only) fallback waits a moment for the live capture

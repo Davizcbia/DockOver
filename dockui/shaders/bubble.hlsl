@@ -28,9 +28,10 @@ cbuffer Constants : register(b0) {
     float4 mouseFronts;                                               // distance travelled on the sphere (chord units)
     float4 waterDrops[16];                                           // xy: position in ball units, z: radius, w: opacity
     float splashCount; float sinkAge; float finishAge; float fileCount;
-    uint4 qrBits[47];
-    uint qrSize; float rimProgress; float rimOpacity; float qrPad;
-    float4 pcPeers[5];  // screen position, radius, opacity
+    uint poolActive; float rimProgress; float rimOpacity; float poolDepth;
+    float4 pcPeers[7];  // screen position, radius, opacity
+    float4 deviceStyle; // preview, clip device rail, phone glass frame, spare
+    float4 deviceClip;  // window-local device viewport
 };
 Texture2D bgTex : register(t0);
 SamplerState samp : register(s0);
@@ -108,7 +109,7 @@ float surfaceDisturbance(float3 n) {
 // While a code is shown, calm the broad motion to keep the rim steady.
 static float peerClockOffset = 0;
 float H(float3 n) {
-    const bool calm = qrSize != 0 || codeMode > 3.5 || (codeMode > 0.5 && codeMode < 1.5);
+    const bool calm = poolActive != 0 || codeMode > 3.5 || (codeMode > 0.5 && codeMode < 1.5);
     const float wobble = calm ? lerp(0.25, 1.0, smoothstep(0.0, 0.74, successAge)) : 1.0;
     return lowModes(n, time + peerClockOffset) * wobble
         + ripples(n, time + peerClockOffset) + surfaceDisturbance(n);
@@ -332,7 +333,7 @@ float4 ShadeBall(float2 px, float2 ballCenter, float ballRadius, bool drawBackdr
     // Transfer progress is the ball's own soap film spreading round the rim clockwise from twelve o'clock. Angle and
     // rim band come from the hit point and its normal, so the band follows the wobble and ripples of the surface.
     float spread = 0, meniscus = 0, flow = 0, active = 0;
-    if (rimProgress > 0 && rimOpacity > 0 && qrSize == 0 && codeMode < 0.5) {
+    if (rimProgress > 0 && rimOpacity > 0 && poolActive == 0 && codeMode < 0.5) {
         const float turn = frac(atan2(p.x, -p.y) / (2 * PI) + 1);
         const float rim = smoothstep(0.42, 0.90, 1 - cosI);
         active = rimOpacity * smoothstep(0.0, 0.06, rimProgress);   // ease the ambient rim out as a transfer starts
@@ -426,8 +427,17 @@ float checkStroke(float2 p, float2 start, float2 end, float progress) {
     return (1.0 - smoothstep(0.026, 0.026 + 1.3 / radius, length(p - start - x * segment))) * step(0.001, progress);
 }
 
+Texture2D PairingGlassFrame : register(t2);
+
 float4 panelEdge(float4 color, float2 px) {
     if (phonePanel < 0.5) return color;
+    if (deviceStyle.z > 0.5) {
+        const float2 edge = min(px, targetSize - px);
+        const float mixToInterior = smoothstep(18.0 * dpi, 49.0 * dpi, min(edge.x, edge.y));
+        if (mixToInterior < 1.0)
+            return lerp(PairingGlassFrame.Load(int3(int2(px), 0)), color, mixToInterior);
+        return color;
+    }
     const float corner = 38.0 * dpi;
     const float2 q = abs(px - targetSize * 0.5) - (targetSize * 0.5 - corner);
     const float2 u = max(q / corner, 0.0);
@@ -458,57 +468,102 @@ float4 FinishTransfer(float4 color, float2 uv) {
 
 float4 PSPcPairing(VSOut input) : SV_Target {
     const float2 px = input.pos.xy;
-    float3 result = bgAt(px, 0);
+    const bool preview = deviceStyle.x > 0.5;
+    float4 base = preview ? PairingGlassFrame.Load(int3(int2(px), 0)) : float4(bgAt(px, 0), 1);
+    float3 result = base.rgb;
     float3 normal;
     float distance;
     const float2 uv = (px - center) / radius;
     const float mainDistance = length(uv);
+    float2 samplePx = px;
+    // Pull the two facing surfaces into a common neck as they touch.
+    if (deviceStyle.w > 0 && deviceStyle.w < 1) {
+        [unroll] for (int j = 0; j < 7; ++j) {
+            const float4 drop = pcPeers[j];
+            if (drop.w <= 0 || drop.z < 1) continue;
+            const float a = (mainDistance - 1) * radius;
+            const float b = length(px-drop.xy) - drop.z;
+            const float width = drop.z * 0.95;
+            const float band = saturate(1 - abs(a-b)/width);
+            const float pull = width * 0.25 * band * band * drop.w;
+            const float2 delta = px - (a < b ? center : drop.xy);
+            samplePx -= delta / max(length(delta), 1) * pull;
+        }
+    }
     float4 selected = float4(center, radius, 1);
     int selectedIndex = 0;
-    [unroll] for (int i = 0; i < 5; ++i) {
+    const bool peersVisible = deviceStyle.y < 0.5 || (all(px >= deviceClip.xy) && all(px < deviceClip.zw));
+    [unroll] for (int i = 0; i < 7; ++i) {
         const float4 peer = pcPeers[i];
-        if (mainDistance >= 1.0 && peer.w > 0 && length(px - peer.xy) < peer.z * 1.16) {
+        if ((peersVisible || i == 0) && length(samplePx-center) >= radius && peer.w > 0 && length(samplePx - peer.xy) < peer.z * 1.16) {
             selected = peer;
             selectedIndex = i + 1;
         }
     }
     if (selectedIndex > 0)
         peerClockOffset = selectedIndex*13.17 + time*(0.16*sin(selectedIndex*7.91));
-    [branch] if (length(px - selected.xy) <= selected.z * 1.16) {
-        float4 ball = ShadeBall(px, selected.xy, selected.z, false, normal, distance);
+    [branch] if (length(samplePx - selected.xy) <= selected.z * 1.16) {
+        float4 ball = ShadeBall(samplePx, selected.xy, selected.z, false, normal, distance);
         if (selectedIndex == 0) ball = FinishTransfer(ball, uv);
         // Absorb the overlapping part into the main surface.
         const float contact = selectedIndex == 0 ? 1.0 : selected.w * smoothstep(0.86, 1.01, mainDistance);
         result = result * (1.0 - ball.a * contact) + ball.rgb * contact;
     }
+    if (preview) return DitherBgra8(float4(result, base.a), px);
     return DitherBgra8(panelEdge(float4(result, 1), px), px);
 }
 
 
-float3 glassCode(float3 glass, float2 px) {
-    // Flat sampling keeps phone cameras compatible. The four-module quiet
-    // zone stays clear while all the surrounding reflection remains on the ball.
-    const float modulePx = max(1.0, floor(radius * 1.24 / (qrSize + 8)));
-    const float side = qrSize * modulePx;
-    const float2 origin = floor(center - side * 0.5);
-    const float2 codePixel = px - origin;
-    const float2 local = codePixel - side * 0.5;
-    const float quietRadius = (side * 0.5 + modulePx * 4.05) * 1.414214;
-    const float spread = min(radius * 0.99, quietRadius + modulePx * 6.0);
-    const float d = length(local);
-    if (d >= spread) return glass;
-    const float coverage = 1.0 - smoothstep(quietRadius, spread, d);
-    const float3 frost = float3(0.80, 0.89, 0.92);
-    float3 face = lerp(glass, frost, 0.83);
-    if (all(codePixel >= 0.0) && all(codePixel < side)) {
-        const uint2 cell = (uint2)floor(codePixel / modulePx);
-        const uint bit = cell.y * qrSize + cell.x;
-        const uint word = qrBits[bit >> 7][(bit >> 5) & 3];
-        if (((word >> (bit & 31)) & 1u) != 0u) {
-            face = lerp(float3(0.045, 0.085, 0.117), glass * 0.43, 0.20);
-        }
-    }
-    return lerp(glass, face, coverage);
+// Top view into a round pool. The lip is fixed; the meniscus travels down
+// an inward-sloping wall while the fixed floor loses its refractive magnification.
+float3 poolCode(float3 glass, float2 px) {
+    const float2 uv = (px - center) / radius;
+    const float r = length(uv);
+    if (r >= 1.25) return glass;
+    const float depth = poolDepth;
+    const float moving = 4.0 * depth * (1.0 - depth);
+    // The curved wall grows steeper near the lip. Its contact line lingers
+    // at the start, then picks up lateral speed as it approaches the floor.
+    const float wetRadius = 0.989 * sqrt(saturate(1.0-depth));
+    const float2 dir = uv / max(r, 0.001);
+    const float wave = moving * (0.012 * sin(3.0 * dir.x + depth * 7) +
+                                 0.007 * cos(5.0 * dir.y - depth * 8));
+    const float meniscus = r - wetRadius - wave;
+    const float wet = (1.0 - smoothstep(-0.012, 0.012, meniscus)) * (1.0-smoothstep(0.996,1.0,depth));
+    // A single low wave runs inwards from the wall; its slope bends the
+    // submerged pattern and sends a narrow caustic across the pool floor.
+    const float crestDistance = r - (1.08 - depth * 1.32) - wave;
+    const float packet = exp(-22.0 * crestDistance * crestDistance);
+    const float slope = packet * sin(23.0 * crestDistance);
+    const float2 refracted = uv * (1.0 - 0.14 * (1.0-depth) * wet)
+        + moving * wet * (0.036 * slope * dir + 0.008 * float2(sin(8*uv.y+6*depth), cos(9*uv.x-5*depth)));
+    float region;
+    const float pattern = codeSoft(refracted / 0.79, region);
+    const float light = saturate(0.65 - dot(uv,float2(0.45,0.55)));
+    const float3 slate = lerp(float3(0.025,0.074,0.10), float3(0.095,0.175,0.21), light);
+    const float3 silver = lerp(float3(0.69,0.84,0.89), float3(0.98,1,1), light);
+    float3 floorColor = lerp(slate, silver, saturate(pattern * 0.5 + 0.5) * region);
+    if (r < 0.23) floorColor += float3(0.025,0.043,0.052) * light * (1.0-smoothstep(0.16,0.23,r));
+    const float wall = smoothstep(0.85,0.97,r);
+    floorColor = lerp(floorColor, slate * (0.52 + light), wall);
+    const float lip = exp(-abs(r-0.967)*210.0);
+    floorColor += lip * light * 0.30;
+    const float edge = 1.0-smoothstep(0.989,0.989+1.25/radius,r);
+    floorColor = lerp(bgAt(px,0), floorColor, edge);
+    // The shallow shelf clears first. Deeper water keeps reflecting the
+    // surface while the outer wall and the floor are already visible.
+    const float shelf = smoothstep(0.36,0.95,r);
+    const float submergedClarity = smoothstep(0.22-0.21*shelf, 0.96-0.32*shelf, depth);
+    const float exposed = smoothstep(0.0,0.22,depth) * (1.0-wet);
+    float3 result = lerp(glass, floorColor, lerp(submergedClarity,1.0,exposed));
+    const float key = saturate(0.38 - 0.62 * dot(dir,float2(0.58,0.81)));
+    const float contact = exp(-abs(meniscus)*145.0);
+    const float wallShadow = exp(-abs(meniscus-0.026)*36.0);
+    const float caustic = packet * pow(saturate(cos(23.0*crestDistance)), 6.0);
+    result *= 1.0 - moving * edge * wet * wallShadow * 0.34;
+    result += edge * moving * float3(0.60,0.85,0.95) *
+        wet * (contact*(0.14+0.68*key) + caustic*(0.025+0.13*key));
+    return result;
 }
 
 float4 finishPixel(float4 color, float2 px) {
@@ -532,7 +587,7 @@ float4 finishPixel(float4 color, float2 px) {
             color.rgb = lerp(color.rgb, saturate(water), coverage * drop.w);
         }
     }
-    if (qrSize != 0) color.rgb = glassCode(color.rgb, px);
+    if (poolActive != 0) color.rgb = poolCode(color.rgb, px);
     return panelEdge(color, px);
 }
 
@@ -542,9 +597,12 @@ float4 PSBubble(VSOut i) : SV_Target {
     float3 n;
     float frontDistance;
     const float rho = length(uv);
+    // At the dry endpoint use only the rigid bowl, even around its silhouette.
+    if (poolActive != 0 && poolDepth >= 1.0)
+        return panelEdge(float4(poolCode(bgAt(px,0), px),1),px);
     float4 c = ShadeBall(px, center, radius, opaque > 0.5, n, frontDistance);
     // The camera samples the first radial band at 0.38 radii.
-    if (qrSize == 0 && fileCount > 0 && sinkAge >= 0 && sinkAge < 1.45 &&
+    if (poolActive == 0 && fileCount > 0 && sinkAge >= 0 && sinkAge < 1.45 &&
         reducedMotion < 0.5 && rho < 0.32 && successAge <= 0) {
         [unroll] for (int j = 0; j < 4; ++j) {
             if (j >= fileCount) break;
@@ -576,7 +634,7 @@ float4 PSBubble(VSOut i) : SV_Target {
     }
     if (codeMode < 0.5) {
         const float4 result = finishPixel(c, px);
-        return qrSize == 0 ? DitherBgra8(result, px) : result;
+        return poolActive == 0 ? DitherBgra8(result, px) : result;
     }
     if (dot(uv, uv) > 1.2 * 1.2) return panelEdge(c, px);
     if (c.a < 1) c = float4(lerp(bgAt(px, 0), c.a > 0 ? c.rgb / c.a : 0, c.a), 1);   // the code needs the quiet zone: opaque

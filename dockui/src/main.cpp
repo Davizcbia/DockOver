@@ -313,7 +313,6 @@ private:
     // Bar (always registered) with kDockFullscreenMsg.
     static constexpr UINT kDockFullscreenMsg = WM_APP + 79;
     bool fullscreenApp_ = false;
-    bool fullscreenRelease_ = false;  // the maximize-button full screen is on this monitor: the Dock's reserved space is given back
     bool gameSuppressed_ = false;
     // A full-screen app makes the Dock auto-hide (macOS): hidden, revealed over the app by moving to the bottom edge,
     // without changing the work area or the app's size.
@@ -1192,7 +1191,6 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case kDockFullscreenMsg:
         SetFullscreenApp(wp != 0);
-        if (fullscreenRelease_ != (wp == 2)) { fullscreenRelease_ = wp == 2; UpdateDockAppBar(); }
         menuBarGame_ = lp != 0;  // the Menu Bar's full-screen game detection
         SetGameSuppressed(menuBarGame_ || listedGame_);
         return 0;
@@ -2259,7 +2257,7 @@ void App::ApplyGameMode() {
 }
 
 void App::UpdateDockAppBar() {
-    const bool want = hwnd_ && !autoHide_ && dockAppBarEnabled_ && !fullscreenRelease_;
+    const bool want = hwnd_ && !autoHide_ && dockAppBarEnabled_;
     if (!want) {
         if (dockAppBar_) { APPBARDATA a{sizeof(a)}; a.hWnd = hwnd_; SHAppBarMessage(ABM_REMOVE, &a); dockAppBar_ = false; dockAppBarRect_ = {}; DLOG(L"dock: appbar removed"); }
         return;
@@ -2772,7 +2770,8 @@ void App::TickWindowPreview() {
                       x + static_cast<LONG>((g.left + g.width) * scale_), y + static_cast<LONG>((g.restTop + g.size) * scale_)};
     const size_t count = windows.size();
     if (!windowPreview_.Show(hwnd_, kActivatePreview, anchor, static_cast<UINT>(dpi_),
-                             liquid::theme::IsDark(appearanceMode_, systemDark_), item->label, std::move(windows))) {
+                             liquid::theme::IsDark(appearanceMode_, systemDark_), item->label, std::move(windows),
+                             item->pixels, item->iconW, item->iconH)) {
         DismissWindowPreview();
         return;
     }
@@ -3075,7 +3074,7 @@ void App::OnRButtonUp(float x, float y) {
     }
     AppendMenuW(menu, MF_STRING, kMenuApplications, docky::ui::Text(L"Applications…"));
 #ifdef DOCKY_PHONE_PAIRING
-    AppendMenuW(menu, MF_STRING, kMenuPairPhone, docky::ui::Text(L"Pair a phone…"));
+    AppendMenuW(menu, MF_STRING, kMenuPairPhone, L"DockDrop…");
 #endif
     AppendMenuW(menu, MF_STRING, kMenuTaskManager, docky::ui::Text(L"Task Manager"));
     AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
@@ -3121,7 +3120,7 @@ void App::OnRButtonUp(float x, float y) {
     if (cmd == kMenuPairPhone) {
         if (!pairingExecutable.empty()) {
             const auto result = reinterpret_cast<INT_PTR>(
-                ShellExecuteW(hwnd_, L"open", pairingExecutable.c_str(), L"--pair-phone", nullptr, SW_SHOWNORMAL));
+                ShellExecuteW(hwnd_, L"open", pairingExecutable.c_str(), L"--discover", nullptr, SW_SHOWNORMAL));
             if (result > 32) return;
         }
         MessageBoxW(hwnd_, L"Could not start phone pairing. Check that DockOver is fully installed.", L"DockOver", MB_OK | MB_ICONWARNING);

@@ -56,6 +56,7 @@ foreach ($p in $programs) {
     if (-not (Test-Path -LiteralPath $from)) { throw "$p is missing from $BuildDir." }
     Copy-Item -LiteralPath $from -Destination $programDir
 }
+Copy-Item (Join-Path $BuildDir 'dockdrop-pc') -Destination (Join-Path $programDir 'dockdrop-pc') -Recurse
 $appsDir = Join-Path $BuildDir 'applications-menu'
 if (-not (Test-Path (Join-Path $appsDir 'DockOverApplications.exe'))) { throw 'Applications menu is missing. Rebuild DockOver.' }
 Copy-Item -LiteralPath $appsDir -Destination (Join-Path $programDir 'applications-menu') -Recurse
