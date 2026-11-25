@@ -4,6 +4,8 @@
 
 <h1 align="center">DockOver</h1>
 
+<p align="center">简体中文 · <a href="README.en.md">English</a></p>
+
 <p align="center">
   <b>Windows 11 上的 macOS 风格桌面：Dock、菜单栏、控制中心、Launchpad 和桌面小组件，全部是实时液态玻璃。</b><br>
   A macOS-style desktop for Windows 11 — Dock, menu bar, Control Center, Launchpad and widgets in live Liquid Glass.
@@ -29,7 +31,7 @@
 
 ![DockOver on Windows 11](docs/screenshots/overview.jpg)
 
-<p align="center"><sub>截图均来自演示环境：Windows 默认壁纸、Windows 自带应用和示例数据。</sub></p>
+<p align="center"><sub>截图使用 Windows 默认壁纸、系统应用和示例数据。 Screenshots use Windows wallpaper, built-in apps, and sample data.</sub></p>
 
 [1.1.0 更新说明](docs/releases/1.1.0.md) · [DockDrop 独立版](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player 独立版](https://github.com/Davizcbia/DockOver-Music-Player)
 
@@ -91,6 +93,10 @@
 
 ![Music settings](docs/screenshots/settings-music.jpg)
 
+## DockDrop
+
+从 Dock 右键菜单打开 DockDrop。手机用浏览器扫描配对光泡或备用二维码，即可双向传输文件和文字。首次配对后可记住手机，下次直接连接。DockOver Desktop 的暂存小组件支持拖入文件和粘贴文字。 [DockDrop 独立版](https://github.com/Davizcbia/DockDrop)
+
 ## 设置
 
 所有选项都在一个 macOS 风格的设置窗口里，支持搜索。
@@ -108,7 +114,8 @@
 
 1. 从 [Releases](https://github.com/Davizcbia/DockOver/releases/latest) 下载 `DockOver-Windows-Portable-<版本>.zip`。
 2. 解压到任意文件夹，运行 `DockOver.exe`。
-3. 再次运行 `DockOver.exe` 会打开设置。小组件和叠放由 `DockOver Desktop.exe` 提供，默认随 Dock 一起启动。
+3. 再次运行 `DockOver.exe` 会打开设置。运行 `DockOver Desktop.exe` 可打开小组件与叠放，也可以在「设置 → 通用」中启用随 DockOver 启动。
+4. 在「设置 → 外观 → 语言」选择简体中文或 English。
 
 便携版不需要安装运行库。设置、日志和用户数据保存在 `%LOCALAPPDATA%`，不写入程序文件夹。退出 DockOver 时会恢复 Windows 任务栏。
 
