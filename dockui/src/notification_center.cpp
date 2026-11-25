@@ -1,4 +1,5 @@
 #include "notification_center.h"
+#include "color_output.h"
 #include "ui_language.h"
 #include "notification_card_metrics.h"
 
@@ -583,7 +584,8 @@ public:
         if (glass_) glass_->ReleaseGpuResources();
         glass_.reset();
         if (dc_) dc_->SetTarget(nullptr);
-        target_.Reset(); rtv_.Reset(); visual_.Reset(); dcompTarget_.Reset(); dcomp_.Reset(); dc_.Reset(); swap_.Reset();
+        target_.Reset(); rtv_.Reset(); outputRtv_.Reset(); colors_ = {};
+        floatingScene_ = scRgb_ = false; visual_.Reset(); dcompTarget_.Reset(); dcomp_.Reset(); dc_.Reset(); swap_.Reset();
         if (waitable_) { CloseHandle(waitable_); waitable_ = nullptr; }
         if (hwnd) { HWND h = hwnd; hwnd = nullptr; SetWindowLongPtrW(h, GWLP_USERDATA, 0); DestroyWindow(h); }
         icons_.clear();
@@ -641,6 +643,7 @@ protected:
         dc_->SetTransform(D2D1::Matrix3x2F::Identity());
         dc_->EndDraw();
         if (!snapshotPath_.empty()) { SaveSnapshot(snapshotPath_); snapshotPath_.clear(); }
+        if (floatingScene_ && !colors_.Resolve(outputRtv_.Get(), scRgb_ ? colors_.WhiteForWindow(hwnd) : 0.f)) return;
         swap_->Present(1, 0);
     }
     // Development (LIQUID_NOTIFY_SNAPSHOT): the next frame's own pixels (premultiplied BGRA) as a PNG, so the panel can
@@ -648,7 +651,9 @@ protected:
     std::wstring snapshotPath_;
     void SaveSnapshot(const std::wstring& path) {
         ComPtr<ID3D11Texture2D> back, staging;
-        if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
+        if (floatingScene_) back = colors_.SdrSnapshot();
+        else if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
+        if (!back) return;
         D3D11_TEXTURE2D_DESC d{};
         back->GetDesc(&d);
         d.Usage = D3D11_USAGE_STAGING; d.BindFlags = 0; d.CPUAccessFlags = D3D11_CPU_ACCESS_READ; d.MiscFlags = 0;
@@ -774,13 +779,29 @@ private:
         sd.BufferCount = 2;
         sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        if (FAILED(hr = f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_))) return hr;
         ComPtr<ID2D1Factory1> factory;
         D2D1_FACTORY_OPTIONS fo{};
         if (FAILED(hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &fo, reinterpret_cast<void**>(factory.GetAddressOf())))) return hr;
         ComPtr<ID2D1Device> d2d;
         if (FAILED(hr = factory->CreateDevice(dxgi.Get(), &d2d))) return hr;
         if (FAILED(hr = d2d->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return hr;
+        floatingScene_ = colors_.Init(g.d3d.Get()) && colors_.Bind(dc_.Get(), pxW, pxH);
+        if (floatingScene_) {
+            sd.Format = docky::color::SceneFormat;
+            scRgb_ = SUCCEEDED(f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_)) &&
+                     docky::color::EnableScRgb(swap_.Get());
+        }
+        if (!scRgb_) {
+            swap_.Reset();
+            sd.Format = docky::color::SdrFormat;
+            if (FAILED(hr = f->CreateSwapChainForComposition(dxgi.Get(), &sd, nullptr, &swap_))) return hr;
+        }
+        if (floatingScene_ && dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+            D2D1_RENDERING_CONTROLS controls{};
+            dc_->GetRenderingControls(&controls);
+            controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+            dc_->SetRenderingControls(&controls);
+        }
         if (FAILED(hr = ResizeTarget())) return hr;
         if (FAILED(hr = DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&dcomp_)))) return hr;
         if (FAILED(hr = dcomp_->CreateTargetForHwnd(hwnd, TRUE, &dcompTarget_))) return hr;
@@ -800,6 +821,7 @@ private:
         dc_->SetTarget(nullptr);
         target_.Reset();
         rtv_.Reset();
+        outputRtv_.Reset();
         HRESULT hr = S_OK;
         DXGI_SWAP_CHAIN_DESC1 d{};
         swap_->GetDesc1(&d);
@@ -808,22 +830,32 @@ private:
             g.ctx->Flush();
             if (FAILED(hr = swap_->ResizeBuffers(2, pxW, pxH, DXGI_FORMAT_UNKNOWN, 0))) return hr;
         }
-        ComPtr<IDXGISurface> s;
-        if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&s)))) return hr;
-        const float dpi = 96.0f * scale;
-        const auto p = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                               D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
-        if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(s.Get(), &p, &target_))) return hr;
+        ComPtr<ID3D11Texture2D> buffer;
+        if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return hr;
+        const float dpi = 96.f * scale;
+        if (floatingScene_) {
+            if (!colors_.Bind(dc_.Get(), pxW, pxH)) return E_FAIL;
+            if (FAILED(hr = g.d3d->CreateRenderTargetView(buffer.Get(), nullptr, &outputRtv_))) return hr;
+            target_ = colors_.Bitmap();
+            buffer = colors_.Texture();
+        } else {
+            ComPtr<IDXGISurface> surface;
+            if (FAILED(hr = buffer.As(&surface))) return hr;
+            const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                D2D1::PixelFormat(docky::color::SdrFormat, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+            if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target_))) return hr;
+        }
         dc_->SetTarget(target_.Get());
         dc_->SetDpi(dpi, dpi);
-        ComPtr<ID3D11Texture2D> t;
-        swap_->GetBuffer(0, IID_PPV_ARGS(&t));
-        return g.d3d->CreateRenderTargetView(t.Get(), nullptr, &rtv_);
+        return g.d3d->CreateRenderTargetView(buffer.Get(), nullptr, &rtv_);
     }
 
     ComPtr<IDXGISwapChain1> swap_;
     HANDLE waitable_ = nullptr;
     ComPtr<ID3D11RenderTargetView> rtv_;
+    docky::color::ColorOutput colors_;
+    ComPtr<ID3D11RenderTargetView> outputRtv_;
+    bool floatingScene_ = false, scRgb_ = false;
     ComPtr<ID2D1Bitmap1> target_;
     ComPtr<IDCompositionDevice> dcomp_;
     ComPtr<IDCompositionTarget> dcompTarget_;

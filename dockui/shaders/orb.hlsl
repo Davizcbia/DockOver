@@ -1,3 +1,5 @@
+#include "quantize.hlsli"
+
 // DockDrop pairing orb (docky-orb): a Liquid Glass card with a GPU particle orb whose code rings carry the pairing
 // information (src/pairing/orb_code.h). Three passes into a premultiplied BGRA target:
 //   PSGlass     the card: the desktop behind it frosted (a coarse mip) and refracted at the rim, a dark tint, a specular
@@ -144,7 +146,8 @@ float4 PSGlass(VSOut i) : SV_Target {
     col += (Hash2(p + frac(time) * 61.0) - 0.5) * 0.012;  // film grain: the glass is a material, not a flat fill
     // card over its own shadow: coverage blends the two across the edge
     const float a = cover * appear;
-    return float4(pow(saturate(col), 1 / 2.2) * a, a + shadow * (1 - a));
+    const float4 result = float4(pow(saturate(col), 1 / 2.2) * a, a + shadow * (1 - a));
+    return codeMode < 0.5 ? DitherBgra8(result, p) : result;
 }
 
 // ---------------------------------------------------------------------------------------------------------------------

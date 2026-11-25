@@ -1,3 +1,5 @@
+#include "quantize.hlsli"
+
 // docky-bubble: the Optical Bubble's look (Phase 2, no code yet): a ball of clear liquid glass, ray traced per pixel.
 //
 // Model (ball units: radius 1, x right, y down, z away from the viewer; eye at z = -E, perspective):
@@ -464,7 +466,7 @@ float4 PSPcPairing(VSOut input) : SV_Target {
         const float contact = selectedIndex == 0 ? 1.0 : selected.w * smoothstep(0.86, 1.01, mainDistance);
         result = result * (1.0 - ball.a * contact) + ball.rgb * contact;
     }
-    return panelEdge(float4(result, 1), px);
+    return DitherBgra8(panelEdge(float4(result, 1), px), px);
 }
 
 
@@ -557,7 +559,10 @@ float4 PSBubble(VSOut i) : SV_Target {
         }
         return c;
     }
-    if (codeMode < 0.5) return finishPixel(c, px);
+    if (codeMode < 0.5) {
+        const float4 result = finishPixel(c, px);
+        return qrSize == 0 ? DitherBgra8(result, px) : result;
+    }
     if (dot(uv, uv) > 1.2 * 1.2) return panelEdge(c, px);
     if (c.a < 1) c = float4(lerp(bgAt(px, 0), c.a > 0 ? c.rgb / c.a : 0, c.a), 1);   // the code needs the quiet zone: opaque
     float region;

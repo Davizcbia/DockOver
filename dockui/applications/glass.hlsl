@@ -1,3 +1,5 @@
+#include "../shaders/quantize.hlsli"
+
 // Liquid Dock - Liquid Glass plate material (P0.3).
 // Written independently for the Dock from the effect requirements in
 // dockui/docs/p0.3-glass-lab-port.md (parameter names follow Glass Lab's JSON so presets transfer).
@@ -22,6 +24,7 @@ cbuffer GlassConstants : register(b0)
     float4 pointer;      // pointer x, y (window px), hover, press
     float4 interact;     // strength, radius (px), debug view, plate rotation (radians, clockwise on screen)
     float4 extra;        // body tone amount (1 = normal glass, 0 = pure blur), edge softness (px), unused, unused
+    float4 outputOptions; // x = final target already quantizes to 8 bits
 };
 
 Texture2D SharpTex : register(t0);
@@ -125,7 +128,8 @@ float4 PSMain(VSOut input) : SV_Target
         float sw = strokeLight.x * s;
         float edge = sw > 0.0 ? smoothstep(-sw - aa, -sw + aa, d) : 0.0;
         solid *= 1.0 - strokeLight.y * edge * (dark ? 1.0 : 0.5);
-        return float4(solid * coverage, coverage + outside) * opacity;
+        const float4 result = float4(solid * coverage, coverage + outside) * opacity;
+        return outputOptions.x > 0.5 ? DitherBgra8(result, input.pos.xy) : result;
     }
 
     // Surface normal from the SDF gradient; bevel band of width bevelWidth inside the outline.
@@ -234,5 +238,6 @@ float4 PSMain(VSOut input) : SV_Target
     else if (view == 5) col = clear;
     else if (view == 6) col = bodyMix;
 
-    return float4(saturate(col) * coverage, coverage + outside) * opacity;
+    const float4 result = float4(saturate(col) * coverage, coverage + outside) * opacity;
+    return outputOptions.x > 0.5 ? DitherBgra8(result, input.pos.xy) : result;
 }

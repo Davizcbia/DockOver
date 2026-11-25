@@ -103,6 +103,11 @@ private:
     Microsoft::WRL::ComPtr<ID3D11Fence> fence_;
     uint64_t fenceValue_ = 0;
     Microsoft::WRL::ComPtr<ID3D11ComputeShader> compareShader_;
+    Microsoft::WRL::ComPtr<ID3D11ComputeShader> normalizeShader_;
+    Microsoft::WRL::ComPtr<ID3D11Buffer> normalizeConstants_;
+    float captureWhite_ = 1.f;
+    ULONGLONG nextWhiteCheck_ = 0;
+    bool floatingCapture_ = false;
     Microsoft::WRL::ComPtr<ID3D11Buffer> result_, resultReadback_;
     Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> resultUav_;
     HANDLE gpuEvent_ = nullptr, retryTimer_ = nullptr;

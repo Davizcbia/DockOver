@@ -3,6 +3,10 @@
 #include "log.h"
 #include "vblank.h"
 #include "roi_compare_cs.h"
+#include "capture_normalize_cs.h"
+#include "color_output.h"
+#include "sdr_dither.h"
+#include <DirectXPackedVector.h>
 #include "desktop/duplication.h"
 #include "capture_visible.h"
 #include <windows.graphics.capture.interop.h>
@@ -224,8 +228,28 @@ bool WgcBackdropSource::Start(HMONITOR monitor, bool tryDuplication) {
         com_ptr<IInspectable> inspectable;
         check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(), inspectable.put()));
         runtimeDevice_ = inspectable.as<IDirect3DDevice>();
-        pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(runtimeDevice_,
+        UINT formatSupport = 0;
+        D3D11_BUFFER_DESC constants{};
+        constants.ByteWidth = 16;
+        constants.Usage = D3D11_USAGE_DYNAMIC;
+        constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        constants.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        floatingCapture_ = SUCCEEDED(device_->CheckFormatSupport(docky::color::SceneFormat, &formatSupport)) &&
+            (formatSupport & D3D11_FORMAT_SUPPORT_TYPED_UNORDERED_ACCESS_VIEW) &&
+            SUCCEEDED(device_->CreateComputeShader(g_CaptureNormalizeCS, sizeof(g_CaptureNormalizeCS), nullptr, &normalizeShader_)) &&
+            SUCCEEDED(device_->CreateBuffer(&constants, nullptr, &normalizeConstants_));
+        if (floatingCapture_) {
+            try {
+                pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(runtimeDevice_,
+                    DirectXPixelFormat::R16G16B16A16Float, 3, item_.Size());
+            } catch (const hresult_error&) {
+                floatingCapture_ = false;
+            }
+        }
+        if (!floatingCapture_) pool_ = Direct3D11CaptureFramePool::CreateFreeThreaded(runtimeDevice_,
             DirectXPixelFormat::B8G8R8A8UIntNormalized, 3, item_.Size());
+        nextWhiteCheck_ = 0;
+        DLOG(L"wgc colour: %ls capture", floatingCapture_ ? L"FP16 scRGB" : L"BGRA8 SDR");
         pending_ = std::make_shared<Pending>();
         pending_->notify = hwnd_;
         pending_->suppressFrames = testFault_ == L"timeout";
@@ -359,6 +383,9 @@ void WgcBackdropSource::Stop() {
     if (retryTimer_) CancelWaitableTimer(retryTimer_);
     if (gpuEvent_) ResetEvent(gpuEvent_);
     candidate_.Reset();
+    normalizeShader_.Reset();
+    normalizeConstants_.Reset();
+    floatingCapture_ = false;
     if (pending_) pending_->active = false;
     try { if (pool_ && pending_) pool_.FrameArrived(frameToken_); } catch (...) {}
     try { if (item_ && pending_) item_.Closed(closedToken_); } catch (...) {}
@@ -392,7 +419,8 @@ bool WgcBackdropSource::CompareRoi(ID3D11Texture2D* source, bool commit) {
     context_->CopyResource(staging.Get(), source);
     D3D11_MAPPED_SUBRESOURCE mapped{};
     check_hresult(context_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped));
-    const size_t rowBytes = static_cast<size_t>(desc.Width) * 4;
+    const bool sdrBitmap = desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+    const size_t rowBytes = static_cast<size_t>(desc.Width) * (sdrBitmap ? 4 : 8);
     const size_t bytes = rowBytes * desc.Height;
     const bool roiChanged = !EqualRect(&previousRect_, &copiedRect_);
     bool changed = previousPixels_.size() != bytes || roiChanged;
@@ -412,20 +440,39 @@ bool WgcBackdropSource::CompareRoi(ID3D11Texture2D* source, bool commit) {
             FILE* file = nullptr;
             bool saved = false;
             if (_wfopen_s(&file, path, L"wb") == 0) {
+                const size_t bmpBytes = static_cast<size_t>(desc.Width) * desc.Height * 4;
+                const auto* pixels = previousPixels_.data();
+                std::vector<unsigned char> sdrPixels;
+                if (!sdrBitmap) {
+                    sdrPixels.resize(bmpBytes);
+                    for (UINT y = 0; y < desc.Height; ++y) {
+                        for (UINT x = 0; x < desc.Width; ++x) {
+                            const auto offset = static_cast<size_t>(y) * desc.Width + x;
+                            DirectX::PackedVector::HALF half[4]{};
+                            std::memcpy(half, pixels + offset * sizeof(half), sizeof(half));
+                            for (unsigned c = 0; c < 3; ++c) {
+                                const float level = DirectX::PackedVector::XMConvertHalfToFloat(half[2 - c]) * 255.f;
+                                sdrPixels[offset * 4 + c] = static_cast<unsigned char>(docky::color::Quantize8(level, x, y));
+                            }
+                            sdrPixels[offset * 4 + 3] = 255;
+                        }
+                    }
+                    pixels = sdrPixels.data();
+                }
                 BITMAPFILEHEADER header{};
                 BITMAPINFOHEADER info{};
                 header.bfType = 0x4D42;
                 header.bfOffBits = sizeof(header) + sizeof(info);
-                header.bfSize = header.bfOffBits + static_cast<DWORD>(bytes);
+                header.bfSize = header.bfOffBits + static_cast<DWORD>(bmpBytes);
                 info.biSize = sizeof(info);
                 info.biWidth = static_cast<LONG>(desc.Width);
                 info.biHeight = -static_cast<LONG>(desc.Height);
                 info.biPlanes = 1;
                 info.biBitCount = 32;
-                info.biSizeImage = static_cast<DWORD>(bytes);
+                info.biSizeImage = static_cast<DWORD>(bmpBytes);
                 saved = fwrite(&header, sizeof(header), 1, file) == 1 &&
                     fwrite(&info, sizeof(info), 1, file) == 1 &&
-                    fwrite(previousPixels_.data(), 1, bytes, file) == bytes;
+                    fwrite(pixels, 1, bmpBytes, file) == bmpBytes;
                 if (fclose(file) != 0) saved = false;
             }
             DLOG(L"wgc compare: ROI bitmap saved=%d path=%ls", saved, path);
@@ -523,8 +570,10 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
     if (kind == 0) return false;
     try {
         const UINT width = roi.right - roi.left, height = roi.bottom - roi.top;
+        D3D11_TEXTURE2D_DESC shared{};
+        dxgiView_->GetDesc(&shared);
         D3D11_TEXTURE2D_DESC desc{}; desc.Width = width; desc.Height = height; desc.MipLevels = desc.ArraySize = 1;
-        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        desc.Format = shared.Format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         candidate_.Reset(); check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
         const D3D11_BOX box{static_cast<UINT>(roi.left - monitorRect_.left), static_cast<UINT>(roi.top - monitorRect_.top), 0,
                             static_cast<UINT>(roi.right - monitorRect_.left), static_cast<UINT>(roi.bottom - monitorRect_.top), 1};
@@ -590,13 +639,49 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
         RECT expanded{wanted.left-margin,wanted.top-margin,wanted.right+margin,wanted.bottom+margin}, roi{};
         if (!IntersectRect(&roi, &expanded, &monitorRect_)) return false;
         UINT width=roi.right-roi.left, height=roi.bottom-roi.top;
-        D3D11_TEXTURE2D_DESC desc{}; desc.Width=width; desc.Height=height; desc.MipLevels=desc.ArraySize=1;
-        desc.Format=DXGI_FORMAT_B8G8R8A8_UNORM; desc.SampleDesc.Count=1; desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
-        candidate_.Reset(); check_hresult(device_->CreateTexture2D(&desc,nullptr,&candidate_));
         auto access=current_.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         ComPtr<ID3D11Texture2D> source; check_hresult(access->GetInterface(IID_PPV_ARGS(&source)));
+        D3D11_TEXTURE2D_DESC sourceDesc{};
+        source->GetDesc(&sourceDesc);
+        D3D11_TEXTURE2D_DESC desc{}; desc.Width=width; desc.Height=height; desc.MipLevels=desc.ArraySize=1;
+        desc.Format=sourceDesc.Format; desc.SampleDesc.Count=1; desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         D3D11_BOX box{static_cast<UINT>(roi.left-monitorRect_.left),static_cast<UINT>(roi.top-monitorRect_.top),0,static_cast<UINT>(roi.right-monitorRect_.left),static_cast<UINT>(roi.bottom-monitorRect_.top),1};
-        context_->CopySubresourceRegion(candidate_.Get(),0,0,0,0,source.Get(),0,&box);
+        candidate_.Reset();
+        if (floatingCapture_ && desc.Format == docky::color::SceneFormat) {
+            ComPtr<ID3D11Texture2D> cropped;
+            check_hresult(device_->CreateTexture2D(&desc, nullptr, &cropped));
+            context_->CopySubresourceRegion(cropped.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
+            desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
+            check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
+            ComPtr<ID3D11ShaderResourceView> input;
+            ComPtr<ID3D11UnorderedAccessView> output;
+            check_hresult(device_->CreateShaderResourceView(cropped.Get(), nullptr, &input));
+            check_hresult(device_->CreateUnorderedAccessView(candidate_.Get(), nullptr, &output));
+            const auto now = GetTickCount64();
+            if (now >= nextWhiteCheck_) {
+                const HMONITOR monitor = sourceWindow_ ? MonitorFromWindow(sourceWindow_, MONITOR_DEFAULTTONEAREST) : monitor_;
+                captureWhite_ = docky::color::DisplayWhite(monitor);
+                nextWhiteCheck_ = now + 1000;
+            }
+            D3D11_MAPPED_SUBRESOURCE map{};
+            check_hresult(context_->Map(normalizeConstants_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map));
+            const float parameters[4]{1.f / captureWhite_};
+            std::memcpy(map.pData, parameters, sizeof(parameters));
+            context_->Unmap(normalizeConstants_.Get(), 0);
+            context_->CSSetShader(normalizeShader_.Get(), nullptr, 0);
+            context_->CSSetConstantBuffers(0, 1, normalizeConstants_.GetAddressOf());
+            context_->CSSetShaderResources(0, 1, input.GetAddressOf());
+            context_->CSSetUnorderedAccessViews(0, 1, output.GetAddressOf(), nullptr);
+            context_->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+            ID3D11ShaderResourceView* noInput = nullptr;
+            ID3D11UnorderedAccessView* noOutput = nullptr;
+            context_->CSSetShaderResources(0, 1, &noInput);
+            context_->CSSetUnorderedAccessViews(0, 1, &noOutput, nullptr);
+            context_->CSSetShader(nullptr, nullptr, 0);
+        } else {
+            check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
+            context_->CopySubresourceRegion(candidate_.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
+        }
         candidateRect_=roi; candidateId_=currentId_; candidateTime_=capturedAt_;
         // Latency: the GPU compare round trip measured 8 ms average / 16 ms max, and up to 234 ms in one session
         // (log 2026-11-10), and while it is in flight newer frames wait. When the OS already reported dirty

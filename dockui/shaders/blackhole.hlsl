@@ -1,3 +1,5 @@
+#include "quantize.hlsli"
+
 // Black Hole Visualizer: a Schwarzschild black hole lensing the live desktop (DockDrop visual base).
 //
 // Every pixel is one photon traced backwards from a distant observer (orthographic camera). Its impact parameter
@@ -340,5 +342,5 @@ float4 PSMain(VSOut input) : SV_Target {
     // Edge: the lens has tapered to the identity mapping, so fading out shows the real desktop underneath seamlessly.
     const float edge = 1 - smoothstep(overlayRadius - 0.06 * regionRadius, overlayRadius, dist);
     const float a = edge * opacity;
-    return float4(ToGamma(acc.rgb) * a, a);
+    return DitherBgra8(float4(ToGamma(acc.rgb) * a, a), p);
 }

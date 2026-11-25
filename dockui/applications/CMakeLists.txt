@@ -8,7 +8,7 @@ configure_file(applications-defaults.ini "${output}/applications-defaults.ini" C
 add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h"
     COMMAND "${FXC_EXECUTABLE}" /nologo /O3 /WX /T ps_5_0 /E PSMain /Vn g_GlassPS
         /Fh "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h" "${CMAKE_CURRENT_SOURCE_DIR}/glass.hlsl"
-    DEPENDS glass.hlsl VERBATIM)
+    DEPENDS glass.hlsl ../shaders/quantize.hlsli VERBATIM)
 add_executable(${target} WIN32 main.cpp "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h" "${src}/app_registry.cpp"
     "${src}/shell_items.cpp" "${src}/liquid_glass.cpp" "${src}/glass_params.cpp" "${src}/json_lite.cpp")
 add_dependencies(${target} LiquidDockShaders)

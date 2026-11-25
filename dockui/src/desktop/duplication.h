@@ -176,7 +176,10 @@ private:
             else if (SUCCEEDED(output.As(&o1))) hr = o1->DuplicateOutput(device_.Get(), &dup_);
             if (FAILED(hr)) return Fail(hr);
             outputRect_ = od.DesktopCoordinates;
-            sdrWhite_ = SdrWhite(od.DeviceName);
+            outputName_ = od.DeviceName;
+            sdrWhite_ = SdrWhite(outputName_.c_str());
+            nextWhiteCheck_ = GetTickCount64() + 1000;
+            floatSharingFailed_ = false;
             ++generation_;  // consumers reopen the shared texture
             failed_ = false; retry_ = false;
             DLOG(L"desk glass: desktop duplication on (%ld,%ld)-(%ld,%ld), SDR white %.2f", outputRect_.left, outputRect_.top, outputRect_.right, outputRect_.bottom, sdrWhite_);
@@ -273,8 +276,18 @@ private:
         if (info.LastPresentTime.QuadPart != 0 || !valid_) {
             ComPtr<ID3D11Texture2D> tex;
             if (SUCCEEDED(res.As(&tex))) {
+                D3D11_TEXTURE2D_DESC source{};
+                tex->GetDesc(&source);
+                bool whiteChanged = false;
+                const auto now = GetTickCount64();
+                if (source.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && now >= nextWhiteCheck_) {
+                    const float white = SdrWhite(outputName_.c_str());
+                    whiteChanged = white != sdrWhite_;
+                    sdrWhite_ = white;
+                    nextWhiteCheck_ = now + 1000;
+                }
                 std::vector<RECT> changed;
-                bool full = !valid_ || needFull_ || !Changes(info, changed);
+                bool full = !valid_ || needFull_ || whiteChanged || !Changes(info, changed);
                 // Per-monitor instances (the Dock, its menus and panels) copy only what some consumer looks at: a video or
                 // a scrolling page elsewhere on the screen then costs no GPU copy at all. Changes nobody watches are kept
                 // as stale areas; a consumer that later looks at one waits for the next full copy (Fresh).
@@ -438,6 +451,10 @@ private:
             DISPLAYCONFIG_SOURCE_DEVICE_NAME source{}; source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME; source.header.size = sizeof(source);
             source.header.adapterId = p[i].sourceInfo.adapterId; source.header.id = p[i].sourceInfo.id;
             if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS || wcscmp(source.viewGdiDeviceName, gdiName) != 0) continue;
+            DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO_2 advanced{};
+            advanced.header = {DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO_2, sizeof(advanced), p[i].targetInfo.adapterId, p[i].targetInfo.id};
+            if (DisplayConfigGetDeviceInfo(&advanced.header) == ERROR_SUCCESS &&
+                advanced.activeColorMode != DISPLAYCONFIG_ADVANCED_COLOR_MODE_HDR) return 1.f;
             DISPLAYCONFIG_SDR_WHITE_LEVEL white{}; white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL; white.header.size = sizeof(white);
             white.header.adapterId = p[i].targetInfo.adapterId; white.header.id = p[i].targetInfo.id;
             if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) return white.SDRWhiteLevel / 1000.f;
@@ -460,16 +477,27 @@ private:
         D3D11_TEXTURE2D_DESC td{}; tex->GetDesc(&td);
         const bool hdr = td.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (!hdr && td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) { DLOG(L"desk glass: duplication format %d unsupported", static_cast<int>(td.Format)); Fail(E_NOTIMPL); return false; }
+        const auto format = hdr && listenersOnly_ && !floatSharingFailed_ ?
+            DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_B8G8R8A8_UNORM;
         D3D11_TEXTURE2D_DESC have{}; if (image_) image_->GetDesc(&have);
-        if (!image_ || have.Width != td.Width || have.Height != td.Height) {
+        if (!image_ || have.Width != td.Width || have.Height != td.Height || have.Format != format) {
             image_.Reset(); rtv_.Reset(); shared_ = nullptr;
-            D3D11_TEXTURE2D_DESC nd{}; nd.Width = td.Width; nd.Height = td.Height; nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            D3D11_TEXTURE2D_DESC nd{}; nd.Width = td.Width; nd.Height = td.Height; nd.MipLevels = 1; nd.ArraySize = 1; nd.Format = format;
             nd.SampleDesc.Count = 1; nd.Usage = D3D11_USAGE_DEFAULT; nd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET; nd.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
-            if (FAILED(device_->CreateTexture2D(&nd, nullptr, &image_))) return false;
             Microsoft::WRL::ComPtr<IDXGIResource> r;
-            if (FAILED(image_.As(&r)) || FAILED(r->GetSharedHandle(&shared_))) return false;
+            if (FAILED(device_->CreateTexture2D(&nd, nullptr, &image_)) ||
+                FAILED(image_.As(&r)) || FAILED(r->GetSharedHandle(&shared_))) {
+                image_.Reset();
+                if (format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                    floatSharingFailed_ = true;
+                    return Copy(tex, rects);
+                }
+                return false;
+            }
             ++generation_;
-            if (rects.size() != 1 || rects[0].left != 0 || rects[0].top != 0) {  // a new image needs the whole frame
+            DLOG(L"desk glass colour: capture=%d shared=%d", static_cast<int>(td.Format), static_cast<int>(format));
+            if (rects.size() != 1 || rects[0].left != 0 || rects[0].top != 0 ||
+                rects[0].right != static_cast<LONG>(td.Width) || rects[0].bottom != static_cast<LONG>(td.Height)) {
                 const RECT all{0, 0, static_cast<LONG>(td.Width), static_cast<LONG>(td.Height)};
                 return Copy(tex, std::vector<RECT>{all});
             }
@@ -484,15 +512,20 @@ private:
         ctx_->Flush();  // consumers on other devices read the shared image
         return true;
     }
-    // FP16 scRGB -> 8-bit sRGB at the SDR white level, only inside the changed rectangles (scissor).
+    // Normalize to the SDR glass material's white level. Per-monitor GPU
+    // consumers keep FP16 precision. The legacy shared desktop uses BGRA8.
     bool Convert(ID3D11Texture2D* tex, const D3D11_TEXTURE2D_DESC& td, const std::vector<RECT>& rects) {
         if (!vs_ && !BuildShaders()) { Fail(E_FAIL); return false; }
         Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
         if (FAILED(device_->CreateShaderResourceView(tex, nullptr, &srv))) { DLOG(L"desk glass: FP16 frame not readable"); Fail(E_ACCESSDENIED); return false; }
         if (!rtv_ && FAILED(device_->CreateRenderTargetView(image_.Get(), nullptr, &rtv_))) return false;
-        const float constants[4] = {1.0f / (sdrWhite_ > 0.1f ? sdrWhite_ : 2.5f), 0, 0, 0};
+        D3D11_RENDER_TARGET_VIEW_DESC target{};
+        rtv_->GetDesc(&target);
+        const float constants[4] = {1.0f / (sdrWhite_ > 0.1f ? sdrWhite_ : 2.5f),
+            target.Format == DXGI_FORMAT_B8G8R8A8_UNORM ? 1.f : 0.f, 0, 0};
         D3D11_MAPPED_SUBRESOURCE map{};
-        if (SUCCEEDED(ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) { std::memcpy(map.pData, constants, sizeof(constants)); ctx_->Unmap(cb_.Get(), 0); }
+        if (FAILED(ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+        std::memcpy(map.pData, constants, sizeof(constants)); ctx_->Unmap(cb_.Get(), 0);
         D3D11_VIEWPORT vp{0, 0, static_cast<float>(td.Width), static_cast<float>(td.Height), 0, 1};
         ctx_->OMSetRenderTargets(1, rtv_.GetAddressOf(), nullptr);
         ctx_->RSSetViewports(1, &vp); ctx_->RSSetState(scissor_.Get());
@@ -510,11 +543,12 @@ private:
     }
     bool BuildShaders() {
         static const char kSource[] =
-            "cbuffer C : register(b0) { float invWhite; float3 pad; };\n"
+            "cbuffer C : register(b0) { float invWhite; float dither; float2 pad; };\n"
             "Texture2D<float4> src : register(t0);\n"
             "float4 VS(uint id : SV_VertexID) : SV_Position { float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }\n"
             "float3 Srgb(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }\n"
-            "float4 PS(float4 pos : SV_Position) : SV_Target { float3 c = saturate(src.Load(int3(pos.xy, 0)).rgb * invWhite); return float4(Srgb(c), 1); }\n";
+            "float Threshold(float2 pos) { uint2 p = uint2(pos) & 7u; uint x = p.x ^ p.y, y = p.y; uint k = ((x & 1u) << 5) | ((y & 1u) << 4) | ((x & 2u) << 2) | ((y & 2u) << 1) | ((x & 4u) >> 1) | ((y & 4u) >> 2); return ((float(k) + 0.5) / 64.0 - 0.5) / 255.0; }\n"
+            "float4 PS(float4 pos : SV_Position) : SV_Target { float3 c = Srgb(saturate(src.Load(int3(pos.xy, 0)).rgb * invWhite)); if (dither > 0) c = floor(saturate(c + Threshold(pos.xy)) * 255.0 + 0.5) / 255.0; return float4(c, 1); }\n";
         static const pD3DCompile compile = [] {
             HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
             return m ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
@@ -545,6 +579,9 @@ private:
     std::vector<Change> history_;
     RECT outputRect_{};
     float sdrWhite_ = 2.5f;
+    std::wstring outputName_;
+    ULONGLONG nextWhiteCheck_ = 0;
+    bool floatSharingFailed_ = false;
     std::atomic<bool> failed_{false}, valid_{false};
     bool retry_ = false;
     ULONGLONG failedAt_ = 0;

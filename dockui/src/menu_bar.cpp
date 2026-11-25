@@ -1,5 +1,6 @@
 #include "game_compat.h"
 #include "ui_language.h"
+#include "sdr_dither.h"
 #include "capture_visible.h"
 #include "status_glyphs.h"
 #include "status_popups.h"
@@ -1196,12 +1197,12 @@ void Render(HWND h) {
         const float fadePixels = (std::max)(1, height - 1) * (gradientLength / 100.f);
         for (int y = 0; y < height && y < fadePixels; ++y) {
             const float t = y / fadePixels;
-            const unsigned shade = static_cast<unsigned>(std::lround(255.f * (gradientOpacity / 100.f) * std::pow(1.f - t * t, 1.25f)));
+            const float shade = (gradientOpacity / 100.f) * std::pow(1.f - t * t, 1.25f);
             auto* row = pixels + static_cast<size_t>(y) * width;
             for (int x = 0; x < width; ++x) {
                 const auto pixel = row[x];
                 const unsigned a = pixel >> 24;
-                const unsigned behind = ((255u - a) * shade + 127u) / 255u;
+                const unsigned behind = docky::color::Quantize8((255u - a) * shade, x, y);
                 if (!behind) continue;
                 const unsigned gray = lightBar ? behind : 0u;
                 row[x] = pixel + (behind << 24) + gray * 0x010101u;

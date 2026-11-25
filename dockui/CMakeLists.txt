@@ -23,7 +23,7 @@ function(add_shader src entry profile var header)
         OUTPUT ${SHADER_OUT}/${header}
         COMMAND ${FXC_EXECUTABLE} /nologo /O3 /WX /T ${profile} /E ${entry} /Vn ${var}
                 /Fh ${SHADER_OUT}/${header} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${src}
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${src}
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${src} ${CMAKE_CURRENT_SOURCE_DIR}/shaders/quantize.hlsli
         COMMENT "fxc ${src} (${entry})"
         VERBATIM)
     set(SHADER_HEADERS ${SHADER_HEADERS} ${SHADER_OUT}/${header} PARENT_SCOPE)
@@ -34,6 +34,9 @@ add_shader(blur.hlsl PSDown ps_5_0 g_BlurDownPS blur_down_ps.h)
 add_shader(blur.hlsl PSBlur ps_5_0 g_BlurPS blur_ps.h)
 add_shader(silk.hlsl VSMain vs_5_0 g_SilkVS silk_vs.h)
 add_shader(silk.hlsl PSMain ps_5_0 g_SilkPS silk_ps.h)
+add_shader(color_output.hlsl VSMain vs_5_0 g_ColorOutputVS color_output_vs.h)
+add_shader(color_output.hlsl PSMain ps_5_0 g_ColorOutputPS color_output_ps.h)
+add_shader(capture_normalize.hlsl CSMain cs_5_0 g_CaptureNormalizeCS capture_normalize_cs.h)
 add_shader(roi_compare.hlsl CSMain cs_5_0 g_RoiCompareCS roi_compare_cs.h)
 add_shader(genie.hlsl VSMain vs_5_0 g_GenieVS genie_vs.h)
 add_shader(genie.hlsl PSMain ps_5_0 g_GeniePS genie_ps.h)

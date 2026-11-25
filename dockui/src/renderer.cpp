@@ -9,6 +9,7 @@
 
 #include "design_tokens.h"
 #include "log.h"
+#include "color_output.h"
 
 namespace dock {
 namespace {
@@ -22,6 +23,18 @@ double NowMs() {
 }
 
 }  // namespace
+
+struct Renderer::Output {
+    docky::color::ColorOutput colors;
+    ComPtr<ID3D11RenderTargetView> swapTarget;
+    bool scRgb = false;
+    float white = 1.f;
+    ULONGLONG nextWhiteCheck = 0;
+    HMONITOR monitor = nullptr;
+};
+
+Renderer::Renderer() = default;
+Renderer::~Renderer() { Shutdown(); }
 
 // Non-blocking GPU timing: timestamps at frame start, after the glass passes and before Present,
 // inside a disjoint query. Results are read a few frames later with DONOTFLUSH; disjoint
@@ -109,6 +122,23 @@ HRESULT Renderer::Init(HWND hwnd, UINT pxW, UINT pxH, float dpi, bool aboveChild
     if (FAILED(hr = d3d_.As(&dxgiDevice_))) return hr;
     d3d_->GetImmediateContext(&ctx_);
 
+    D2D1_FACTORY_OPTIONS options{};
+    if (FAILED(hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &options,
+                                      reinterpret_cast<void**>(d2dFactory_.GetAddressOf())))) return hr;
+    if (FAILED(hr = d2dFactory_->CreateDevice(dxgiDevice_.Get(), &d2dDevice_))) return hr;
+    if (FAILED(hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return hr;
+    auto output = std::make_unique<Output>();
+    if (output->colors.Init(d3d_.Get()) &&
+        output->colors.Bind(dc_.Get(), std::max<UINT>(1, pxW), std::max<UINT>(1, pxH))) {
+        output_ = std::move(output);
+        if (dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+            D2D1_RENDERING_CONTROLS controls{};
+            dc_->GetRenderingControls(&controls);
+            controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+            dc_->SetRenderingControls(&controls);
+        }
+    }
+
     ComPtr<IDXGIFactory2> factory;
     if (FAILED(hr = CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return hr;
     DXGI_SWAP_CHAIN_DESC1 desc{};
@@ -121,20 +151,26 @@ HRESULT Renderer::Init(HWND hwnd, UINT pxW, UINT pxH, float dpi, bool aboveChild
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     desc.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    if (FAILED(hr = factory->CreateSwapChainForComposition(dxgiDevice_.Get(), &desc, nullptr, &swapChain_))) return hr;
+    if (output_) {
+        desc.Format = docky::color::SceneFormat;
+        output_->scRgb = SUCCEEDED(factory->CreateSwapChainForComposition(dxgiDevice_.Get(), &desc, nullptr, &swapChain_)) &&
+                         docky::color::EnableScRgb(swapChain_.Get());
+    }
+    if (!output_ || !output_->scRgb) {
+        swapChain_.Reset();
+        desc.Format = docky::color::SdrFormat;
+        if (FAILED(hr = factory->CreateSwapChainForComposition(dxgiDevice_.Get(), &desc, nullptr, &swapChain_))) return hr;
+    }
     ComPtr<IDXGISwapChain2> sc2;
     if (SUCCEEDED(swapChain_.As(&sc2))) {
         sc2->SetMaximumFrameLatency(1);
         waitable_ = sc2->GetFrameLatencyWaitableObject();
     }
 
-    D2D1_FACTORY_OPTIONS options{};
-    if (FAILED(hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &options,
-                                      reinterpret_cast<void**>(d2dFactory_.GetAddressOf()))))
-        return hr;
-    if (FAILED(hr = d2dFactory_->CreateDevice(dxgiDevice_.Get(), &d2dDevice_))) return hr;
-    if (FAILED(hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return hr;
     if (FAILED(hr = CreateTarget())) return hr;
+    DLOG(L"renderer colour: %ls, %ls working surface",
+         output_ && output_->scRgb ? L"FP16 scRGB" : L"BGRA8",
+         output_ ? L"FP16" : L"BGRA8");
 
     if (FAILED(hr = DCompositionCreateDevice(dxgiDevice_.Get(), IID_PPV_ARGS(&dcomp_)))) return hr;
     if (FAILED(hr = dcomp_->CreateTargetForHwnd(hwnd, aboveChildWindows ? TRUE : FALSE, &dcompTarget_))) return hr;
@@ -205,6 +241,7 @@ void Renderer::Shutdown() {
     dcompTarget_.Reset();
     dcomp_.Reset();
     target_.Reset();
+    output_.reset();
     dc_.Reset();
     d2dDevice_.Reset();
     d2dFactory_.Reset();
@@ -220,19 +257,27 @@ void Renderer::Shutdown() {
 }
 
 HRESULT Renderer::CreateTarget() {
-    ComPtr<IDXGISurface> surface;
-    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&surface));
+    ComPtr<ID3D11Texture2D> buffer;
+    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&buffer));
     if (FAILED(hr)) return hr;
+    D3D11_TEXTURE2D_DESC bd{};
+    buffer->GetDesc(&bd);
+    if (output_) {
+        if ((!output_->colors.Bitmap() || targetW_ != bd.Width || targetH_ != bd.Height) &&
+            !output_->colors.Bind(dc_.Get(), bd.Width, bd.Height)) return E_FAIL;
+        if (FAILED(hr = d3d_->CreateRenderTargetView(buffer.Get(), nullptr, &output_->swapTarget))) return hr;
+        target_ = output_->colors.Bitmap();
+        buffer = output_->colors.Texture();
+    } else {
+    ComPtr<IDXGISurface> surface;
+    if (FAILED(hr = buffer.As(&surface))) return hr;
     const D2D1_BITMAP_PROPERTIES1 props = D2D1::BitmapProperties1(
         D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi_, dpi_);
     if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target_))) return hr;
+    }
     dc_->SetTarget(target_.Get());
     dc_->SetDpi(dpi_, dpi_);
-    ComPtr<ID3D11Texture2D> buffer;
-    if (FAILED(hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return hr;
-    D3D11_TEXTURE2D_DESC bd{};
-    buffer->GetDesc(&bd);
     targetW_ = bd.Width;
     targetH_ = bd.Height;
     return d3d_->CreateRenderTargetView(buffer.Get(), nullptr, &rtv_);
@@ -244,6 +289,7 @@ HRESULT Renderer::Resize(UINT pxW, UINT pxH, float dpi) {
     dc_->SetTarget(nullptr);
     target_.Reset();
     rtv_.Reset();
+    if (output_) output_->swapTarget.Reset();
     if (ctx_) {
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
         ctx_->Flush();
@@ -317,16 +363,22 @@ bool Renderer::PresentTiming(UINT& lastPresentCount, UINT& shownPresentCount, LO
     return true;
 }
 
-// One-shot diagnostic export of this renderer's DComp backbuffer, not the desktop composite.
+ComPtr<ID3D11Texture2D> Renderer::SnapshotSource() {
+    if (output_) return output_->colors.SdrSnapshot();
+    ComPtr<ID3D11Texture2D> source;
+    swapChain_->GetBuffer(0, IID_PPV_ARGS(&source));
+    return source;
+}
+
+// One-shot SDR diagnostic export of this renderer's own surface.
 // WIC expects straight BGRA: undo premultiplication so translucent edges do not acquire dark halos.
 void Renderer::SavePngSnapshot() {
     pngSnapshotRequested_ = false;
-    ComPtr<ID3D11Texture2D> source, staging;
-    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&source));
-    if (FAILED(hr)) { DLOG(L"snapshot png: backbuffer unavailable 0x%08X", hr); return; }
+    ComPtr<ID3D11Texture2D> source = SnapshotSource(), staging;
+    if (!source) { DLOG(L"snapshot png: SDR source unavailable"); return; }
     D3D11_TEXTURE2D_DESC desc{}; source->GetDesc(&desc);
     desc.Usage = D3D11_USAGE_STAGING; desc.BindFlags = 0; desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ; desc.MiscFlags = 0;
-    hr = d3d_->CreateTexture2D(&desc, nullptr, &staging);
+    HRESULT hr = d3d_->CreateTexture2D(&desc, nullptr, &staging);
     if (FAILED(hr)) { DLOG(L"snapshot png: staging failed 0x%08X", hr); return; }
     ctx_->CopyResource(staging.Get(), source.Get());
     D3D11_MAPPED_SUBRESOURCE map{}; hr = ctx_->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &map);
@@ -374,16 +426,15 @@ void Renderer::SavePngSnapshot() {
 }
 
 void Renderer::SaveSnapshot() {
-    ComPtr<ID3D11Texture2D> source, staging;
-    HRESULT hr = swapChain_->GetBuffer(0, IID_PPV_ARGS(&source));
-    if (FAILED(hr)) { DLOG(L"snapshot: GetBuffer failed 0x%08X", hr); return; }
+    ComPtr<ID3D11Texture2D> source = SnapshotSource(), staging;
+    if (!source) { DLOG(L"snapshot: SDR source unavailable"); return; }
     D3D11_TEXTURE2D_DESC desc{};
     source->GetDesc(&desc);
     desc.Usage = D3D11_USAGE_STAGING;
     desc.BindFlags = 0;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     desc.MiscFlags = 0;
-    hr = d3d_->CreateTexture2D(&desc, nullptr, &staging);
+    HRESULT hr = d3d_->CreateTexture2D(&desc, nullptr, &staging);
     if (FAILED(hr)) { DLOG(L"snapshot: staging failed 0x%08X", hr); return; }
     ctx_->CopyResource(staging.Get(), source.Get());
     D3D11_MAPPED_SUBRESOURCE mapped{};
@@ -420,7 +471,8 @@ bool Renderer::RenderLocalGlass(const LocalGlassOverlay& overlay) {
     auto& cache=localGlassCaches_[std::clamp(overlay.cacheKey,0,static_cast<int>(localGlassCaches_.size())-1)];
     if(!cache.material){cache.material=CreateLiquidGlassMaterial();if(FAILED(cache.material->CreateGpuResources(d3d_.Get()))){cache.material.reset();return false;}}
     ComPtr<ID3D11Texture2D> source;
-    if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&source)))) return false;
+    if (output_) source = output_->colors.Texture();
+    else if (FAILED(swapChain_->GetBuffer(0, IID_PPV_ARGS(&source)))) return false;
     D3D11_TEXTURE2D_DESC desc{}; source->GetDesc(&desc);
     const float scale=dpi_/96.f;
     const int margin=static_cast<int>(std::ceil(96.f*scale));
@@ -592,6 +644,18 @@ HRESULT Renderer::PresentFrame(const Scene& scene) {
     if (!snapshotPath_.empty()) {
         SaveSnapshot();
         snapshotPath_.clear();
+    }
+    if (output_) {
+        if (output_->scRgb) {
+            const auto monitor = MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST);
+            const auto now = GetTickCount64();
+            if (monitor != output_->monitor || now >= output_->nextWhiteCheck) {
+                output_->monitor = monitor;
+                output_->white = docky::color::DisplayWhite(monitor);
+                output_->nextWhiteCheck = now + 1000;
+            }
+        }
+        if (!output_->colors.Resolve(output_->swapTarget.Get(), output_->scRgb ? output_->white : 0.f)) return E_FAIL;
     }
     ++presentCalls_;
     const double p0 = NowMs();

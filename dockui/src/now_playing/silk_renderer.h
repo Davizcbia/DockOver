@@ -32,12 +32,19 @@ public:
         if (!ps_ || !width || !height || palette.empty()) return nullptr;
         if (!texture_ || width != w_ || height != h_) {
             texture_.Reset(); rtv_.Reset(); bitmap_.Reset();
-            D3D11_TEXTURE2D_DESC d{}; d.Width = width; d.Height = height; d.MipLevels = 1; d.ArraySize = 1; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            D3D11_TEXTURE2D_DESC d{}; d.Width = width; d.Height = height; d.MipLevels = 1; d.ArraySize = 1;
             d.SampleDesc.Count = 1; d.Usage = D3D11_USAGE_DEFAULT; d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            Microsoft::WRL::ComPtr<IDXGISurface> surface;
-            const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-            if (FAILED(device_->CreateTexture2D(&d, nullptr, &texture_)) || FAILED(device_->CreateRenderTargetView(texture_.Get(), nullptr, &rtv_)) ||
-                FAILED(texture_.As(&surface)) || FAILED(dc->CreateBitmapFromDxgiSurface(surface.Get(), &props, &bitmap_))) { texture_.Reset(); return nullptr; }
+            for (const auto format : {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM}) {
+                d.Format = format;
+                texture_.Reset(); rtv_.Reset(); bitmap_.Reset();
+                Microsoft::WRL::ComPtr<IDXGISurface> surface;
+                const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(format, D2D1_ALPHA_MODE_IGNORE));
+                if (SUCCEEDED(device_->CreateTexture2D(&d, nullptr, &texture_)) &&
+                    SUCCEEDED(device_->CreateRenderTargetView(texture_.Get(), nullptr, &rtv_)) &&
+                    SUCCEEDED(texture_.As(&surface)) &&
+                    SUCCEEDED(dc->CreateBitmapFromDxgiSurface(surface.Get(), &props, &bitmap_))) break;
+            }
+            if (!bitmap_) { texture_.Reset(); return nullptr; }
             w_ = width; h_ = height;
         }
         D3D11_MAPPED_SUBRESOURCE map{};

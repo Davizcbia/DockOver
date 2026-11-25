@@ -23,6 +23,7 @@
 #include "artwork_source.h"
 #include "audio_beat.h"
 #include "../music_wallpaper_frame.h"
+#include "../color_output.h"
 #include "lyrics_source.h"
 #include "local_tags.h"
 #include "silk_renderer.h"
@@ -414,6 +415,12 @@ public:
         ComPtr<ID2D1Device2> d2d;
         if (FAILED(factory_->CreateDevice(dxgi.Get(), &d2d)) || FAILED(d2d->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return false;
         dc_->SetUnitMode(D2D1_UNIT_MODE_PIXELS);
+        if (dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+            D2D1_RENDERING_CONTROLS controls{};
+            dc_->GetRenderingControls(&controls);
+            controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+            dc_->SetRenderingControls(&controls);
+        }
         dc_->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
         if (FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dwrite_.GetAddressOf())))) return false;
         CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic_));
@@ -491,6 +498,20 @@ public:
         if (std::max(w, h) > 4096) {
             ComPtr<IWICBitmapScaler> scaler; const float r = 4096.f / float(std::max(w, h));
             if (SUCCEEDED(wic_->CreateBitmapScaler(&scaler)) && SUCCEEDED(scaler->Initialize(frame.Get(), UINT(w * r), UINT(h * r), WICBitmapInterpolationModeFant))) src = scaler;
+        }
+        WICPixelFormatGUID sourceFormat{};
+        if (SUCCEEDED(src->GetPixelFormat(&sourceFormat)) &&
+            (sourceFormat == GUID_WICPixelFormat16bppGray || sourceFormat == GUID_WICPixelFormat48bppRGB ||
+             sourceFormat == GUID_WICPixelFormat64bppRGBA || sourceFormat == GUID_WICPixelFormat64bppPRGBA) &&
+            dc_->IsDxgiFormatSupported(DXGI_FORMAT_R16G16B16A16_UNORM)) {
+            const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE,
+                D2D1::PixelFormat(DXGI_FORMAT_R16G16B16A16_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+            if (SUCCEEDED(wic_->CreateFormatConverter(&conv)) &&
+                SUCCEEDED(conv->Initialize(src.Get(), GUID_WICPixelFormat64bppPRGBA, WICBitmapDitherTypeNone,
+                                           nullptr, 0, WICBitmapPaletteTypeCustom)) &&
+                SUCCEEDED(dc_->CreateBitmapFromWicBitmap(conv.Get(), &props, &out))) return out;
+            conv.Reset();
+            out.Reset();
         }
         if (FAILED(wic_->CreateFormatConverter(&conv)) || FAILED(conv->Initialize(src.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeMedianCut))) return out;
         dc_->CreateBitmapFromWicBitmap(conv.Get(), nullptr, &out);
@@ -1217,6 +1238,7 @@ public:
         ComPtr<ID2D1Bitmap1> target;
         const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         if (FAILED(scene_.Dc()->CreateBitmap(D2D1::SizeU(w, h), nullptr, 0, &props, &target))) return 2;
+        const bool floating = colors_.Init(gpu_.device.Get()) && colors_.Bind(scene_.Dc(), w, h);
         auto art = std::make_shared<Art>();
         if (!image.empty()) { art->still = scene_.LoadFile(image); art->palette = scene_.PaletteOfFile(image); }
         if (!video.empty()) {
@@ -1246,10 +1268,19 @@ public:
             const float tw = GetEnvironmentVariableW(L"DOCKY_SILK_TWIST", v, 32) ? float(_wtof(v)) : 0.f;
             ui.silk = silk_.Render(scene_.Dc(), UINT(w * .56f / 2), h / 2, st, tw, art->palette);
         }
-        scene_.Dc()->SetTarget(target.Get());
+        scene_.Dc()->SetTarget(floating ? colors_.Bitmap() : target.Get());
         scene_.Dc()->BeginDraw();
         scene_.Draw(float(w), float(h), nullptr, art.get(), 1, ui);
         if (FAILED(scene_.Dc()->EndDraw())) return 5;
+        if (floating) {
+            scene_.Dc()->SetTarget(nullptr);
+            ComPtr<IDXGISurface> surface;
+            ComPtr<ID3D11Texture2D> texture;
+            ComPtr<ID3D11RenderTargetView> output;
+            if (FAILED(target->GetSurface(&surface)) || FAILED(surface.As(&texture)) ||
+                FAILED(gpu_.device->CreateRenderTargetView(texture.Get(), nullptr, &output)) ||
+                !colors_.Resolve(output.Get(), 0.f)) return 5;
+        }
         return SavePng(scene_.Dc(), target.Get(), w, h, out) ? 0 : 6;
     }
 
@@ -1288,7 +1319,7 @@ private:
             auto* c = reinterpret_cast<Ctx*>(l); MONITORINFO mi{sizeof(mi)};
             if (GetMonitorInfoW(m, &mi)) {
                 // rcWork leaves out the Dock band and the menu bar (both reserve their edge like a taskbar).
-                Monitor x{mi.rcMonitor, mi.rcWork}; OffsetRect(&x.screen, -c->o.x, -c->o.y);
+                Monitor x{mi.rcMonitor, mi.rcWork, m}; OffsetRect(&x.screen, -c->o.x, -c->o.y);
                 OffsetRect(&x.work, -mi.rcMonitor.left, -mi.rcMonitor.top);
                 c->out->push_back(x);
             }
@@ -1360,21 +1391,56 @@ private:
         ComPtr<IDXGIDevice> dxgi; gpu_.device.As(&dxgi);
         ComPtr<IDXGIAdapter> adapter; dxgi->GetAdapter(&adapter);
         ComPtr<IDXGIFactory2> factory; adapter->GetParent(IID_PPV_ARGS(&factory));
-        DXGI_SWAP_CHAIN_DESC1 d{}; d.Width = W_; d.Height = H_; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
+        floatingScene_ = colors_.Init(gpu_.device.Get()) && colors_.Bind(scene_.Dc(), W_, H_);
+        DXGI_SWAP_CHAIN_DESC1 d{}; d.Width = W_; d.Height = H_; d.Format = floatingScene_ ? docky::color::SceneFormat : docky::color::SdrFormat; d.SampleDesc.Count = 1;
         d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | (wallpaper_ ? DXGI_USAGE_SHADER_INPUT : 0); d.BufferCount = 2; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
         d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
-        if (FAILED(factory->CreateSwapChainForComposition(gpu_.device.Get(), &d, nullptr, &swap_))) return false;
+        if (floatingScene_) {
+            scRgb_ = SUCCEEDED(factory->CreateSwapChainForComposition(gpu_.device.Get(), &d, nullptr, &swap_)) &&
+                     docky::color::EnableScRgb(swap_.Get());
+        }
+        if (!scRgb_) {
+            swap_.Reset();
+            d.Format = docky::color::SdrFormat;
+            if (FAILED(factory->CreateSwapChainForComposition(gpu_.device.Get(), &d, nullptr, &swap_))) return false;
+        }
         if (FAILED(DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&dcomp_))) || FAILED(dcomp_->CreateTargetForHwnd(hwnd_, TRUE, &dtarget_)) ||
             FAILED(dcomp_->CreateVisual(&visual_))) return false;
         visual_->SetContent(swap_.Get()); dtarget_->SetRoot(visual_.Get()); dcomp_->Commit();
+        RefreshOutputWhite();
+        Log(L"colour output: %ls; %ls scene", scRgb_ ? L"FP16 scRGB" : L"BGRA8 SDR", floatingScene_ ? L"FP16" : L"BGRA8");
         return BindTarget();
     }
     bool BindTarget() {
         scene_.Dc()->SetTarget(nullptr); target_.Reset();
+        if (floatingScene_) {
+            outputRtv_.Reset();
+            ComPtr<ID3D11Texture2D> buffer;
+            if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&buffer))) ||
+                FAILED(gpu_.device->CreateRenderTargetView(buffer.Get(), nullptr, &outputRtv_))) return false;
+            target_ = colors_.Bitmap();
+            return target_ != nullptr;
+        }
         ComPtr<IDXGISurface> surface; if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&surface)))) return false;
         const auto options = wallpaper_ ? D2D1_BITMAP_OPTIONS_TARGET : D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW;
         const auto props = D2D1::BitmapProperties1(options, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
         return SUCCEEDED(scene_.Dc()->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target_));
+    }
+
+    void RefreshOutputWhite() {
+        if (!scRgb_) return;
+        const float white = docky::color::DisplayWhite(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONEAREST));
+        if (white != outputWhite_) { outputWhite_ = white; dirty_ = true; }
+        if (!wallpaper_) return;
+        std::vector<docky::color::ColorOutput::Region> next;
+        next.reserve(monitors_.size());
+        for (const auto& monitor : monitors_)
+            next.push_back({monitor.screen, docky::color::DisplayWhite(monitor.handle)});
+        if (next.size() != outputRegions_.size() ||
+            !std::equal(next.begin(), next.end(), outputRegions_.begin(), [](const auto& a, const auto& b) {
+                return a.white == b.white && EqualRect(&a.rect, &b.rect);
+            })) dirty_ = true;
+        outputRegions_ = std::move(next);
     }
 
     static LRESULT CALLBACK Proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1401,8 +1467,10 @@ private:
                 RECT rc; GetClientRect(host_, &rc);
                 if (UINT(rc.right) != W_ || UINT(rc.bottom) != H_) SetWindowPos(hwnd_, nullptr, 0, 0, rc.right, rc.bottom, SWP_NOZORDER | SWP_NOACTIVATE);
                 UpdateMonitors();
+                RefreshOutputWhite();
                 return 0;
             }
+            RefreshOutputWhite();
             if (liquid::settings::ReadRevision(liquid::settings::DefaultPath()) != settingsRevision_) { ReadSharedSettings(); dirty_ = true; }
             {
             SYSTEMTIME st; GetLocalTime(&st);
@@ -1507,16 +1575,31 @@ private:
             }
             return 0;
         case WM_DISPLAYCHANGE: case WM_DPICHANGED: {
+            if (wallpaper_) {
+                UpdateMonitors();
+                RefreshOutputWhite();
+                dirty_ = true;
+                return 0;
+            }
             MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi);
             SetWindowPos(h, nullptr, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_NOZORDER | SWP_NOACTIVATE);
             scene_.SetScale(float(GetDpiForWindow(h)) / 96.f);
+            RefreshOutputWhite();
+            dirty_ = true;
             return 0;
         }
         case WM_SIZE:
             if (swap_ && LOWORD(lp) && HIWORD(lp) && (LOWORD(lp) != W_ || HIWORD(lp) != H_)) {
-                W_ = LOWORD(lp); H_ = HIWORD(lp);
                 scene_.Dc()->SetTarget(nullptr); target_.Reset();
-                swap_->ResizeBuffers(2, W_, H_, DXGI_FORMAT_B8G8R8A8_UNORM, 0); BindTarget(); dirty_ = true;
+                outputRtv_.Reset();
+                W_ = LOWORD(lp); H_ = HIWORD(lp);
+                if (FAILED(swap_->ResizeBuffers(2, W_, H_, DXGI_FORMAT_UNKNOWN, 0)) ||
+                    (floatingScene_ && !colors_.Bind(scene_.Dc(), W_, H_)) || !BindTarget()) {
+                    Log(L"colour output: resize failed");
+                    PostQuitMessage(2);
+                    return 0;
+                }
+                dirty_ = true;
             }
             return 0;
         }
@@ -1981,7 +2064,9 @@ private:
         }
         const HRESULT hr = dc->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) { Log(L"device lost"); PostQuitMessage(2); return; }
-        if (wallpaper_ && appear > 0.f && SUCCEEDED(hr)) PublishWallpaperFrame(appear, mix);
+        if (FAILED(hr)) return;
+        if (wallpaper_ && appear > 0.f) PublishWallpaperFrame(appear, mix);
+        if (floatingScene_ && !colors_.Resolve(outputRtv_.Get(), scRgb_ ? outputWhite_ : 0.f, outputRegions_)) return;
         const double submitted = musicTraceEvent_.published ? Now() : 0;
         const HRESULT present = swap_->Present(1, 0);
         if (submitted) {
@@ -1998,6 +2083,11 @@ private:
     HWND hwnd_ = nullptr; UINT W_ = 0, H_ = 0;
     ComPtr<IDXGISwapChain1> swap_; ComPtr<IDCompositionDevice> dcomp_; ComPtr<IDCompositionTarget> dtarget_; ComPtr<IDCompositionVisual> visual_;
     ComPtr<ID2D1Bitmap1> target_;
+    docky::color::ColorOutput colors_;
+    ComPtr<ID3D11RenderTargetView> outputRtv_;
+    std::vector<docky::color::ColorOutput::Region> outputRegions_;
+    float outputWhite_ = 1.f;
+    bool floatingScene_ = false, scRgb_ = false;
     std::unique_ptr<MediaWorker> media_; std::unique_ptr<ArtworkSource> artwork_;
     Volume volume_; float volumeLevel_ = volume_.Get(); bool muted_ = volume_.Muted();
     Media snapshot_; std::wstring trackKey_ = L"\x1", artKey_; uint64_t thumbHash_ = 0;
@@ -2007,7 +2097,7 @@ private:
     int hover_ = 0, pressed_ = 0, minute_ = -1; bool dirty_ = true, hideNow_ = false;
     // wallpaper mode
     bool wallpaper_ = false, shown_ = false, covered_ = false, forceShow_ = false;
-    struct Monitor { RECT screen, work; };  // screen: in the window; work: in the monitor
+    struct Monitor { RECT screen, work; HMONITOR handle; };  // screen: in the window; work: in the monitor
     docky::music_wallpaper::Channel wallpaperFrames_;
     ComPtr<ID2D1Bitmap1> wallpaperPreview_, wallpaperReadback_;
     ULONGLONG lastWallpaperFrame_ = 0;

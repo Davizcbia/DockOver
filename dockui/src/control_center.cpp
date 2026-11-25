@@ -1,4 +1,5 @@
 #include "control_center.h"
+#include "color_output.h"
 #include "ui_language.h"
 #include "audio_output_icons.h"
 #include <shellapi.h>
@@ -409,6 +410,9 @@ private:
     ComPtr<IDXGISwapChain1> swap_;
     HANDLE waitable_ = nullptr;
     ComPtr<ID3D11RenderTargetView> rtv_;
+    docky::color::ColorOutput colors_;
+    ComPtr<ID3D11RenderTargetView> outputRtv_;
+    bool floatingScene_ = false, scRgb_ = false;
     ComPtr<ID2D1Factory1> factory_;
     ComPtr<ID2D1Device> d2dDevice_;
     ComPtr<ID2D1DeviceContext> dc_;
@@ -532,18 +536,34 @@ HRESULT Panel::InitGraphics() {
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
     sd.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
-    if (FAILED(hr = f->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_))) return hr;
-    ComPtr<IDXGISwapChain2> sc2;
-    if (SUCCEEDED(swap_.As(&sc2))) {
-        sc2->SetMaximumFrameLatency(1);
-        waitable_ = sc2->GetFrameLatencyWaitableObject();
-    }
     D2D1_FACTORY_OPTIONS fo{};
     if (FAILED(hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), &fo,
                                       reinterpret_cast<void**>(factory_.GetAddressOf()))))
         return hr;
     if (FAILED(hr = factory_->CreateDevice(dxgi_.Get(), &d2dDevice_))) return hr;
     if (FAILED(hr = d2dDevice_->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &dc_))) return hr;
+    floatingScene_ = colors_.Init(d3d_.Get()) && colors_.Bind(dc_.Get(), pxW_, pxH_);
+    if (floatingScene_) {
+        sd.Format = docky::color::SceneFormat;
+        scRgb_ = SUCCEEDED(f->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_)) &&
+                 docky::color::EnableScRgb(swap_.Get());
+    }
+    if (!scRgb_) {
+        swap_.Reset();
+        sd.Format = docky::color::SdrFormat;
+        if (FAILED(hr = f->CreateSwapChainForComposition(dxgi_.Get(), &sd, nullptr, &swap_))) return hr;
+    }
+    if (floatingScene_ && dc_->IsBufferPrecisionSupported(D2D1_BUFFER_PRECISION_16BPC_FLOAT)) {
+        D2D1_RENDERING_CONTROLS controls{};
+        dc_->GetRenderingControls(&controls);
+        controls.bufferPrecision = D2D1_BUFFER_PRECISION_16BPC_FLOAT;
+        dc_->SetRenderingControls(&controls);
+    }
+    ComPtr<IDXGISwapChain2> sc2;
+    if (SUCCEEDED(swap_.As(&sc2))) {
+        sc2->SetMaximumFrameLatency(1);
+        waitable_ = sc2->GetFrameLatencyWaitableObject();
+    }
     if (FAILED(hr = ResizeTarget())) return hr;
     LoadStatusIcons();
     tSwapD2D_ = Ms();
@@ -608,6 +628,7 @@ HRESULT Panel::ResizeTarget() {
     dc_->SetTarget(nullptr);
     target_.Reset();
     rtv_.Reset();
+    outputRtv_.Reset();
     HRESULT hr = S_OK;
     DXGI_SWAP_CHAIN_DESC1 d{};
     swap_->GetDesc1(&d);
@@ -617,17 +638,24 @@ HRESULT Panel::ResizeTarget() {
         if (FAILED(hr = swap_->ResizeBuffers(2, pxW_, pxH_, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)))
             return hr;
     }
-    ComPtr<IDXGISurface> s;
-    if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&s)))) return hr;
-    const float dpi = 96.0f * scale_;
-    const auto p = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-                                           D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
-    if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(s.Get(), &p, &target_))) return hr;
+    ComPtr<ID3D11Texture2D> buffer;
+    if (FAILED(hr = swap_->GetBuffer(0, IID_PPV_ARGS(&buffer)))) return hr;
+    const float dpi = 96.f * scale_;
+    if (floatingScene_) {
+        if (!colors_.Bind(dc_.Get(), pxW_, pxH_)) return E_FAIL;
+        if (FAILED(hr = d3d_->CreateRenderTargetView(buffer.Get(), nullptr, &outputRtv_))) return hr;
+        target_ = colors_.Bitmap();
+        buffer = colors_.Texture();
+    } else {
+        ComPtr<IDXGISurface> surface;
+        if (FAILED(hr = buffer.As(&surface))) return hr;
+        const auto props = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+            D2D1::PixelFormat(docky::color::SdrFormat, D2D1_ALPHA_MODE_PREMULTIPLIED), dpi, dpi);
+        if (FAILED(hr = dc_->CreateBitmapFromDxgiSurface(surface.Get(), &props, &target_))) return hr;
+    }
     dc_->SetTarget(target_.Get());
     dc_->SetDpi(dpi, dpi);
-    ComPtr<ID3D11Texture2D> t;
-    swap_->GetBuffer(0, IID_PPV_ARGS(&t));
-    return d3d_->CreateRenderTargetView(t.Get(), nullptr, &rtv_);
+    return d3d_->CreateRenderTargetView(buffer.Get(), nullptr, &rtv_);
 }
 
 // Geometry follows the macOS Control Center module grid: 140 pt columns, 64 pt pills, 12 pt gaps,
@@ -1002,7 +1030,8 @@ void Panel::DrawSwitchLens(D2D1_RECT_F thumb, float opacity) {
     y0 = std::clamp(y0, 0L, static_cast<LONG>(pxH_)); y1 = std::clamp(y1, 0L, static_cast<LONG>(pxH_));
     if (x1 - x0 < 4 || y1 - y0 < 4) return;
     ComPtr<ID3D11Texture2D> back;
-    if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
+    if (floatingScene_) back = colors_.Texture();
+    else if (FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
     D3D11_TEXTURE2D_DESC bd{}; back->GetDesc(&bd);
     const UINT w = static_cast<UINT>(x1 - x0), h = static_cast<UINT>(y1 - y0);
     if (!lensScene_ || lensW_ != w || lensH_ != h) {
@@ -1634,6 +1663,7 @@ void Panel::Render() {
     // the same open-animation scale the D2D pass used).
     if (lensOpacity_ > 0.002f) { DrawSwitchLens(scaled(lensThumb_), lensOpacity_); DrawLensHighlights(lensThumb_, lensOpacity_, k, D2D1::Point2F(pivotX, pivotY)); }
     if (snapshotRequested_) SaveSnapshot();
+    if (floatingScene_ && !colors_.Resolve(outputRtv_.Get(), scRgb_ ? colors_.WhiteForWindow(hwnd) : 0.f)) return;
     swap_->Present(1, 0);
     if (!tFirstPresent_) tFirstPresent_ = Ms();
     if (!lastGlass_ && !tFirstFallback_) { tFirstFallback_ = Ms(); DLOG(L"cc: first fallback presented ms=%.1f", tFirstFallback_); }
@@ -1644,7 +1674,9 @@ void Panel::SaveSnapshot() {
     snapshotRequested_ = false;
     if (snapshotDir_.empty()) return;
     ComPtr<ID3D11Texture2D> back, staging;
-    swap_->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (floatingScene_) back = colors_.SdrSnapshot();
+    else swap_->GetBuffer(0, IID_PPV_ARGS(&back));
+    if (!back) return;
     D3D11_TEXTURE2D_DESC d{};
     back->GetDesc(&d);
     d.Usage = D3D11_USAGE_STAGING;

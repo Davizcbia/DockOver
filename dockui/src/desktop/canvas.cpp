@@ -1,5 +1,6 @@
 #include "canvas.h"
 #include "../ui_language.h"
+#include "../sdr_dither.h"
 #include "../desktop_settings.h"
 #include "../music_wallpaper_frame.h"
 #include "../theme_state.h"
@@ -533,12 +534,28 @@ Theme PaintPlate(ID2D1RenderTarget* rt, D2D1_RECT_F shape, const RECT& screen, c
     if (gradient) {
         const auto top = Rgb(theme.dark ? 0x212121 : 0xf9f9fa);
         const auto bottom = Rgb(theme.dark ? 0x0e0e0e : 0xececee);
-        const D2D1_GRADIENT_STOP colors[] = {{0.f, top}, {1.f, bottom}};
-        ComPtr<ID2D1GradientStopCollection> stops;
-        ComPtr<ID2D1LinearGradientBrush> fill;
-        if (SUCCEEDED(rt->CreateGradientStopCollection(colors, ARRAYSIZE(colors), &stops)) &&
-            SUCCEEDED(rt->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties(
-                D2D1::Point2F(shape.left, shape.top), D2D1::Point2F(shape.left, shape.bottom)), stops.Get(), &fill))) {
+        float dpiX = 96.f, dpiY = 96.f;
+        rt->GetDpi(&dpiX, &dpiY);
+        const auto rows = static_cast<UINT>(std::clamp(std::ceil((shape.bottom - shape.top) * dpiY / 96.f), 1.f, 8192.f));
+        constexpr UINT cols = 8;
+        std::vector<std::uint32_t> pixels(static_cast<size_t>(rows) * cols);
+        for (UINT y = 0; y < rows; ++y) {
+            const float t = (y + 0.5f) / rows;
+            for (UINT x = 0; x < cols; ++x) {
+                const auto r = docky::color::Quantize8(std::lerp(top.r, bottom.r, t) * 255.f, x, y);
+                const auto g = docky::color::Quantize8(std::lerp(top.g, bottom.g, t) * 255.f, x, y);
+                const auto b = docky::color::Quantize8(std::lerp(top.b, bottom.b, t) * 255.f, x, y);
+                pixels[y * cols + x] = 0xff000000u | (r << 16) | (g << 8) | b;
+            }
+        }
+        ComPtr<ID2D1Bitmap> pattern;
+        ComPtr<ID2D1BitmapBrush> fill;
+        const auto bitmapProps = D2D1::BitmapProperties(D2D1::PixelFormat(
+            DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), dpiX, dpiY);
+        if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(cols, rows), pixels.data(), cols * 4, bitmapProps, &pattern)) &&
+            SUCCEEDED(rt->CreateBitmapBrush(pattern.Get(), D2D1::BitmapBrushProperties(D2D1_EXTEND_MODE_WRAP,
+                D2D1_EXTEND_MODE_CLAMP, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR), &fill))) {
+            fill->SetTransform(D2D1::Matrix3x2F::Translation(shape.left, shape.top));
             rt->FillGeometry(outline.Get(), fill.Get());
         } else {
             brush->SetColor(top);

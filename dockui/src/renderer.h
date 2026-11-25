@@ -115,7 +115,8 @@ private:
 
 class Renderer {
 public:
-    ~Renderer() { Shutdown(); }
+    Renderer();
+    ~Renderer();
     HRESULT Init(HWND hwnd, UINT pxW, UINT pxH, float dpi, bool aboveChildWindows = true);
     void Shutdown();
     bool Ready() const { return dc_ != nullptr; }
@@ -171,6 +172,7 @@ private:
     float lastUiMs_ = 0.0f;
     uint64_t composedFrames_ = 0;
     HRESULT CreateTarget();
+    ComPtr<ID3D11Texture2D> SnapshotSource();
     bool RenderLocalGlass(const LocalGlassOverlay& overlay);
     void DrawScene(const Scene& scene, bool drawPlate);
     ComPtr<ID2D1PathGeometry> ContinuousRect(D2D1_RECT_F r, float radius);
@@ -206,6 +208,8 @@ private:
     std::unique_ptr<IPlateMaterial> liquid_;    // Liquid Glass (GPU)
     ComPtr<ID3D11DeviceContext> ctx_;
     ComPtr<ID3D11RenderTargetView> rtv_;
+    struct Output;
+    std::unique_ptr<Output> output_;
     struct LocalGlassCache {ComPtr<ID3D11Texture2D> scene;UINT width=0,height=0;std::unique_ptr<IPlateMaterial> material;};
     std::array<LocalGlassCache,4> localGlassCaches_;
     uint64_t localSceneFrame_ = 0;

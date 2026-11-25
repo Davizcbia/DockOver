@@ -43,6 +43,7 @@ struct alignas(16) GlassConstants {
     float pointer[4];
     float interact[4];
     float extra[4];
+    float outputOptions[4];
 };
 static_assert(sizeof(GlassConstants) % 16 == 0, "cbuffer size");
 
@@ -183,6 +184,10 @@ public:
         Set(c.pointer, g.pointerX, g.pointerY, g.hover, g.press);
         Set(c.interact, p.interactionStrength, p.interactionRadius, static_cast<float>(p.debugView), g.rotationDeg * 0.0174532925f);
         Set(c.extra, p.bodyTone, p.edgeSoftness * s, p.highlightDim, static_cast<float>(p.settingsShape));
+        D3D11_RENDER_TARGET_VIEW_DESC targetDesc{};
+        g.target->GetDesc(&targetDesc);
+        c.outputOptions[0] = targetDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                             targetDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ? 1.f : 0.f;
         Upload(ctx, glassCb_.Get(), &c, sizeof(c));
 
         D3D11_VIEWPORT vp{0, 0, static_cast<float>(g.targetWidth), static_cast<float>(g.targetHeight), 0, 1};
