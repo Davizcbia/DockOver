@@ -650,9 +650,24 @@ void MaintainFilled(){
     }
 }
 void SetFullscreenApp(HWND h,bool full);
+// The hidden Windows taskbar keeps its reserved strip (its AppBar cannot be removed from outside Explorer). While a
+// maximize-button full screen is in front, that monitor's work area is set to the whole monitor without broadcasting
+// (Explorer reverts a broadcast change at once; see taskbar_workarea.h); re-registering the bars on leaving makes
+// Explorer derive the work area again, and the work area from before is put back if it did not.
+struct WorkOverride{bool active=false;HMONITOR monitor=nullptr;RECT before{};}workOverride;
+void RestoreWorkOverride(){
+    if(!workOverride.active)return;
+    workOverride.active=false;
+    MONITORINFO mi{sizeof(mi)};
+    if(GetMonitorInfoW(workOverride.monitor,&mi)&&EqualRect(&mi.rcWork,&mi.rcMonitor)){
+        SystemParametersInfoW(SPI_SETWORKAREA,0,&workOverride.before,SPIF_SENDCHANGE);
+        DLOG(L"menu: work area put back after full screen %ld,%ld-%ld,%ld",workOverride.before.left,workOverride.before.top,workOverride.before.right,workOverride.before.bottom);
+    }
+}
 void EnterFullscreen(HWND w){
     if(!IsZoomed(w))return;
     for(const auto& f:buttonFullscreen)if(f.w==w)return;
+    if(!workOverride.active){MONITORINFO mi{sizeof(mi)};if(GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi))workOverride.before=mi.rcWork;}
     buttonFullscreen.push_back({w});
     fullscreenWindow=w;
     // The bar and the Dock hide and give back their space (SetFullscreenApp / the Dock's kDockFullscreenMsg 2): the work
@@ -663,9 +678,17 @@ void EnterFullscreen(HWND w){
 // Normally Windows has already resized the maximized window to the new work area; some apps keep their old size.
 void GrowFullscreen(){
     for(const auto& f:buttonFullscreen){
-        if(!IsWindow(f.w)||!IsZoomed(f.w)||CoversMonitor(f.w))continue;
-        MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(MonitorFromWindow(f.w,MONITOR_DEFAULTTONEAREST),&mi))continue;
-        if(!EqualRect(&mi.rcWork,&mi.rcMonitor))continue;  // space not released (yet)
+        if(!IsWindow(f.w)||!IsZoomed(f.w)||CoversMonitor(f.w)||f.w!=fullscreenWindow)continue;
+        const HMONITOR monitor=MonitorFromWindow(f.w,MONITOR_DEFAULTTONEAREST);
+        MONITORINFO mi{sizeof(mi)};if(!GetMonitorInfoW(monitor,&mi))continue;
+        if(!EqualRect(&mi.rcWork,&mi.rcMonitor)){
+            // Only the taskbar's strip may be left: the bar's own space must be released already (top edge free).
+            if(mi.rcWork.top!=mi.rcMonitor.top)continue;
+            if(!SystemParametersInfoW(SPI_SETWORKAREA,0,&mi.rcMonitor,0))continue;
+            if(!workOverride.active){workOverride.active=true;workOverride.monitor=monitor;}
+            DLOG(L"menu: full screen: work area set to the whole monitor (taskbar strip %ld px)",
+                 (mi.rcMonitor.bottom-mi.rcWork.bottom)+(mi.rcWork.left-mi.rcMonitor.left)+(mi.rcMonitor.right-mi.rcWork.right));
+        }
         fullscreenBusy=true;PlaceVisible(f.w,mi.rcMonitor);fullscreenBusy=false;
         DLOG(L"menu: full-screen window grown to the monitor");
     }
@@ -884,7 +907,7 @@ void SetFullscreenApp(HWND h,bool full){
         if(IsButtonFullscreen(fullscreenWindow))RemoveAppBar(h);  // Place() registers it again when full screen ends
         // Game mode: EVENT_OBJECT_LOCATIONCHANGE also fires for every pointer move, and raw input for every mouse packet.
         if(locationHook){UnhookWinEvent(locationHook);locationHook=nullptr;}DropRawMouse();}
-    else{Place(h);ShowWindow(h,SW_SHOWNOACTIVATE);if(inputWindow)ShowWindow(inputWindow,SW_SHOWNOACTIVATE);Render(h);
+    else{Place(h);RestoreWorkOverride();ShowWindow(h,SW_SHOWNOACTIVATE);if(inputWindow)ShowWindow(inputWindow,SW_SHOWNOACTIVATE);Render(h);
         if(!locationHook&&shellHooksEnabled)locationHook=SetWinEventHook(EVENT_OBJECT_LOCATIONCHANGE,EVENT_OBJECT_LOCATIONCHANGE,nullptr,OnLocationChange,0,0,WINEVENT_OUTOFCONTEXT|WINEVENT_SKIPOWNPROCESS);
         if(shellHooksEnabled)EnsureRawMouse();}
 }
@@ -1654,7 +1677,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(w==kTrayTimer){KillTimer(h,kTrayTimer);trayIcons=docky::tray::Get().Snapshot();extraImages.clear();Render(h);return 0;}
         if(w==kFullscreenGrowTimer){KillTimer(h,kFullscreenGrowTimer);GrowFullscreen();return 0;}
         if(w==kUnsnapTimer){KillTimer(h,kUnsnapTimer);UnsnapPending();return 0;}
-        if(w==kFullscreenTimer){MaintainButtonFullscreen();
+        if(w==kFullscreenTimer){MaintainButtonFullscreen();if(fullscreenApp)GrowFullscreen();
             {const bool listed=!menuGameWatch.Poll(themeSettingsPath,gameCompatibility).empty();if(listed!=listedGameMenu){listedGameMenu=listed;DLOG(L"menu: games list %ls",listed?L"program running: bar hidden":L"no listed program running");}}
             SetFullscreenApp(h,FullscreenForeground()||listedGameMenu);SyncGameCompatibility(h);
             if(gameSuppressed){DropRawMouse();return 0;}
