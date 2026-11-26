@@ -1,4 +1,5 @@
 #pragma once
+#include "vblank.h"
 
 #include <windows.h>
 #include <dwmapi.h>
@@ -71,6 +72,8 @@ private:
     int columns_ = 1, pageSize_ = 1, page_ = 0, hovered_ = -1, pressed_ = -1;
     int cellWidth_ = 0, imageHeight_ = 0, cellHeight_ = 0;
     ULONGLONG shownAt_ = 0;
+    docky::vblank::Ticker appearanceTicker_;
+    double fadeStart_ = 0;
     float appear_ = 0.f;
 };
 

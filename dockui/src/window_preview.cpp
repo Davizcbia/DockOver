@@ -18,7 +18,7 @@ using Microsoft::WRL::ComPtr;
 constexpr wchar_t kPreviewClass[] = L"DockOverWindowPreview";
 constexpr wchar_t kPreviewClassGdi[] = L"DockOverWindowPreviewGdi";
 constexpr int kPrevious = -2, kNext = -3, kNoHit = -1, kButtonBase = 1000;
-constexpr UINT_PTR kTimerCapture = 1, kTimerAppear = 2, kTimerHealth = 3;
+constexpr UINT_PTR kTimerCapture = 1, kTimerHealth = 3;
 
 // Layout (DIP). Corners are concentric: each nested shape's radius is its parent's minus the inset between them.
 constexpr int kPad = 8;                               // panel edge -> card
@@ -169,7 +169,8 @@ bool WindowPreview::Show(HWND owner, UINT activateMessage, RECT anchor, UINT dpi
         shownAt_ = GetTickCount64();
         surface_->Materialize(0.f, false);
         surface_->Start();
-        SetTimer(window_, kTimerAppear, 15, nullptr);
+        fadeStart_ = 0;
+        appearanceTicker_.Start(window_, docky::vblank::kMsgVBlank);
         SetTimer(window_, kTimerHealth, 1000, nullptr);
     }
     LayoutPage();
@@ -195,7 +196,7 @@ void WindowPreview::Hide() {
     if (Visible()) ShowWindow(window_, SW_HIDE);
     if (window_) {
         KillTimer(window_, kTimerCapture);
-        KillTimer(window_, kTimerAppear);
+        appearanceTicker_.Stop();
         KillTimer(window_, kTimerHealth);
     }
     if (surface_) surface_->Suspend();
@@ -480,14 +481,16 @@ void WindowPreview::Paint() {
 // Reveal: like the menu, coverage waits (up to 0.25 s) for the first captured backdrop so no fallback frame flashes,
 // then fades in over ~140 ms (at once with Reduce motion).
 void WindowPreview::StepAppear() {
-    if (!surface_) { KillTimer(window_, kTimerAppear); return; }
+    if (!surface_) { appearanceTicker_.Stop(); return; }
     const ULONGLONG now = GetTickCount64();
     if (!surface_->GlassReady() && now - shownAt_ < 250) return;
     BOOL animations = TRUE;
     const bool reduced = SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0) && !animations;
-    appear_ = reduced ? 1.f : (std::min)(1.f, appear_ + 15.f / 140.f);
+    const double seconds = docky::vblank::Seconds();
+    if (!fadeStart_) fadeStart_ = seconds;
+    appear_ = reduced ? 1.f : static_cast<float>((std::min)(1.0, (seconds - fadeStart_) / 0.14));
     surface_->Materialize(appear_, false);
-    if (appear_ >= 1.f) KillTimer(window_, kTimerAppear);
+    if (appear_ >= 1.f) appearanceTicker_.Stop();
 }
 
 LRESULT CALLBACK WindowPreview::WndProc(HWND window, UINT message, WPARAM w, LPARAM l) {
@@ -512,9 +515,9 @@ LRESULT WindowPreview::Handle(UINT message, WPARAM w, LPARAM l) {
             if (surface_->CompletionEvent()) SetTimer(window_, kTimerCapture, 8, nullptr);
         }
         return 0;
+    case docky::vblank::kMsgVBlank: appearanceTicker_.Ack(); StepAppear(); return 0;
     case WM_TIMER:
-        if (w == kTimerAppear) StepAppear();
-        else if (w == kTimerCapture && surface_) {
+        if (w == kTimerCapture && surface_) {
             const HANDLE event = surface_->CompletionEvent();
             if (event && WaitForSingleObject(event, 0) == WAIT_OBJECT_0 && surface_->Complete()) InvalidateRect(window_, nullptr, FALSE);
             if (!surface_->CompletionEvent()) KillTimer(window_, kTimerCapture);

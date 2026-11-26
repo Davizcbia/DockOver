@@ -29,6 +29,7 @@
 #include "local_tags.h"
 #include "silk_renderer.h"
 #include "../desktop_settings.h"
+#include "../vblank.h"
 #include "../json_lite.h"
 
 #include <windows.h>
@@ -1560,7 +1561,9 @@ private:
             if (media_) media_->SetLocalTags(localTags_);
             lyricsBeat_ = loaded.value.controlCenter.lyricsBeat;
             lyricsOffsetMs_ = loaded.value.controlCenter.lyricsOffsetMs;
-            musicFps_ = loaded.value.controlCenter.musicFps;
+            const int globalCap = loaded.value.performance.animationFps;
+            const int musicCap = loaded.value.controlCenter.musicFps;
+            musicFps_ = musicCap > 0 ? (std::min)(globalCap,musicCap) : globalCap;
             musicResponse_ = static_cast<MusicResponse>(loaded.value.controlCenter.musicResponse);
             beat_.SetSensitivity(loaded.value.controlCenter.musicSensitivity);
             const bool lyricsBefore = wallpaperLyrics_;
@@ -2221,8 +2224,8 @@ private:
                 }
                 const bool anim = wallAlpha_ != before || prev_ || finishedTransition || lyricsMoving || beatFrame;
                 if (shown_ && (dirty_ || anim || frame)) { Render(prev_ ? std::min(1.f, mix) : 1.f, wallAlpha_); dirty_ = false; }
-                else if (shown_ && ((cur_ && cur_->video && VideoShouldPlay()) || pendingVideo_)) DwmFlush();
-                else if (shown_ && !covered_ && LyricsView() && snapshot_.playing && musicFps_ <= 0) DwmFlush();
+                else if (shown_ && ((cur_ && cur_->video && VideoShouldPlay()) || pendingVideo_)) docky::vblank::WaitFrame(hwnd_);
+                else if (shown_ && !covered_ && LyricsView() && snapshot_.playing && musicFps_ <= 0) docky::vblank::WaitFrame(hwnd_);
                 else if (shown_ && !covered_ && LyricsView() && snapshot_.playing)
                     WaitForMusicFrame(lastBeatFrame_ + 1.0 / musicFps_);
                 else MsgWaitForMultipleObjects(0, nullptr, FALSE, shown_ && !covered_ ? UntilNextLine() : 1000, QS_ALLINPUT);
@@ -2255,7 +2258,7 @@ private:
                 Render(prev_ ? std::min(1.f, mix) : 1.f, closing_ >= 0 ? 1 - closeT : appear);
                 dirty_ = false;
             } else if ((cur_ && cur_->video && snapshot_.playing) || pendingVideo_) {
-                DwmFlush();  // a motion frame may be due by the next composition
+                docky::vblank::WaitFrame(hwnd_);  // a motion frame may be due by the next composition
             } else {
                 MsgWaitForMultipleObjects(0, nullptr, FALSE, 1000, QS_ALLINPUT);
             }

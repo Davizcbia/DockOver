@@ -8,6 +8,11 @@
 
 namespace liquid::cc {
 
+inline constexpr wchar_t kStageDockWindow[] = L"LiquidDockV01";
+inline constexpr wchar_t kStageEnabledProperty[] = L"DockOver.StageManagerActive";
+inline constexpr UINT kToggleStage = WM_APP + 212;
+inline constexpr UINT kStageChanged = WM_APP + 125;
+
 // anchor: screen rectangle (physical pixels) of the Menu Bar's Control Center icon.
 // notify/notifyMessage: posted after the panel changed system state or closed (Menu Bar refresh).
 void SetSettingsPath(const std::wstring& path);

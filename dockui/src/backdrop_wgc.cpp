@@ -29,6 +29,17 @@ using Microsoft::WRL::ComPtr;
 
 namespace dock {
 namespace {
+void EnsureRoiTexture(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& desc,
+                      ComPtr<ID3D11Texture2D>& texture) {
+    if (texture) {
+        D3D11_TEXTURE2D_DESC existing{};
+        texture->GetDesc(&existing);
+        if (existing.Width == desc.Width && existing.Height == desc.Height &&
+            existing.Format == desc.Format && existing.BindFlags == desc.BindFlags) return;
+    }
+    check_hresult(device->CreateTexture2D(&desc, nullptr, texture.ReleaseAndGetAddressOf()));
+}
+
 // Request from the calling window's initialized apartment; never block its message loop.
 // Process-lifetime storage keeps the async operation alive while the Windows prompt is open.
 using BorderlessOperation=winrt::Windows::Foundation::IAsyncOperation<winrt::Windows::Security::Authorization::AppCapabilityAccess::AppCapabilityAccessStatus>;
@@ -325,12 +336,12 @@ bool WgcBackdropSource::Start(HMONITOR monitor, bool tryDuplication) {
         // Capture cadence: the 2026-11-10 log shows publishes every 16-20 ms (about 60 fps) on a 240 Hz display,
         // so content moving behind the Dock (a dragged window) updated only every ~4 refreshes. Newer Windows
         // exposes MinUpdateInterval; its default is not documented, so request the minimum and log both values.
+        startedCap_ = docky::vblank::CaptureCap();
         if (winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
                 L"Windows.Graphics.Capture.GraphicsCaptureSession", L"MinUpdateInterval")) {
             try {
                 const auto before = session_.MinUpdateInterval();
                 // Settings > General > Frame rate > capture: at most that many desktop frames per second (1 ms = no cap).
-                startedCap_ = docky::vblank::CaptureCap();
                 const auto interval = startedCap_ > 0 ? std::chrono::microseconds(1000000 / startedCap_) : std::chrono::microseconds(1000);
                 session_.MinUpdateInterval(std::chrono::duration_cast<winrt::Windows::Foundation::TimeSpan>(interval));
                 DLOG(L"wgc: MinUpdateInterval %.2f ms -> %.2f ms",
@@ -383,6 +394,7 @@ void WgcBackdropSource::Stop() {
     if (retryTimer_) CancelWaitableTimer(retryTimer_);
     if (gpuEvent_) ResetEvent(gpuEvent_);
     candidate_.Reset();
+    normalizationInput_.Reset();
     normalizeShader_.Reset();
     normalizeConstants_.Reset();
     floatingCapture_ = false;
@@ -529,6 +541,25 @@ void WgcBackdropSource::SubmitCompare(UINT width, UINT height) {
     context_->Flush();
 }
 
+void WgcBackdropSource::DiscardCompare() {
+    inFlight_ = false;
+    retryMap_ = false;
+    if (retryTimer_) CancelWaitableTimer(retryTimer_);
+    if (gpuEvent_) ResetEvent(gpuEvent_);
+}
+
+void WgcBackdropSource::PublishCandidate() {
+    texture_.Swap(candidate_);
+    copiedRect_ = candidateRect_;
+    copiedId_ = candidateId_;
+    publishedTime_ = candidateTime_;
+    publishedLp_ = candidateLp_;
+    ++contentVersion_;
+    ++publishedCount_;
+    state_ = 2;
+    NotePublished();
+}
+
 bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
     if (!device_ || !context_) return false;
     RECT wanted = wantedIn; OffsetRect(&wanted, -ProbeOffset(), 0);  // dev probe only (0 otherwise)
@@ -549,16 +580,20 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
     // comparison (it only decided whether the older image was worth publishing) and take the newer frame now. Waiting
     // for it delayed live wallpaper frames by ~2 ms on average, up to ~50 ms (measured 2026-11-20). Only changes outside
     // the window can cut in, so the window's own redraws still cannot drive each other.
-    if (inFlight_ && hasRoi && d.Valid() && d.ChangedKind(roi, dxgiSeen_, own) == 2) {
-        inFlight_ = false; retryMap_ = false; candidate_.Reset();
-        if (retryTimer_) CancelWaitableTimer(retryTimer_);
-        if (gpuEvent_) ResetEvent(gpuEvent_);
-    }
+    if (inFlight_ && hasRoi && d.Valid() && d.ChangedKind(roi, dxgiSeen_, own) == 2) DiscardCompare();
     if (!hasRoi || inFlight_ || !d.Valid() || !d.Fresh(roi)) return false;  // Fresh: wait for the full copy (SharedDesktop)
     if (!dxgiView_ || dxgiGeneration_ != d.Generation()) {
         dxgiView_.Reset();
         const HANDLE shared = d.SharedHandle();
-        if (!shared || FAILED(device_->OpenSharedResource(shared, IID_PPV_ARGS(&dxgiView_)))) { dxgiView_.Reset(); return false; }
+        if (!shared) return false;
+        const HRESULT opened = device_->OpenSharedResource(shared, IID_PPV_ARGS(&dxgiView_));
+        if (FAILED(opened)) {
+            DLOG(L"capture: cannot open duplication texture (0x%08X); trying borderless WGC", static_cast<unsigned>(opened));
+            const HMONITOR monitor = monitor_;
+            Stop();
+            StartOrWait(monitor, false);
+            return true;
+        }
         dxgiGeneration_ = d.Generation();
         texture_.Reset(); copiedRect_ = {};
     }
@@ -574,7 +609,7 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
         dxgiView_->GetDesc(&shared);
         D3D11_TEXTURE2D_DESC desc{}; desc.Width = width; desc.Height = height; desc.MipLevels = desc.ArraySize = 1;
         desc.Format = shared.Format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        candidate_.Reset(); check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
+        EnsureRoiTexture(device_.Get(), desc, candidate_);
         const D3D11_BOX box{static_cast<UINT>(roi.left - monitorRect_.left), static_cast<UINT>(roi.top - monitorRect_.top), 0,
                             static_cast<UINT>(roi.right - monitorRect_.left), static_cast<UINT>(roi.bottom - monitorRect_.top), 1};
         context_->CopySubresourceRegion(candidate_.Get(), 0, 0, 0, 0, dxgiView_.Get(), 0, &box);
@@ -596,8 +631,7 @@ bool WgcBackdropSource::ProcessDuplication(const RECT& wantedIn) {
         const double ownWindow = (std::min)(0.035, 2.5 * docky::vblank::FramePeriod().load() + 0.004);
         const bool drewRecently = lastDrawQpc_ && static_cast<double>(now.QuadPart - lastDrawQpc_) < ownWindow * freq.QuadPart;
         if (moved || kind == 2 || (kind == 1 && !drewRecently) || !compareShader_ || !context4_ || !fence_) {
-            texture_ = candidate_; candidate_.Reset(); copiedRect_ = roi; copiedId_ = candidateId_; publishedTime_ = candidateTime_; publishedLp_ = candidateLp_;
-            ++contentVersion_; ++publishedCount_; state_ = 2; NotePublished();
+            PublishCandidate();
             DLOG_DEBUG(L"capture: duplication publish content=%llu roi=(%ld,%ld)-(%ld,%ld)", static_cast<unsigned long long>(contentVersion_), roi.left, roi.top, roi.right, roi.bottom);
             return true;
         }
@@ -626,7 +660,10 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
               pending_->roiValid = true;
           } else pending_->roiValid = false; }
         pending_->posted = false;
-        if (inFlight_) return false;
+        if (inFlight_) {
+            if (!pending_->frame || !pending_->frameDirtyHit) return false;
+            DiscardCompare();
+        }
         if (pending_->frame) { current_ = std::move(pending_->frame); currentId_ = pending_->sequence; currentDirtyHit_ = pending_->frameDirtyHit;
             capturedAt_ = current_.SystemRelativeTime().count() / 10000000.0; }
     }
@@ -646,16 +683,14 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
         D3D11_TEXTURE2D_DESC desc{}; desc.Width=width; desc.Height=height; desc.MipLevels=desc.ArraySize=1;
         desc.Format=sourceDesc.Format; desc.SampleDesc.Count=1; desc.Usage=D3D11_USAGE_DEFAULT; desc.BindFlags=D3D11_BIND_SHADER_RESOURCE;
         D3D11_BOX box{static_cast<UINT>(roi.left-monitorRect_.left),static_cast<UINT>(roi.top-monitorRect_.top),0,static_cast<UINT>(roi.right-monitorRect_.left),static_cast<UINT>(roi.bottom-monitorRect_.top),1};
-        candidate_.Reset();
         if (floatingCapture_ && desc.Format == docky::color::SceneFormat) {
-            ComPtr<ID3D11Texture2D> cropped;
-            check_hresult(device_->CreateTexture2D(&desc, nullptr, &cropped));
-            context_->CopySubresourceRegion(cropped.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
+            EnsureRoiTexture(device_.Get(), desc, normalizationInput_);
+            context_->CopySubresourceRegion(normalizationInput_.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
             desc.BindFlags |= D3D11_BIND_UNORDERED_ACCESS;
-            check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
+            EnsureRoiTexture(device_.Get(), desc, candidate_);
             ComPtr<ID3D11ShaderResourceView> input;
             ComPtr<ID3D11UnorderedAccessView> output;
-            check_hresult(device_->CreateShaderResourceView(cropped.Get(), nullptr, &input));
+            check_hresult(device_->CreateShaderResourceView(normalizationInput_.Get(), nullptr, &input));
             check_hresult(device_->CreateUnorderedAccessView(candidate_.Get(), nullptr, &output));
             const auto now = GetTickCount64();
             if (now >= nextWhiteCheck_) {
@@ -679,7 +714,7 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
             context_->CSSetUnorderedAccessViews(0, 1, &noOutput, nullptr);
             context_->CSSetShader(nullptr, nullptr, 0);
         } else {
-            check_hresult(device_->CreateTexture2D(&desc, nullptr, &candidate_));
+            EnsureRoiTexture(device_.Get(), desc, candidate_);
             context_->CopySubresourceRegion(candidate_.Get(), 0, 0, 0, 0, source.Get(), 0, &box);
         }
         candidateRect_=roi; candidateId_=currentId_; candidateTime_=capturedAt_;
@@ -688,8 +723,7 @@ bool WgcBackdropSource::ProcessCapture(const RECT& wanted) {
         // rectangles inside the ROI the content is known to have changed, so publish this frame immediately;
         // the compare only remains for frames without usable dirty data.
         if (!texture_ || !EqualRect(&roi,&copiedRect_) || !compareShader_ || !context4_ || !fence_ || currentDirtyHit_) {
-            texture_=candidate_; candidate_.Reset(); copiedRect_=roi; copiedId_=candidateId_; publishedTime_=candidateTime_; publishedLp_=candidateLp_;
-            ++contentVersion_; ++publishedCount_; state_=2; NotePublished();
+            PublishCandidate();
             if (diagnostics_) CompareRoi();
             // Per frame, so debug only (it was ~240 lines/s with a video wallpaper: 564 MB of log).
             DLOG_DEBUG(L"wgc: baseline or conservative publish capture=%llu content=%llu roi=(%ld,%ld)-(%ld,%ld)", copiedId_, contentVersion_, roi.left, roi.top, roi.right, roi.bottom);
@@ -726,9 +760,11 @@ bool WgcBackdropSource::CompleteCompare(const RECT& wanted) {
         const bool exactChanged = CompareRoi(candidate_.Get(), changed);
         if (exactChanged != changed) DLOG(L"ERROR gpu comparison disagrees with exact diagnostic GPU=%d exact=%d", changed, exactChanged);
     }
-    if (changed && valid) { texture_=candidate_; copiedRect_=candidateRect_; copiedId_=candidateId_;
-        publishedTime_=candidateTime_; publishedLp_=candidateLp_; ++contentVersion_; ++publishedCount_; published=true; NotePublished(); DLOG_DEBUG(L"wgc: content publish capture=%llu content=%llu", static_cast<unsigned long long>(copiedId_), static_cast<unsigned long long>(contentVersion_)); }
-    candidate_.Reset();
+    if (changed && valid) {
+        PublishCandidate();
+        published = true;
+        DLOG_DEBUG(L"wgc: content publish capture=%llu content=%llu", static_cast<unsigned long long>(copiedId_), static_cast<unsigned long long>(contentVersion_));
+    }
     if (!valid) candidateId_=0;
     PostMessageW(hwnd_,kMsgCaptureAvailable,0,0);
     return published;

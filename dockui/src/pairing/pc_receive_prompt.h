@@ -25,6 +25,8 @@ struct Offer {
     HFONT title{}, body{};
     HICON icon{};
     motion::Spring entrance;
+    docky::vblank::Ticker entranceTicker;
+    double stepTime = 0;
     std::string pending;
     phone_settings::Palette palette = phone_settings::ChoosePalette();
 
@@ -179,16 +181,20 @@ inline LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
             DestroyWindow(window);
         }
         return 0;
+    case docky::vblank::kMsgVBlank: {
+        offer->entranceTicker.Ack();
+        const double seconds=docky::vblank::Seconds();
+        offer->entrance.Step(std::clamp(seconds-offer->stepTime,0.0,0.05));
+        offer->stepTime=seconds;
+        const double remaining=1.0-offer->entrance.Value();
+        SetWindowPos(window,nullptr,offer->x+offer->Dip(static_cast<int>(remaining*offer->width)),offer->y,0,0,
+                     SWP_NOACTIVATE|SWP_NOSIZE|SWP_NOZORDER);
+        if(offer->entrance.AtRest())offer->entranceTicker.Stop();
+        return 0;
+    }
     case WM_TIMER: {
         const auto now = GetTickCount64();
         if (offer->Terminal() && now >= offer->closeAt) { DestroyWindow(window); return 0; }
-        if (!offer->entrance.AtRest()) {
-            offer->entrance.Step(std::min(0.05, (now - offer->last) / 1000.0));
-            const double remaining = 1.0 - offer->entrance.Value();
-            SetWindowPos(window, nullptr, offer->x + offer->Dip(static_cast<int>(remaining * offer->width)),
-                offer->y, 0, 0,
-                SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER);
-        }
         offer->last = now;
         PollInput(window, *offer, now);
         return 0;
@@ -198,6 +204,7 @@ inline LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
         DestroyWindow(window);
         return 0;
     case WM_DESTROY:
+        offer->entranceTicker.Stop();
         KillTimer(window, kTick);
         PostQuitMessage(0);
         return 0;
@@ -273,7 +280,9 @@ inline int RunBanner(HINSTANCE instance, Offer& offer) {
     offer.accept = button(Ui(L"接受"), kAccept, offer.width - 100, 81, true);
     offer.open = button(Ui(L"打开文件夹"), kOpen, offer.width - 145, 126, false);
     offer.last = GetTickCount64();
-    SetTimer(window, kTick, 16, nullptr);
+    offer.stepTime=docky::vblank::Seconds();
+    offer.entranceTicker.Start(window,docky::vblank::kMsgVBlank);
+    SetTimer(window,kTick,50,nullptr);
     ShowWindow(window, SW_SHOWNOACTIVATE);
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

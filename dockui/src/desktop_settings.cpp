@@ -55,6 +55,9 @@ Result Load(const std::wstring& path) {
         if(diag->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;return r;}
         r.value.dock.diagnostics=diag->boolean;
     }
+    if (const auto* dock = root.Find("dock"))
+        if (const auto* perspective = dock->Find("stagePerspective"); perspective && perspective->type == dock::json::Value::Type::Bool)
+            r.value.dock.stagePerspective = perspective->boolean;
     if(const auto* section=root.Find("dock")) if(const auto* hide=section->Find("autoHide")){
         if(hide->type!=dock::json::Value::Type::Bool){r.status=LoadStatus::Invalid;r.value=Settings{};return r;}
         r.value.dock.autoHide=hide->boolean;

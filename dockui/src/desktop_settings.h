@@ -8,7 +8,7 @@ namespace liquid::settings {
 // program from the game list (GameListPath: game-compat.txt beside the settings file, one .exe name per line) runs.
 // lowLatencyGlass (opt-in): the Dock's glass shows the desktop one display frame after it was composed (one-frame DXGI
 // path, dockui/docs/glass-one-frame-latency-v01.md); off = the standard path.
-struct Dock { bool diagnostics = false; bool useMacIconMask = true; bool autoHide = false; bool hideSnapLayouts = false; bool genieMinimize = false; bool gameCompatibility = false;
+struct Dock { bool diagnostics = false; bool useMacIconMask = true; bool autoHide = false; bool hideSnapLayouts = false; bool genieMinimize = false; bool stagePerspective = true; bool gameCompatibility = false;
     bool lowLatencyGlass = false;
     int iconSize = 46;               // Dock icon size in DIP (screen width limits the live size)
     int magnification = 126;         // hover magnification in percent added to the icon (0 = none, 150 = 2.5x); default 2.26x

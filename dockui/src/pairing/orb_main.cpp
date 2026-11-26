@@ -572,7 +572,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { if (m.message == WM_QUIT) g_quit = true; TranslateMessage(&m); DispatchMessageW(&m); }
         if (g_quit) break;
         app.Frame();
-        docky::vblank::WaitFrame();
+        docky::vblank::WaitFrame(g_wnd);
     }
     app.Shutdown();
     g_app = nullptr;

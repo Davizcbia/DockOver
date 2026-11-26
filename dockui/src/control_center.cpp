@@ -305,7 +305,7 @@ bool ActivateMediaApp(const std::wstring& id) {
 
 enum class Page { Main, Wifi, Bluetooth };
 enum class Hit {
-    None, WifiToggle, WifiBody, BtToggle, BtBody, Airplane, Focus, Battery, MediaPrev, MediaPlay, MediaNext, Media, MediaCover,
+    None, WifiToggle, WifiBody, BtToggle, BtBody, Airplane, Focus, Battery, Stage, MediaPrev, MediaPlay, MediaNext, Media, MediaCover,
     DisplayTitle, DisplaySlider, SoundTitle, SoundSlider, Mute, Back, PageSwitch, Row, OtherNetworks, Settings, ManageOutputs
 };
 
@@ -450,7 +450,8 @@ private:
     Page page_ = Page::Main;
     std::vector<Module> modules_;  // glass plates of the current page
     // Main-page geometry
-    Module wifi_, bt_, media_, airplane_, focus_, battery_, display_, sound_;
+    Module wifi_, bt_, media_, airplane_, focus_, stage_, battery_, display_, sound_;
+    HWND StageDock() const;
     D2D1_RECT_F displayTrack_{}, soundTrack_{}, muteBtn_{}, prevBtn_{}, playBtn_{}, nextBtn_{};
     // Detail-page geometry
     Module detail_;
@@ -802,6 +803,13 @@ void Panel::EditOutput(size_t index) {
     if (closeAfterOutputEditor_) Close(L"toggle");
 }
 
+HWND Panel::StageDock() const {
+    wchar_t name[48]{};
+    if (GetClassNameW(notify_, name, ARRAYSIZE(name)) && !wcscmp(name, kStageDockWindow))
+        return notify_;
+    return FindWindowW(kStageDockWindow, nullptr);
+}
+
 void Panel::Layout() {
     modules_.clear();
     rows_.clear();
@@ -823,11 +831,17 @@ void Panel::Layout() {
         y += kPill + kGap;
         bt_ = {D2D1::RectF(x0, y, x0 + kCol, y + kPill), kPill * 0.5f};
         y += kPill + kGap;
-        airplane_ = {D2D1::RectF(x0, y, x0 + kPill, y + kPill), kPill * 0.5f};
-        focus_ = {D2D1::RectF(x0 + kPill + kGap, y, x0 + 2 * kPill + kGap, y + kPill), kPill * 0.5f};
+        constexpr float quickGap = 7.0f, diameter = (kCol - 2 * quickGap) / 3;
+        const auto quick = [&](int column) {
+            const float left = x0 + column * (diameter + quickGap), top = y + (kPill - diameter) * .5f;
+            return Module{D2D1::RectF(left, top, left + diameter, top + diameter), diameter * .5f};
+        };
+        airplane_ = quick(0);
+        focus_ = quick(1);
+        stage_ = quick(2);
         battery_ = {D2D1::RectF(x1, y, x1 + kCol, y + kPill), kPill * 0.5f};
         y += kPill + kGap;
-        modules_ = {wifi_, media_, bt_, airplane_, focus_, battery_};
+        modules_ = {wifi_, media_, bt_, airplane_, focus_, stage_, battery_};
         if (st_.brightness) {
             display_ = {D2D1::RectF(x0, y, x0 + kWidth, y + kPill), 26.0f};
             displayTrack_ = D2D1::RectF(x0 + 40, y + 42, x0 + kWidth - 40, y + 46);
@@ -1317,6 +1331,8 @@ std::wstring Panel::Describe(Hit h) const {
     case Hit::BtBody: return L"Show connected Bluetooth devices";
     case Hit::Airplane: return L"Airplane Mode — opens Windows Settings";
     case Hit::Focus: return L"Do Not Disturb — opens Windows Settings";
+    case Hit::Stage: return docky::ui::Text(GetPropW(StageDock(), kStageEnabledProperty) ?
+        L"Turn Stage Manager off" : L"Turn Stage Manager on");
     case Hit::Battery: return L"Battery — opens Windows Settings";
     case Hit::DisplayTitle: return L"Display settings";
     case Hit::SoundTitle: return L"Sound settings";
@@ -1470,6 +1486,23 @@ void Panel::Render() {
         for (auto [m, g, h] : {std::tuple{airplane_, wchar_t(0xE709), Hit::Airplane}, std::tuple{focus_, wchar_t(0xE708), Hit::Focus}}) {
             DrawModuleBase(m, a, hovered(h), pressedOn(h));
             Glyph(g, 20.0f, D2D1::Point2F((m.r.left + m.r.right) * 0.5f, (m.r.top + m.r.bottom) * 0.5f), a);
+        }
+        DrawModuleBase(stage_, a, hovered(Hit::Stage), pressedOn(Hit::Stage));
+        {
+            const auto dock = StageDock();
+            const bool on = dock && GetPropW(dock, kStageEnabledProperty);
+            const float x = (stage_.r.left + stage_.r.right) * .5f, y = (stage_.r.top + stage_.r.bottom) * .5f;
+            if (on) {
+                brush_->SetColor(D2D1::ColorF(0.96f, 0.99f, 1.f, a));
+                dc_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), stage_.radius - 2, stage_.radius - 2), brush_.Get());
+            }
+            brush_->SetColor(on ? Accent(a) : Ink(dock ? a : .40f * a));
+            for (int i = -1; i <= 1; ++i) {
+                const float top = y + i * 5.5f - 1.5f;
+                dc_->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x - 10, top, x - 7, top + 3), .7f, .7f), brush_.Get());
+            }
+            dc_->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(x - 3, y - 7, x + 10, y + 7), 2.5f, 2.5f),
+                                      brush_.Get(), 1.8f);
         }
         // Battery (read-only)
         DrawModuleBase(battery_, a, hovered(Hit::Battery), pressedOn(Hit::Battery));
@@ -1747,6 +1780,7 @@ Hit Panel::HitTest(float x, float y, int* row) {
         if (in(media_.r)) return Hit::Media;
         if (in(airplane_.r)) return Hit::Airplane;
         if (in(focus_.r)) return Hit::Focus;
+        if (in(stage_.r) && StageDock()) return Hit::Stage;
         if (in(battery_.r)) return Hit::Battery;
         if (st_.brightness && in(display_.r)) return y > display_.r.top + 30 ? Hit::DisplaySlider : Hit::DisplayTitle;
         if (in(muteBtn_)) return Hit::Mute;
@@ -1782,6 +1816,7 @@ std::vector<std::pair<Hit, int>> Panel::FocusOrder() const {
         for (Hit h : {Hit::WifiToggle, Hit::WifiBody, Hit::BtToggle, Hit::BtBody, Hit::MediaPrev, Hit::MediaPlay, Hit::MediaNext,
                       Hit::Airplane, Hit::Focus, Hit::Battery})
             o.push_back({h, -1});
+        if (StageDock()) o.push_back({Hit::Stage, -1});
         if (st_.brightness) o.push_back({Hit::DisplaySlider, -1});
         if (st_.audio) { o.push_back({Hit::SoundSlider, -1}); o.push_back({Hit::Mute, -1}); }
         return o;
@@ -1808,6 +1843,7 @@ bool Panel::FocusRect(Hit h, int row, D2D1_RECT_F& r) const {
     case Hit::MediaNext: r = grow(nextBtn_, 2); return true;
     case Hit::Airplane: r = grow(airplane_.r, -3); return true;
     case Hit::Focus: r = grow(focus_.r, -3); return true;
+    case Hit::Stage: r = grow(stage_.r, -3); return true;
     case Hit::Battery: r = grow(battery_.r, -3); return true;
     case Hit::DisplaySlider: r = grow(displayTrack_, 9); return true;
     case Hit::SoundSlider: r = grow(soundTrack_, 9); return true;
@@ -1920,6 +1956,10 @@ void Panel::Click(Hit h, int row) {
     }
     case Hit::Airplane: settings(L"ms-settings:network-airplanemode", L"airplane"); return;
     case Hit::Focus: settings(L"ms-settings:notifications", L"focus"); return;
+    case Hit::Stage:
+        if (const HWND dock = StageDock())
+            PostMessageW(dock, kToggleStage, 0, reinterpret_cast<LPARAM>(hwnd));
+        return;
     case Hit::Battery: settings(L"ms-settings:batterysaver", L"battery"); return;
     case Hit::DisplayTitle: settings(L"ms-settings:display", L"display"); return;
     case Hit::ManageOutputs:
@@ -2204,6 +2244,7 @@ LRESULT Panel::Handle(UINT m, WPARAM w, LPARAM l) {
         if (!outputEditorOpen_ && GetWindowRect(hwnd, &rect) && !PtInRect(&rect, point)) Close(L"clicked outside");
         return 0;
     }
+    case kStageChanged: needsFrame_ = true; return 0;
     case kMsgState: {
         ctl::State s = worker_->Latest();
         // While (or just after) the user drags a slider, keep the local value to avoid jitter.

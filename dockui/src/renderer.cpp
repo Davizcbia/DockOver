@@ -10,6 +10,7 @@
 #include "design_tokens.h"
 #include "log.h"
 #include "color_output.h"
+#include "display_adapter.h"
 
 namespace dock {
 namespace {
@@ -111,8 +112,14 @@ HRESULT Renderer::Init(HWND hwnd, UINT pxW, UINT pxH, float dpi, bool aboveChild
                                         D3D_FEATURE_LEVEL_10_0};
     HRESULT hr = S_OK;
     if (useDevice_) { d3d_ = useDevice_; featureLevel_ = d3d_->GetFeatureLevel(); }  // shared with another renderer on this thread
-    else hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
+    else {
+        const auto adapter = docky::DisplayAdapter(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
+        if (adapter) hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                           levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
+        if (!adapter || FAILED(hr))
+            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
+    }
     if (FAILED(hr)) {
         DLOG(L"D3D11CreateDevice hardware failed 0x%08X, trying WARP", hr);
         hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,

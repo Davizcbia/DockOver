@@ -144,7 +144,7 @@ void StartUpdateDownload(HWND h) {
   ULONGLONG lastPost = 0;
   const bool ok = docky::update::Download(rel, zip, [&](uint64_t done, uint64_t total) {
    updDone = done; if (total) updTotal = total;
-   const ULONGLONG now = GetTickCount64();
+   const ULONGLONG now = docky::vblank::AnimationMillis();
    if (now - lastPost > 100) { lastPost = now; PostMessageW(h, kMsgUpdate, 3, 0); }
   }, &updCancel, *err);
   if (ok) {
@@ -158,7 +158,7 @@ void StartUpdateDownload(HWND h) {
 // General page, "Frame rate" card: two rows of five choices (30, 60, 120, 240, Unlimited).
 constexpr int kFrameCaps[5] = {30, 60, 120, 240, 0};
 D2D1_RECT_F FrameCapButton(int row,int i,float left,float right){const float width=(right-left-32-4*8)/5,top=liquid::design::settings::CardTop+178+62+row*64;const float x=left+16+i*(width+8);return D2D1::RectF(x,top,x+width,top+28);}
-void BeginSwitchPress(HWND h,int id,bool down){const auto now=GetTickCount64();const float current=visualSwitch==id?PressAmount(now):0.f;visualSwitch=id;pressFrom=down?current:std::max(current,.55f);pressTo=down?1.f:0.f;pressStart=now;SetTimer(h,4,4,nullptr);}
+void BeginSwitchPress(HWND h,int id,bool down){const auto now=docky::vblank::AnimationMillis();const float current=visualSwitch==id?PressAmount(now):0.f;visualSwitch=id;pressFrom=down?current:std::max(current,.55f);pressTo=down?1.f:0.f;pressStart=now;SetTimer(h,4,4,nullptr);}
 
 int recordingShortcut=-1;int shortcutValues[4]={0x34C,0x34D,0x344,0x34E};int chromeHover=-1,chromePressed=-1;bool chromeTracking=false;bool keyboardFocusVisible=false;int switchPressed=-1; float scale=1; bool diagnostics=false, iconMask=true, autoHide=false, hideSnap=false, genie=false, gameCompatibility=false, lowLatencyGlass=false, menuBarOn=true, menuBarThemeGradient=true, dlVertical=false, dlPreview=true, launchDesktop=false, loginItem=false; liquid::settings::Launchpad density; bool mediaArtworkBackground=false, musicWallpaper=false, wallpaperAvoidBars=true, wallpaperLyrics=true, lyricsFullArtwork=true, lyricsAutoReturn=true, lyricsBeat=true, shortcutsLoaded=false; int lyricsOffsetMs=300; bool animatedArtwork=true, lyricsDoubleClickSeek=true, keepArtworkWhenPaused=false, localMusicTags=true, hideIconsWithWidgets=true, captureNotifications=false, hideSystemNotifications=true; int ncBlur=20, ncFade=100, ncShade=30, gradientOpacity=90, gradientLength=100; int ccBlur=60, dlCount=6, dockMagnification=126; std::wstring settingsPath;
 liquid::settings::Revision revision;
@@ -202,7 +202,7 @@ void UpdateScrollBounds(HWND h){RECT r{};GetClientRect(h,&r);const float height=
  sidebarScroll.Bounds(liquid::design::settings::SidebarTop+visibleCategories.size()*liquid::design::settings::SidebarStep+12-height);
  contentScroll[selected].Bounds(SettingsContentBottom()+16-height);
 }
-void StartScroll(HWND h){const auto now=GetTickCount64();if(!lastScrollTick||now-lastScrollTick>100)lastScrollTick=now;scrollActiveUntil=now+1000;SetTimer(h,kScrollTimer,16,nullptr);switchTicker.Start(h,docky::vblank::kMsgVBlank);InvalidateRect(h,nullptr,FALSE);}
+void StartScroll(HWND h){const auto now=docky::vblank::AnimationMillis();if(!lastScrollTick||now-lastScrollTick>100)lastScrollTick=now;scrollActiveUntil=now+1000;SetTimer(h,kScrollTimer,1000,nullptr);switchTicker.Start(h,docky::vblank::kMsgVBlank);InvalidateRect(h,nullptr,FALSE);}
 void EnsureSidebarSelection(HWND h){UpdateScrollBounds(h);auto it=std::find(visibleCategories.begin(),visibleCategories.end(),selected);if(it!=visibleCategories.end()){
  const float y=liquid::design::settings::SidebarTop+(it-visibleCategories.begin())*liquid::design::settings::SidebarStep;
  RECT r{};GetClientRect(h,&r);sidebarScroll.Ensure(y,y+liquid::design::settings::SidebarRow,112,r.bottom/scale-12);StartScroll(h);}}
@@ -264,7 +264,7 @@ void DrawSettingsSwitch(HWND hwnd,int index,D2D1_RECT_F hit,bool on,bool pressed
  const auto track=D2D1::RectF(cx-w*.5f,cy-h*.5f,cx+w*.5f,cy+h*.5f);
  Round(track,h*.5f,contrast?(on?colors.selected:colors.background):(on?0x007AFF:liquid::theme::IsDark(appearanceMode,systemDark)?0x3A3B40:0xC8C9CE));
  if(focused||contrast){brush->SetColor(C(focused?colors.focused:colors.primary));target->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(track.left-2,track.top-2,track.right+2,track.bottom+2),12,12),brush.Get(),focused?2.f:1.f);}
- const ULONGLONG now=GetTickCount64();static SwitchMotion spare;auto& anim=index>=0&&index<int(std::size(switchMotion))?switchMotion[index]:spare;
+ const ULONGLONG now=docky::vblank::AnimationMillis();static SwitchMotion spare;auto& anim=index>=0&&index<int(std::size(switchMotion))?switchMotion[index]:spare;
  if(!anim.initialized){anim.initialized=true;anim.on=on;anim.from=anim.to=on?1.f:0.f;anim.start=now;}
  const auto positionAt=[&](ULONGLONG t){const float u=std::clamp((t-anim.start)/420.f,0.f,1.f);return std::clamp(anim.from+(anim.to-anim.from)*EaseOutBack(u),0.f,1.f);};
  if(anim.on!=on){anim.from=positionAt(now);anim.to=on?1.f:0.f;anim.on=on;anim.start=now;}
@@ -303,6 +303,10 @@ FormRow MeasureFormRow(float top,float left,float right,const wchar_t* detail,fl
  return {top,top+height,D2D1::RectF(left+16,textTop,textRight,textTop+22),D2D1::RectF(left+16,textTop+25,textRight,textTop+25+detailHeight),D2D1::RectF(right-20-controlWidth,cy-14,right-20,cy+14)};
 }
 void DrawFormText(const FormRow& row,const wchar_t* title,const wchar_t* detail,const liquid::design::Palette& colors){Text(title,normal.Get(),row.title,colors.primary);Text(detail,fontSmall.Get(),row.detail,colors.secondary);}
+constexpr int kStagePerspectiveSwitch=53;
+constexpr int kStagePerspectiveRow=5;
+constexpr int kDownloadsRow=kStagePerspectiveRow+1;
+bool stagePerspective=true;
 struct DockRowSpec{const wchar_t* title;const wchar_t* detail;int id;};
 const DockRowSpec dockRows[]={
  {L"macOS icon mask",L"Use rounded-square tiles for app icons.",0},
@@ -310,12 +314,13 @@ const DockRowSpec dockRows[]={
  {L"Show Dock diagnostics",L"Applies when the Dock restarts.",2},
  {L"Hide snap layouts while dragging windows",L"Hide Windows snap layouts while dragging a window.",8},
  {L"Genie minimize animation",L"Animate windows into and out of the Dock when minimizing or restoring.",10},
+ {L"Stage Manager perspective",L"Tilt window previews in the Stage Manager sidebar.",kStagePerspectiveSwitch},
  {L"Files shown",L"Show 3–10 recent files. Open Downloads to see everything.",-1},
  {L"Straight fan",L"Arrange the Downloads fan in a straight line.",11},
  {L"File previews",L"Show thumbnails for supported files instead of file-type icons.",12}};
-struct DockForm {std::array<FormRow,8> rows;};
+struct DockForm {std::array<FormRow,std::size(dockRows)> rows;};
 DockForm MeasureDock(float left,float right){DockForm result;float top=liquid::design::settings::CardTop+146+12;  // below the Magnification card
- for(int i=0;i<8;++i){if(i==5)top+=40;result.rows[i]=MeasureFormRow(top,left,right,dockRows[i].detail,i==5?106:48);top=result.rows[i].bottom;}return result;}
+ for(int i=0;i<std::ssize(dockRows);++i){if(i==kDownloadsRow)top+=40;result.rows[i]=MeasureFormRow(top,left,right,dockRows[i].detail,i==kDownloadsRow?106:48);top=result.rows[i].bottom;}return result;}
 std::pair<float,float> CurrentContentEdges(){RECT rc{};GetClientRect(settingsWindowHandle,&rc);const float left=ContentLeftForWidth(rc.right/scale);return {left,ContentRightForWidth(rc.right/scale,left)};}
 DockForm CurrentDockForm(){const auto [left,right]=CurrentContentEdges();return MeasureDock(left,right);}
 struct FormSpec{const wchar_t* title;const wchar_t* detail;};
@@ -633,7 +638,7 @@ bool RefreshTaskbarStatus(){docky::taskbar::Status next;const bool read=docky::t
  const bool changed=live!=tbLive||next.state!=tbStatus.state||next.guardian!=tbStatus.guardian||next.hotkey!=tbStatus.hotkey||next.hotkeyText!=tbStatus.hotkeyText||next.message!=tbStatus.message;
  tbStatus=next;tbLive=live;return changed;}
 bool LoginItemEnabled();
-void Refresh(){const auto r=liquid::settings::Load(settingsPath);docky::ui::SetLanguage(r.value.appearance.language);gameCompatibility=r.value.dock.gameCompatibility;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging)dockMagnification=r.value.dock.magnification;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;musicResponse=r.value.controlCenter.musicResponse;if(!menuSliderDragging||activeSizeSlider!=9)musicSensitivity=r.value.controlCenter.musicSensitivity;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
+void Refresh(){const auto r=liquid::settings::Load(settingsPath);docky::ui::SetLanguage(r.value.appearance.language);gameCompatibility=r.value.dock.gameCompatibility;stagePerspective=r.value.dock.stagePerspective;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging)dockMagnification=r.value.dock.magnification;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;musicResponse=r.value.controlCenter.musicResponse;if(!menuSliderDragging||activeSizeSlider!=9)musicSensitivity=r.value.controlCenter.musicSensitivity;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;docky::vblank::SetCaps(perf.animationFps,perf.captureFps);updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
 void OpenWindowsTaskbarSettings(HWND h){
  const auto result=reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",L"ms-settings:taskbar",nullptr,nullptr,SW_SHOWNORMAL));
  if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Taskbar Settings could not be opened. Open Personalization > Taskbar in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
@@ -643,7 +648,7 @@ void OpenVisualEffects(HWND h){
  if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Settings could not be opened. Open Accessibility > Visual effects in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
 }
 void ToggleDockSetting(HWND h,int row){
- if(row<0||row>=5)return;const char* keys[]={"useMacIconMask","autoHide","diagnostics","hideSnapLayouts","genieMinimize"};const bool now[]={iconMask,autoHide,diagnostics,hideSnap,genie};
+ if(row<0||row>=kDownloadsRow)return;const char* keys[]={"useMacIconMask","autoHide","diagnostics","hideSnapLayouts","genieMinimize","stagePerspective"};const bool now[]={iconMask,autoHide,diagnostics,hideSnap,genie,stagePerspective};
  const auto status=liquid::settings::WriteBool(settingsPath,"dock",keys[row],!now[row]);
  if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
  InvalidateRect(h,nullptr,FALSE);
@@ -781,7 +786,7 @@ bool CreateResources(HWND h){
  target=fallbackTarget.Get();
  if(!brush && FAILED(target->CreateSolidColorBrush(C(0xffffff),&brush))){fallbackTarget.Reset();target=nullptr;return false;}return true;
 }
-bool SettingsSwitchValue(int index){switch(index){case 0:return iconMask;case 1:return autoHide;case 2:return diagnostics;
+bool SettingsSwitchValue(int index){switch(index){case kStagePerspectiveSwitch:return stagePerspective;case 0:return iconMask;case 1:return autoHide;case 2:return diagnostics;
  case 3:return taskbarPref.hideOnStartup;case 4:return taskbarPref.freeWorkArea;case 5:return taskbarPref.hotkeyEnabled&&taskbarPref.hotkeyKey!=0;case 8:return hideSnap;case 9:return density.hideLabels;case 10:return genie;case 11:return dlVertical;case 12:return dlPreview;case 13:return density.showWindows;case 14:return updatePref.autoCheck;case 15:return updatePref.autoInstall;case 16:return launchDesktop;case 17:return loginItem;case 18:return gameCompatibility;case 26:return lowLatencyGlass;case 20:return menuBarOn;case 46:return menuBarThemeGradient;case 24:return captureNotifications;case 25:return hideSystemNotifications;case 19:return mediaArtworkBackground;case 28:return musicWallpaper;case 29:return wallpaperAvoidBars;case 31:return wallpaperLyrics;case 32:return lyricsFullArtwork;case 33:return lyricsAutoReturn;case 38:return lyricsBeat;case 44:return animatedArtwork;case 45:return lyricsDoubleClickSeek;case 50:return keepArtworkWhenPaused;case 51:return localMusicTags;case 52:return hideIconsWithWidgets;default:return false;}}
 // General page: "Start DockOver Desktop with DockOver" (index 16), in its own card below the frame-rate card.
 float DesktopLaunchCardTop(){return CurrentForm(16).top;}
@@ -822,7 +827,7 @@ bool SetLoginItem(bool on,std::wstring& error){
  DLOG(L"settings: login item set to %ls",command.c_str());return true;
 }
 // Dock page: the Downloads card below the five Dock rows (row 0: files shown, row 1: straight-up switch, index 11).
-float DownloadsCardTop(){return CurrentDockForm().rows[5].top;}
+float DownloadsCardTop(){return CurrentDockForm().rows[kDownloadsRow].top;}
 D2D1_RECT_F DownloadsVerticalSwitch(float,int row=1){return CurrentDockForm().rows[5+row].control;}
 // Launchpad page: the "Hide app names" switch (index 9), in its own card below the density card.
 D2D1_RECT_F LaunchpadNamesSwitch(float){return CurrentForm(9).control;}
@@ -832,7 +837,7 @@ int SettingsSwitchAt(HWND h,float x,float y){
  y=liquid::settings::SettingsBodyY(y,contentScroll[selected].Position());
  namespace lay=liquid::design::settings;RECT rc{};GetClientRect(h,&rc);
  const float left=ContentLeftForWidth(rc.right/scale),right=ContentRightForWidth(rc.right/scale,left);
- if(selected==2){const auto form=MeasureDock(left,right);for(int i=0;i<8;++i){if(i==5)continue;auto r=form.rows[i].control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return dockRows[i].id;}}
+ if(selected==2){const auto form=MeasureDock(left,right);for(int i=0;i<std::ssize(dockRows);++i){if(i==kDownloadsRow)continue;auto r=form.rows[i].control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return dockRows[i].id;}}
  if(selected==5||selected==10){for(int id:{19,44,28,29,31,50,51,32,33,45,38,52}){if((id==19)!=(selected==5))continue;auto r=FormFor(id,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return id;}}
  if(selected==3){for(int id:{46,18,20,24,25}){auto r=FormFor(id,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return id;}}
  if(selected==0){const auto r=DesktopLaunchSwitch(right);if(x>=r.left-8&&x<r.right+8&&y>=r.top-8&&y<r.bottom+8)return 16;
@@ -939,7 +944,7 @@ void DrawSizeSlider(HWND h,int index,float left,float right,const liquid::design
  Text(spec.title,normal.Get(),D2D1::RectF(left+16,top+14,right-100,top+39),colors.primary);
  Text((std::to_wstring(SizeValue(index))+spec.unit).c_str(),trailingSmall.Get(),D2D1::RectF(right-64,top+(index==0?21:14),right-16,top+(index==0?50:39)),colors.secondary);
  Text(spec.detail,fontSmall.Get(),D2D1::RectF(left+16,top+(index==0?36:45),right-(index==0?202:16),top+(index==0?71:83)),colors.secondary);
- const auto track=SizeSliderTrack(index,left,right);const auto now=GetTickCount64();
+ const auto track=SizeSliderTrack(index,left,right);const auto now=docky::vblank::AnimationMillis();
  const float press=ReducedMotion()?0.f:(visualSwitch==40+index?PressAmount(now):0.f);
  if(visualSwitch==40+index&&now-pressStart<150&&!ReducedMotion())switchTicker.Start(h,docky::vblank::kMsgVBlank);
  const auto shape=dock::LabSlider(track.left,track.right,(track.top+track.bottom)*.5f,(SizeValue(index)-spec.lo)/float(spec.hi-spec.lo),.8f,press);
@@ -1070,7 +1075,7 @@ void DrawContent(HWND h){
   if(contrast||screenshotMenuIcon||custom==settingsPackIcons.end()||!DrawWorkshopPreview(custom->second,iconRect)){Round(iconRect,ds::radius::Button/2,contrast?colors.background:badges[i]);DrawCategoryGlyph(i,iconRect,contrast?colors.primary:colors.onAccent);}
   Text(titles[i],i==selected?sidebarSelected.Get():sidebarLabel.Get(),D2D1::RectF(sp::Xl*2+sp::Xs,y,lay::SidebarWidth-sp::L,y+lay::SidebarRow),i==selected?colors.onAccent:colors.primary);}
  target->SetTransform(D2D1::Matrix3x2F::Identity());target->PopAxisAlignedClip();
-  if(GetTickCount64()<scrollActiveUntil)scrollbar(lay::SidebarWidth-7,110,ht-118,lay::SidebarTop+visibleCategories.size()*lay::SidebarStep+12-110,sidebarScroll.Position());
+  if(docky::vblank::AnimationMillis()<scrollActiveUntil)scrollbar(lay::SidebarWidth-7,110,ht-118,lay::SidebarTop+visibleCategories.size()*lay::SidebarStep+12-110,sidebarScroll.Position());
  };
  if(drawingChromeGlass&&allowTransparency){
   dock::LocalGlassOverlay sidebar;
@@ -1241,12 +1246,12 @@ void DrawContent(HWND h){
  }else if(selected==2){
   const auto form=MeasureDock(left,right);
   DrawSizeSlider(h,8,left,right,colors);
-  Round(D2D1::RectF(left,form.rows[0].top,right,form.rows[4].bottom),SettingsCardRadius,colors.surface);
-  Text(L"Downloads",fontSmall.Get(),D2D1::RectF(left+16,form.rows[5].top-28,right-16,form.rows[5].top-8),colors.secondary);
-  Round(D2D1::RectF(left,form.rows[5].top,right,form.rows[7].bottom),SettingsCardRadius,colors.surface);
-  for(int i=0;i<8;++i){const auto& row=form.rows[i];if(i!=0&&i!=5){brush->SetColor(C(colors.secondary,.14f));target->DrawLine(D2D1::Point2F(left+16,row.top),D2D1::Point2F(right-16,row.top),brush.Get(),1);}
+  Round(D2D1::RectF(left,form.rows[0].top,right,form.rows[kStagePerspectiveRow].bottom),SettingsCardRadius,colors.surface);
+  Text(L"Downloads",fontSmall.Get(),D2D1::RectF(left+16,form.rows[kDownloadsRow].top-28,right-16,form.rows[kDownloadsRow].top-8),colors.secondary);
+  Round(D2D1::RectF(left,form.rows[kDownloadsRow].top,right,form.rows.back().bottom),SettingsCardRadius,colors.surface);
+  for(int i=0;i<std::ssize(dockRows);++i){const auto& row=form.rows[i];if(i!=0&&i!=kDownloadsRow){brush->SetColor(C(colors.secondary,.14f));target->DrawLine(D2D1::Point2F(left+16,row.top),D2D1::Point2F(right-16,row.top),brush.Get(),1);}
    DrawFormText(row,dockRows[i].title,dockRows[i].detail,colors);
-   if(i==5){const float y=row.control.top;
+   if(i==kDownloadsRow){const float y=row.control.top;
     const auto minus=D2D1::RectF(right-126,y,right-98,y+28),plus=D2D1::RectF(right-48,y,right-20,y+28);
     Round(minus,8,colors.background);Round(plus,8,colors.background);Text(L"−",centerSmall.Get(),minus,colors.primary);Text(L"+",centerSmall.Get(),plus,colors.primary);
     Text(std::to_wstring(dlCount).c_str(),centerSmall.Get(),D2D1::RectF(right-98,y,right-48,y+28),colors.primary);
@@ -1311,7 +1316,7 @@ void DrawContent(HWND h){
 
  }
  target->SetTransform(D2D1::Matrix3x2F::Identity());target->PopAxisAlignedClip();bodyShift=0;
- if(GetTickCount64()<scrollActiveUntil){
+ if(docky::vblank::AnimationMillis()<scrollActiveUntil){
   scrollbar(w-7,64,ht-72,SettingsContentBottom()+16-64,contentScroll[selected].Position());
  }
 }
@@ -1399,7 +1404,7 @@ void ImportMyDockFinder(HWND h,bool replace){
  MessageBoxW(h,msg.c_str(),L"DockOver Settings",MB_OK|(ok?MB_ICONINFORMATION:MB_ICONWARNING));
 }
 LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
- if(m==docky::vblank::kMsgVBlank){switchTicker.Ack();switchTicker.Stop();const auto now=GetTickCount64();const double dt=std::min(.05,(now-lastScrollTick)/1000.0);lastScrollTick=now;
+ if(m==docky::vblank::kMsgVBlank){switchTicker.Ack();switchTicker.Stop();const auto now=docky::vblank::AnimationMillis();const double dt=std::min(.05,(now-lastScrollTick)/1000.0);lastScrollTick=now;
   bool moving=sidebarScroll.Step(dt,ReducedMotion());for(auto& scroll:contentScroll)moving=scroll.Step(dt,ReducedMotion())||moving;
   if(moving)switchTicker.Start(h,docky::vblank::kMsgVBlank);InvalidateRect(h,nullptr,FALSE);return 0;}  // the painter re-arms it while switches animate
  switch(m){
@@ -1425,7 +1430,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
     if(x>=track.left-22&&x<=track.right+22&&by>=track.top-18&&by<=track.bottom+18){SetFocus(h);activeSizeSlider=index;if(index==0)menuKeyboardControl=0;else if(index<=2)appearanceKeyboard=index+2;menuDragStart=SizeValue(index);menuSliderDragging=true;BeginSwitchPress(h,40+index,true);menuSliderGrab=std::fabs(x-cx)<=20?x-cx:0;SetCapture(h);UpdateMenuSlider(h,x);InvalidateRect(h,nullptr,FALSE);return 0;}}}
 
   const int sw=SettingsSwitchAt(h,x,y);if(sw>=0){SetFocus(h);if(sw==46)menuKeyboardControl=1;else if(sw==18)menuKeyboardControl=2;switchPressed=sw;switchDragging=false;switchDragStartX=x;switchDragStartPosition=SettingsSwitchValue(sw)?1.f:0.f;switchDragPosition=switchDragStartPosition;BeginSwitchPress(h,sw,true);SetCapture(h);InvalidateRect(h,nullptr,FALSE);return 0;}break;}
- case WM_CAPTURECHANGED:if(menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();InvalidateRect(h,nullptr,FALSE);}if(chromePressed>=0||switchPressed>=0){if(switchPressed>=0){if(switchDragging){auto& anim=switchMotion[switchPressed];const bool value=SettingsSwitchValue(switchPressed);anim.initialized=true;anim.on=value;anim.from=switchDragPosition;anim.to=value?1.f:0.f;anim.start=GetTickCount64();}BeginSwitchPress(h,switchPressed,false);}chromePressed=-1;switchPressed=-1;switchDragging=false;InvalidateRect(h,nullptr,FALSE);}break;
+ case WM_CAPTURECHANGED:if(menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();InvalidateRect(h,nullptr,FALSE);}if(chromePressed>=0||switchPressed>=0){if(switchPressed>=0){if(switchDragging){auto& anim=switchMotion[switchPressed];const bool value=SettingsSwitchValue(switchPressed);anim.initialized=true;anim.on=value;anim.from=switchDragPosition;anim.to=value?1.f:0.f;anim.start=docky::vblank::AnimationMillis();}BeginSwitchPress(h,switchPressed,false);}chromePressed=-1;switchPressed=-1;switchDragging=false;InvalidateRect(h,nullptr,FALSE);}break;
  case WM_CREATE: settingsWindowHandle=h;Refresh();scale=GetDpiForWindow(h)/96.f*settingsUiPercent/100.f;RefreshWorkshop();RefreshTaskbarState();RefreshTaskbarStatus();
   try {systemUi=winrt::Windows::UI::ViewManagement::UISettings();} catch(...) {systemUi=nullptr;} RefreshAccessibility();RefreshSystemAppearance();
   {WNDCLASSW host{};host.hInstance=GetModuleHandleW(nullptr);host.lpfnWndProc=SearchHostProc;host.lpszClassName=L"DockOverSettingsSearchHost";host.hCursor=LoadCursorW(nullptr,IDC_IBEAM);RegisterClassW(&host);
@@ -1461,7 +1466,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard>=7){SetApplicationsOrder(h,appearanceKeyboard-7);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard>=5){SetLanguage(h,appearanceKeyboard-5);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==1&&appearanceKeyboard<3){SetAppearance(h,appearanceKeyboard);return 0;}
-  if(w==VK_TAB && selected==2){const bool backwards=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((backwards&&dockKeyboardRow==0)||(!backwards&&dockKeyboardRow==4)){if(searchBox)FocusSearch();}else dockKeyboardRow+=backwards?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
+  if(w==VK_TAB && selected==2){const bool backwards=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((backwards&&dockKeyboardRow==0)||(!backwards&&dockKeyboardRow==kStagePerspectiveRow)){if(searchBox)FocusSearch();}else dockKeyboardRow+=backwards?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==6){ActivateTaskbarControl(h,taskbarKeyboardControl);return 0;}
   if(w==VK_TAB&&selected==6){const bool backwards=(GetKeyState(VK_SHIFT)&0x8000)!=0;
    if((backwards&&taskbarKeyboardControl==0)||(!backwards&&taskbarKeyboardControl==kTaskbarControls-1)){if(searchBox)FocusSearch();}else taskbarKeyboardControl+=backwards?-1:1;
@@ -1529,7 +1534,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   for(int f:{1,21,24,30,50,82,90,110,142,150,175})if(referenceCaptureFrame==f)snapshotPath=referenceCaptureDir+L"\\settings-"+std::to_wstring(f)+L".bmp";
   if(referenceCaptureFrame>=190){KillTimer(h,38);PostMessageW(h,WM_CLOSE,0,0);}
   InvalidateRect(h,nullptr,FALSE);return 0;
- }if(w==kScrollTimer){if(GetTickCount64()>scrollActiveUntil&&!sidebarScroll.Animating()&&!contentScroll[selected].Animating())KillTimer(h,kScrollTimer);else switchTicker.Start(h,docky::vblank::kMsgVBlank);InvalidateRect(h,nullptr,FALSE);return 0;}if(w==4){KillTimer(h,4);InvalidateRect(h,nullptr,FALSE);return 0;}if(RefreshSystemAppearance()&&appearanceMode==0){ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);}if(RefreshAccessibility()){ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);}
+ }if(w==kScrollTimer){KillTimer(h,kScrollTimer);InvalidateRect(h,nullptr,FALSE);return 0;}if(w==4){KillTimer(h,4);InvalidateRect(h,nullptr,FALSE);return 0;}if(RefreshSystemAppearance()&&appearanceMode==0){ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);}if(RefreshAccessibility()){ApplyNativeAppearance(h);InvalidateRect(h,nullptr,FALSE);}
   if(w==kRecordTimeout){StopRecording(h,L"Recording timed out; the previous shortcut is kept.");return 0;}
   if(recordingHotkey&&selected!=6)StopRecording(h,nullptr);  // left the page (e.g. via search)
   if(w==2){KillTimer(h,2);taskbarFeedback.clear();}  // short follow-up refresh after a taskbar command
@@ -1546,7 +1551,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   StartScroll(h);return 0;}
  case WM_LBUTTONUP:{if(menuSliderDragging){UpdateMenuSlider(h,GET_X_LPARAM(l)/scale);menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);ReleaseCapture();SaveMenuScale(h);return 0;}namespace ds=liquid::design;namespace lay=liquid::design::settings;namespace sp=liquid::design::space;
   float x=GET_X_LPARAM(l)/scale,y=GET_Y_LPARAM(l)/scale;RECT rc{};GetClientRect(h,&rc);const float contentLeft=ContentLeftForWidth(rc.right/scale),right=ContentRightForWidth(rc.right/scale,contentLeft);
-  if(switchPressed>=0){const int pressed=switchPressed;const bool oldValue=SettingsSwitchValue(pressed);const bool change=!switchDragging||((switchDragPosition>=.5f)!=oldValue);if(switchDragging){auto& anim=switchMotion[pressed];anim.initialized=true;anim.on=oldValue;anim.from=switchDragPosition;anim.to=oldValue?1.f:0.f;anim.start=GetTickCount64();}switchPressed=-1;BeginSwitchPress(h,pressed,false);switchDragging=false;if(GetCapture()==h)ReleaseCapture();
+  if(switchPressed>=0){const int pressed=switchPressed;const bool oldValue=SettingsSwitchValue(pressed);const bool change=!switchDragging||((switchDragPosition>=.5f)!=oldValue);if(switchDragging){auto& anim=switchMotion[pressed];anim.initialized=true;anim.on=oldValue;anim.from=switchDragPosition;anim.to=oldValue?1.f:0.f;anim.start=docky::vblank::AnimationMillis();}switchPressed=-1;BeginSwitchPress(h,pressed,false);switchDragging=false;if(GetCapture()==h)ReleaseCapture();
    if(change&&SettingsSwitchAt(h,x,y)==pressed&&pressed==20){if(liquid::settings::WriteBool(settingsPath,"menuBar","enabled",!menuBarOn)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(change&&SettingsSwitchAt(h,x,y)==pressed){if(pressed==44||pressed==45||pressed==50||pressed==51||pressed==52){
      const char* key=pressed==44?"animatedArtwork":pressed==45?"lyricsDoubleClickSeek":pressed==50?"keepArtworkWhenPaused":pressed==51?"localMusicTags":"hideDesktopIconsWithWidgets";
@@ -1569,6 +1574,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    else if(pressed==9){if(liquid::settings::WriteBool(settingsPath,"launchpad","hideLabels",!density.hideLabels)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(pressed==12){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsPreview",!dlPreview)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(pressed==11){if(liquid::settings::WriteBool(settingsPath,"dock","downloadsVertical",!dlVertical)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
+   else if(pressed==kStagePerspectiveSwitch){dockKeyboardRow=kStagePerspectiveRow;ToggleDockSetting(h,dockKeyboardRow);}
    else if(pressed<3||pressed==8||pressed==10){const int row=pressed==8?3:pressed==10?4:pressed;dockKeyboardRow=row;ToggleDockSetting(h,row);}else{taskbarKeyboardControl=pressed;ActivateTaskbarControl(h,pressed);}}InvalidateRect(h,nullptr,FALSE);return 0;}
   if(chromePressed>=0){const int pressed=chromePressed;chromePressed=-1;if(GetCapture()==h)ReleaseCapture();if(ChromeButtonAt(x,y)==pressed){if(pressed==0)PostMessageW(h,WM_CLOSE,0,0);else if(pressed==1)ShowWindow(h,SW_MINIMIZE);else ShowWindow(h,IsZoomed(h)?SW_RESTORE:SW_MAXIMIZE);}InvalidateRect(h,nullptr,FALSE);return 0;}
   const float nav=lay::SidebarWidth+10.f;if(x>=nav&&x<nav+88&&y>=10&&y<52){StepHistory(h,x<nav+44?-1:1);return 0;}
@@ -1641,7 +1647,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    }}}
    if(action){if(!ok)MessageBoxW(h,error.empty()?L"Workshop operation failed.":error.c_str(),L"DockOver Workshop",MB_OK|MB_ICONWARNING);RefreshWorkshop();}InvalidateRect(h,nullptr,FALSE);
   }
-  else if(selected==2){const float y0=CurrentDockForm().rows[5].control.top;
+  else if(selected==2){const float y0=CurrentDockForm().rows[kDownloadsRow].control.top;
    if(y>=y0&&y<y0+28){if(x>=right-126&&x<right-98)SetDownloadsCount(h,dlCount-1);else if(x>=right-48&&x<right-20)SetDownloadsCount(h,dlCount+1);}
   }
   else if(selected==5){const float y0=CcBlurRow(contentLeft,right).control.top;
@@ -1680,7 +1686,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int){
  if((!referenceCaptureDir.empty()||referenceInteractive||referenceLayoutOnly)&&(!explicitWorkshopRoot||!explicitSettingsPath||referenceCaptureDir.empty()))return 2;
  if(devOpaque&&!explicitWorkshopRoot)return 2;
  if(devPress&&(!explicitSettingsPath||!explicitWorkshopRoot||devOpaque))return 2;
- if(devPress){selected=2;switchPressed=1;visualSwitch=1;pressFrom=pressTo=1.f;pressStart=GetTickCount64();switchPointerX=824.f;switchPointerY=190.f;}
+ if(devPress){selected=2;switchPressed=1;visualSwitch=1;pressFrom=pressTo=1.f;pressStart=docky::vblank::AnimationMillis();switchPointerX=824.f;switchPointerY=190.f;}
  if(devWorkshop){selected=7;categoryHistory={7};categoryHistoryIndex=0;RefreshWorkshop();}
  if(FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,factory.GetAddressOf()))||FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,__uuidof(IDWriteFactory),reinterpret_cast<IUnknown**>(writeFactory.GetAddressOf()))))return 1;
  auto font=[&](float size,DWRITE_FONT_WEIGHT weight,ComPtr<IDWriteTextFormat>& out){return writeFactory->CreateTextFormat(liquid::design::type::Family,nullptr,weight,DWRITE_FONT_STYLE_NORMAL,DWRITE_FONT_STRETCH_NORMAL,size,L"en-us",&out);};

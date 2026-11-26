@@ -116,7 +116,7 @@ double NowMs(){static LARGE_INTEGER f{};if(!f.QuadPart)QueryPerformanceFrequency
 // (DwmFlush) and posts one tick at a time to the panel; posted messages wake the Dock's message wait at once.
 struct Ticker{std::atomic<bool> quit{false},active{false},pending{false};HANDLE wake=CreateEventW(nullptr,FALSE,FALSE,nullptr);HWND h=nullptr;~Ticker(){if(wake)CloseHandle(wake);}};
 void StartTicker(const std::shared_ptr<Ticker>& t){std::thread([t]{double lastPost=0;while(!t->quit){if(!t->active){WaitForSingleObject(t->wake,250);continue;}
- docky::vblank::WaitFrame();const double now=docky::vblank::Seconds();
+ docky::vblank::WaitFrame(t->h);const double now=docky::vblank::Seconds();
  if(now-lastPost<docky::vblank::CapInterval(docky::vblank::AnimationCap()))continue;  // Settings > General > Frame rate
  if(t->active&&!t->quit&&!t->pending.exchange(true)){lastPost=now;PostMessageW(t->h,kTick,0,0);}}}).detach();}
 struct Shared {std::mutex mutex;HWND window=nullptr;bool busy=false;std::vector<Entry> result;DWORD error=0;};

@@ -5,8 +5,8 @@ set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 string(RANDOM LENGTH 32 ALPHABET 0123456789abcdef LIQUID_BUILD_ID)
 file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/liquid_build_id.h" "#pragma once\n#define LIQUID_BUILD_MARKER \"LiquidDesktopBuild:${LIQUID_BUILD_ID}\"\n")
 # Software update (Settings > About): the version is the GitHub release tag; see package_docky.ps1.
-set(DOCKY_VERSION "1.3.1")  # the GitHub release tag of this version; raise it for every release
-set(DOCKDROP_VERSION "0.3.0")
+set(DOCKY_VERSION "1.4.0")  # the GitHub release tag of this version; raise it for every release
+set(DOCKDROP_VERSION "0.4.0")
 set(DOCKOVER_MUSIC_VERSION "0.3.0")
 set(DOCKY_UPDATE_REPO "Davizcbia/DockOver")  # GitHub repository whose releases carry updates (public)
 set(DOCKY_UPDATE_ASSET "DockOver-Windows-Portable")  # name prefix of the release's portable zip

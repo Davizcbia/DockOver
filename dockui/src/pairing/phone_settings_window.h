@@ -1,4 +1,5 @@
 #pragma once
+#include "../vblank.h"
 
 #include <windows.h>
 #include <commctrl.h>
@@ -70,6 +71,8 @@ struct Window {
         float pointerDownPosition = 0;
         bool pointerDown = false, dragging = false;
     } switches[2];
+
+    docky::vblank::Ticker switchTicker;
 
     ~Window() {
         if (frame) DestroyWindow(frame);
@@ -288,7 +291,7 @@ inline void PaintBase(HDC dc, const Window& model, int left = 0, int top = 0) {
     card(kDeviceTop, model.Height() - kDeviceTop - 25);
 }
 
-constexpr UINT_PTR kSwitchAnimation = 1;
+
 constexpr float kTrackWidth = 46.4f, kTrackHeight = 20.0f;
 constexpr float kThumbWidth = 29.6f, kThumbHeight = 17.6f, kThumbTravel = 14.4f;
 
@@ -305,7 +308,7 @@ inline float SwitchAmount(float from, float to, ULONGLONG start, ULONGLONG now, 
 
 inline void PaintSwitch(const DRAWITEMSTRUCT& item, Window& model, const RECT& bounds, bool focused, bool active) {
     auto& motion = Motion(model, item.CtlID);
-    const auto now = GetTickCount64();
+    const auto now = docky::vblank::AnimationMillis();
     const bool on = SwitchOn(model, item.CtlID);
     const bool contrast = model.color.top == model.color.bottom;
     const bool dark = GetRValue(model.color.top) < 128;
@@ -549,12 +552,12 @@ inline void PlaceFrame(HWND window, const Window& model) {
 
 inline void AnimateSwitch(HWND control, Window& model) {
     InvalidateRect(control, nullptr, FALSE);
-    if (!model.reducedMotion) SetTimer(model.dialog, kSwitchAnimation, 15, nullptr);
+    if (!model.reducedMotion) model.switchTicker.Start(model.dialog, docky::vblank::kMsgVBlank);
 }
 
 inline void SetSwitchPress(HWND control, Window& model, bool pressed) {
     auto& motion = Motion(model, GetDlgCtrlID(control));
-    const auto now = GetTickCount64();
+    const auto now = docky::vblank::AnimationMillis();
     motion.pressFrom = SwitchAmount(motion.pressFrom, motion.pressTo, motion.pressAt, now, 150);
     motion.pressTo = pressed ? 1.0f : 0.0f;
     motion.pressAt = now;
@@ -565,7 +568,7 @@ inline void CommitSwitch(HWND control, Window& model, bool on) {
     const UINT id = GetDlgCtrlID(control);
     auto& checked = id == kBackgroundSwitch ? model.background : model.pcBubble;
     auto& motion = Motion(model, id);
-    const auto now = GetTickCount64();
+    const auto now = docky::vblank::AnimationMillis();
     motion.from = motion.dragging ? motion.dragPosition : SwitchAmount(motion.from, motion.to, motion.slideAt, now, 420, true);
     motion.dragging = false;
     bool failed = false;
@@ -597,7 +600,7 @@ inline LRESULT CALLBACK SwitchProc(HWND control, UINT message, WPARAM wp, LPARAM
         SetCapture(control);
         motion.pointerDown = true;
         motion.pointerDownX = GET_X_LPARAM(lp);
-        motion.pointerDownPosition = SwitchAmount(motion.from, motion.to, motion.slideAt, GetTickCount64(), 420, true);
+        motion.pointerDownPosition = SwitchAmount(motion.from, motion.to, motion.slideAt, docky::vblank::AnimationMillis(), 420, true);
         SetSwitchPress(control, model, true);
         return 0;
     case WM_MOUSEMOVE:
@@ -748,6 +751,7 @@ inline INT_PTR CALLBACK DialogProc(HWND window, UINT message, WPARAM wp, LPARAM 
         if (model) PlaceFrame(window, *model);
         break;
     case WM_DESTROY:
+        if (model) model->switchTicker.Stop();
         if (model && model->frame) { DestroyWindow(model->frame); model->frame = nullptr; }
         break;
     case WM_PAINT:
@@ -764,10 +768,11 @@ inline INT_PTR CALLBACK DialogProc(HWND window, UINT message, WPARAM wp, LPARAM 
     case WM_DRAWITEM:
         if (model) { PaintButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lp), *model); return TRUE; }
         break;
-    case WM_TIMER:
-        if (model && wp == kSwitchAnimation) {
+    case docky::vblank::kMsgVBlank:
+        if (model) {
+            model->switchTicker.Ack();
             bool running = false;
-            const auto now = GetTickCount64();
+            const auto now = docky::vblank::AnimationMillis();
             for (int id : {kPcBubbleSwitch, kBackgroundSwitch}) {
                 auto& motion = Motion(*model, id);
                 if (motion.from == motion.to && motion.pressFrom == motion.pressTo) continue;
@@ -776,7 +781,7 @@ inline INT_PTR CALLBACK DialogProc(HWND window, UINT message, WPARAM wp, LPARAM 
                 running = running || motion.from != motion.to || motion.pressFrom != motion.pressTo;
                 InvalidateRect(GetDlgItem(window, id), nullptr, FALSE);
             }
-            if (!running) KillTimer(window, kSwitchAnimation);
+            if (!running) model->switchTicker.Stop();
             return TRUE;
         }
         break;

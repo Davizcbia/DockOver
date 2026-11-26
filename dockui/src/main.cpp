@@ -55,6 +55,8 @@ static volatile const char liquidBuildMarker[] = LIQUID_BUILD_MARKER;
 #include "app_registry.h"
 #include "applications_win_key.h"
 #include "vblank.h"
+#include "fullscreen_window.h"
+#include "stage_manager.h"
 #include "desktop_settings.h"
 #include "theme_state.h"
 #include "status_group.h"
@@ -75,6 +77,7 @@ constexpr UINT_PTR kTimerLaunchpadIcon = 3;  // a Launchpad icon command, run on
 constexpr UINT_PTR kTimerLaunchpadPrewarm = 4;  // app discovery and icon cache for Launchpad, a few seconds after start
 constexpr UINT_PTR kTimerDragRemoval = 5;
 constexpr UINT_PTR kTimerWindowPreview = 6;
+constexpr UINT_PTR kTimerFullscreen = 7;
 constexpr UINT kDragRemovalDwellMs = 300;
 constexpr UINT_PTR kTimerApplicationsPrewarm = 58;  // the resident Applications window, started hidden after the Dock
 static HWND ApplicationsWindow(HANDLE process);  // the resident Applications window of that process, if any
@@ -91,6 +94,7 @@ static bool OwnPopupVisible() {
     if (popup) GetWindowThreadProcessId(popup, &owner);
     return popup && owner == GetCurrentProcessId() && IsWindowVisible(popup);
 }
+constexpr UINT kMenuStageManager=83;
 constexpr UINT kMenuApplications=74;
 constexpr UINT kMenuTaskManager=79;  // Dock menu > Task Manager (taskmgr.exe; Windows asks for elevation when its policy wants it)
 #ifdef DOCKY_PHONE_PAIRING
@@ -270,7 +274,8 @@ private:
     void SetLowLatency(bool on, const wchar_t* why);         // Settings > General > Low latency glass (live)
     // Game compatibility: the Menu Bar's full-screen game detection and the games list (game_compat.h) both hide the
     // Dock and stop capture (SetGameSuppressed).
-    bool gameCompatSetting_ = false, menuBarGame_ = false, listedGame_ = false;
+    bool gameCompatSetting_ = false, listedGame_ = false;
+    HWND detectedGame_ = nullptr;
     std::wstring listedGameName_;
     docky::game::Watcher gameWatch_;
     // The monitor duplication this Dock owns (low latency), whether or not the Dock's own glass currently reads it: Control
@@ -307,11 +312,12 @@ private:
     std::vector<uint32_t> DockIconPixels(size_t index, UINT& w, UINT& h);  // CPU copy of the icon as the Dock shows it
     void OnRButtonUp(float x, float y);
     void UpdateDockAppBar();  // reserve / release the Dock band as a bottom AppBar (MyDockFinder "window boundary")
+    void ToggleStageManager();
     static constexpr UINT kDockAppBarMsg = WM_APP + 78;
     // macOS: an app in true full screen (covering the whole monitor, e.g. F11 / its full-screen button) hides the Dock;
-    // a maximized window keeps it. Told by the shell (ABN_FULLSCREENAPP, while the AppBar is registered) and by the Menu
-    // Bar (always registered) with kDockFullscreenMsg.
-    static constexpr UINT kDockFullscreenMsg = WM_APP + 79;
+    // a maximized window keeps it. Detection also runs when the menu bar is disabled.
+    docky::StageManager stageManager_;
+    HWND fullscreenWindow_ = nullptr;
     bool fullscreenApp_ = false;
     bool gameSuppressed_ = false;
     // A full-screen app makes the Dock auto-hide (macOS): hidden, revealed over the app by moving to the bottom edge,
@@ -334,6 +340,7 @@ private:
     void MinimizedChanged(HWND w, bool added);
     void PlaceMinimizedTiles();
     void SetFullscreenApp(bool full);
+    void CheckFullscreen();
     void SetGameSuppressed(bool suppress);
     void ApplyGameMode();
     bool dockAppBar_ = false, dockAppBarEnabled_ = false;
@@ -777,6 +784,7 @@ int App::Run(HINSTANCE instance, const Options& options) {
     if (wchar_t v[8]{}; GetEnvironmentVariableW(L"DOCKY_LATENCY_LOG", v, 8) && v[0] == L'1') latencyLogForced_ = true;  // measurements
     {   const auto initial = liquid::settings::Load(opt_.desktopSettingsPath).value.dock;
         gameCompatSetting_ = initial.gameCompatibility;
+        stageManager_.SetPerspective(initial.stagePerspective);
         SetLowLatency(lowLatForced_ || initial.lowLatencyGlass, lowLatForced_ ? L"command line / DOCKY_LOWLAT" : L"settings"); }
     if (latencyLogForced_) latencyLogEvery_ = 10.0;
     if (!opt_.snapshot.empty()) renderer_.RequestSnapshot(opt_.snapshot);
@@ -813,6 +821,8 @@ int App::Run(HINSTANCE instance, const Options& options) {
             if (h && pid != GetCurrentProcessId()) g_lastExternalForeground = h;
         }, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
     SetTimer(hwnd_, kTimerRunning, 1000, nullptr);  // state polling only; never drives animation
+    SetTimer(hwnd_, kTimerFullscreen, 250, nullptr);
+    CheckFullscreen();
     if (!statusVolume_.Start(hwnd_, kStatusVolumeMsg)) DLOG(L"status group: volume watcher unavailable (volume follows the 5 s query)");
     if (opt_.exitAfter <= 0) {  // timed test runs never hook other windows or change Windows animation settings
         HWND self = hwnd_;
@@ -1032,6 +1042,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         if(next!=downloadsPixels_){downloadsPixels_=std::move(next);for(auto& item:items_)if(item.isDownloads){ResolveItem(item);break;}BuildIcons();}
         return 0;}
     case WM_TIMER:
+        if (wp == kTimerFullscreen) { CheckFullscreen(); return 0; }
         if (wp == kTimerWindowPreview) { TickWindowPreview(); return 0; }
         if (wp == kTimerDragRemoval) {
             if (dragging_) {
@@ -1056,7 +1067,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if (game.empty() == listedGame_ || game != listedGameName_) {
                     listedGame_ = !game.empty(); listedGameName_ = game;
                     DLOG(L"game compatibility: games list %ls%ls", listedGame_ ? L"program running: " : L"no listed program running", game.c_str());
-                    SetGameSuppressed(menuBarGame_ || listedGame_);
+                    CheckFullscreen();
                 }
             }
             if (GameMode() && (++gameTick_ % 5) != 0) return 0;
@@ -1098,6 +1109,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if(const float mag=1.0f+current.value.dock.magnification/100.0f;std::fabs(mag-model_.m.maxScale)>0.001f){
                     model_.m.maxScale=mag;ApplyWindowLayout(L"magnification");needsFrame_=true;StartAnimating();DLOG(L"magnification: %.2fx",mag);}
                 gameCompatSetting_=current.value.dock.gameCompatibility;
+                stageManager_.SetPerspective(current.value.dock.stagePerspective);
                 if(!lowLatForced_)SetLowLatency(current.value.dock.lowLatencyGlass,L"settings changed");
                 if(current.value.dock.statusBatteryPercent!=statusPercent_){statusPercent_=current.value.dock.statusBatteryPercent;RefreshStatus(false);}
                 if(current.value.dock.statusTileStyle!=statusTileStyle_){statusTileStyle_=current.value.dock.statusTileStyle;RefreshStatus(false);}
@@ -1186,13 +1198,15 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
     case kMinimizeMsg:
         MinimizedChanged(reinterpret_cast<HWND>(lp), wp != 0);
         return 0;
+    case liquid::cc::kToggleStage:
+        ToggleStageManager();
+        if (lp) PostMessageW(reinterpret_cast<HWND>(lp), liquid::cc::kStageChanged, 0, 0);
+        return 0;
     case WM_APP + 80:  // Settings imported a new pinned.txt (MyDockFinder import)
         Reload();
         return 0;
-    case kDockFullscreenMsg:
-        SetFullscreenApp(wp != 0);
-        menuBarGame_ = lp != 0;  // the Menu Bar's full-screen game detection
-        SetGameSuppressed(menuBarGame_ || listedGame_);
+    case docky::fullscreen::kDockChanged:
+        CheckFullscreen();
         return 0;
     case dock::launchpad::kMsgLaunchpadAppMenu: {
         std::unique_ptr<dock::launchpad::AppMenuRequest> request(reinterpret_cast<dock::launchpad::AppMenuRequest*>(lp));
@@ -1208,8 +1222,8 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         DLOG(L"dock: desktop capture %ls", launchpadCovers_ ? L"paused under Launchpad" : L"resumed");
         return 0;
     case kDockAppBarMsg:
-        // ABN_FULLSCREENAPP is not trusted: Windows also sends it for the virtual-desktop switch animation (measured
-        // 2026-11-10), which made the Dock slide away on every switch. The Menu Bar's checked decision (kDockFullscreenMsg) rules.
+        // Windows also sends ABN_FULLSCREENAPP for the virtual-desktop switch animation. Check the actual window.
+        if (wp == ABN_FULLSCREENAPP) CheckFullscreen();
         if (wp == ABN_POSCHANGED) {  // another appbar / the taskbar changed: recompute (bounded, never a notify loop)
             static ULONGLONG last = 0; const ULONGLONG t = GetTickCount64();
             if (t - last > 500) { last = t; dockAppBarRect_ = {}; UpdateDockAppBar(); }
@@ -1240,6 +1254,8 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         DestroyWindow(hwnd_);
         return 0;
     case WM_DESTROY:
+        stageManager_.Stop();
+        RemovePropW(hwnd_, liquid::cc::kStageEnabledProperty);
         DismissWindowPreview();
         docky::statushost::Shutdown();
         RevokeDragDrop(hwnd_);
@@ -1251,6 +1267,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         DLOG(L"window destroyed");
         if (fgHook_) { UnhookWinEvent(fgHook_); fgHook_ = nullptr; }
         KillTimer(hwnd_, kTimerRunning);
+        KillTimer(hwnd_, kTimerFullscreen);
         hwnd_ = nullptr;
         animating_ = needsFrame_ = false;
         PostQuitMessage(0);
@@ -2222,6 +2239,35 @@ void App::StartAnimating() {
 // thickness = Dock size + distance from the screen edge, minus a taskbar already reserved on that edge; no
 // drag-time window constraint was found. Windows then keeps maximized / snapped windows out of the band. Like
 // MyDockFinder this is not combined with auto-hide (a hidden Dock must not keep reserving space).
+void App::ToggleStageManager() {
+    stageManager_.Toggle(hwnd_);
+    if (stageManager_.Enabled())
+        SetPropW(hwnd_, liquid::cc::kStageEnabledProperty, reinterpret_cast<HANDLE>(1));
+    else
+        RemovePropW(hwnd_, liquid::cc::kStageEnabledProperty);
+}
+
+void App::CheckFullscreen() {
+    const HWND menuBar = FindWindowW(docky::fullscreen::kMenuBarClass, nullptr);
+    const HWND buttonWindow = menuBar ?
+        static_cast<HWND>(GetPropW(menuBar, docky::fullscreen::kButtonWindowProperty)) : nullptr;
+    fullscreenWindow_ = docky::fullscreen::Find(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTONULL),
+                                                  fullscreenWindow_, buttonWindow);
+    if (!gameCompatSetting_ || detectedGame_ != fullscreenWindow_) detectedGame_ = nullptr;
+    if (gameCompatSetting_ && fullscreenWindow_ && !detectedGame_) {
+        QUERY_USER_NOTIFICATION_STATE state = QUNS_NOT_PRESENT;
+        if ((SUCCEEDED(SHQueryUserNotificationState(&state)) && state == QUNS_RUNNING_D3D_FULL_SCREEN) ||
+            docky::fullscreen::GameOwnsPointer()) detectedGame_ = fullscreenWindow_;
+    }
+    MONITORINFO display{sizeof(display)};
+    const bool gamePresentation = fullscreenWindow_ &&
+        GetMonitorInfoW(MonitorFromWindow(fullscreenWindow_, MONITOR_DEFAULTTONULL), &display) &&
+        docky::fullscreen::ScaledGame(fullscreenWindow_, display.rcMonitor);
+    stageManager_.Refresh(fullscreenWindow_ || listedGame_ || launchpadCovers_);
+    SetFullscreenApp(fullscreenWindow_ != nullptr);
+    SetGameSuppressed(gamePresentation || detectedGame_ || listedGame_);
+}
+
 void App::SetFullscreenApp(bool full) {
     if (!hwnd_ || full == fullscreenApp_) return;
     fullscreenApp_ = full;
@@ -3076,6 +3122,8 @@ void App::OnRButtonUp(float x, float y) {
 #ifdef DOCKY_PHONE_PAIRING
     AppendMenuW(menu, MF_STRING, kMenuPairPhone, L"DockDrop…");
 #endif
+    AppendMenuW(menu, MF_STRING | (stageManager_.Enabled() ? MF_CHECKED : 0), kMenuStageManager,
+                docky::ui::chinese ? L"台前调度" : L"Stage Manager");
     AppendMenuW(menu, MF_STRING, kMenuTaskManager, docky::ui::Text(L"Task Manager"));
     AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -3127,6 +3175,7 @@ void App::OnRButtonUp(float x, float y) {
         return;
     }
 #endif
+    if(cmd==kMenuStageManager){ToggleStageManager();return;}
     if(cmd==kMenuTaskManager){const auto r=reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr,L"open",L"taskmgr.exe",nullptr,nullptr,SW_SHOWNORMAL));DLOG(L"menu: Task Manager (%ld)",static_cast<long>(r));return;}
     if(cmd>=kMenuShowBase&&cmd<kMenuShowBase+3){
         const char* keys[3]={"showDivider","showDownloads","showTrash"};bool* fields[3]={&showDivider_,&showDownloads_,&showTrash_};
