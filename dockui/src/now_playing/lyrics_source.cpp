@@ -6,6 +6,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <cwchar>
 #include <vector>
 #include <cstdlib>
@@ -16,7 +17,7 @@ namespace {
 constexpr wchar_t kAgent[] = L"DockOver Now Playing (lyrics)";
 
 std::string ReadBytes(const std::wstring& path, size_t limit) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return {};
     std::string out; LARGE_INTEGER size{};
     if (GetFileSizeEx(f, &size) && size.QuadPart > 0 && size_t(size.QuadPart) <= limit) {
@@ -29,10 +30,15 @@ std::string ReadBytes(const std::wstring& path, size_t limit) {
 }
 
 bool WriteText(const std::wstring& path, const std::string& data) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    const auto pending = path + L".tmp-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetCurrentThreadId());
+    HANDLE f = CreateFileW(pending.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
-    DWORD written = 0; const BOOL ok = WriteFile(f, data.data(), DWORD(data.size()), &written, nullptr);
-    CloseHandle(f); return ok && written == data.size();
+    DWORD written = 0;
+    const bool ok = WriteFile(f, data.data(), DWORD(data.size()), &written, nullptr) && written == data.size();
+    CloseHandle(f);
+    if (ok && MoveFileExW(pending.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) return true;
+    DeleteFileW(pending.c_str());
+    return false;
 }
 
 bool FreshMarker(const std::wstring& path) {
@@ -71,19 +77,25 @@ double JsonNumber(const dock::json::Value& o, const char* key) {
 // must name the same artist, the same title and version, and (when the player gives one) a length within 3 s.
 // A catalog result is usable when its title (version words included) and artist match and, when the player gives
 // the length, it is within 3 s. Returns a score (higher is better) or -1.
-int Candidate(const LyricsRequest& r, const std::wstring& title, const std::vector<std::wstring>& artists, double lengthMs) {
+int Candidate(const LyricsRequest& r, const std::wstring& title, const std::vector<std::wstring>& artists,
+              double lengthMs, const std::wstring& album = {}) {
     const std::wstring wantArtist = NormalizeName(r.artist);
-    if (!SameRecording(title, r.title)) return -1;
-    bool artistOk = false, exact = false;
+    if (wantArtist.empty() || !SameRecording(title, r.title)) return -1;
+    int artistScore = 0;
     for (const auto& a : artists) {
         const std::wstring n = NormalizeName(a);
         if (n.empty()) continue;
-        if (n == wantArtist) exact = artistOk = true;
-        else if (wantArtist.find(n) != std::wstring::npos || n.find(wantArtist) != std::wstring::npos) artistOk = true;
+        if (n == wantArtist) artistScore = 100;
+        else if ((L" " + wantArtist + L" ").find(L" " + n + L" ") != std::wstring::npos ||
+                 (L" " + n + L" ").find(L" " + wantArtist + L" ") != std::wstring::npos)
+            artistScore = std::max(artistScore, 65);
     }
-    if (!artistOk) return -1;
-    if (r.durationMs > 0 && (lengthMs <= 0 || std::abs(lengthMs - r.durationMs) > 3000)) return -1;
-    return (exact ? 2 : 0) + (r.durationMs > 0 && std::abs(lengthMs - r.durationMs) <= 1500 ? 2 : 0);
+    if (!artistScore) return -1;
+    const auto difference = std::abs(lengthMs - r.durationMs);
+    if (r.durationMs > 0 && (lengthMs <= 0 || difference > 3000)) return -1;
+    const int durationScore = r.durationMs > 0 ? static_cast<int>((3000 - difference) / 100) : 0;
+    const bool sameAlbum = !album.empty() && !r.album.empty() && NormalizeName(album) == NormalizeName(r.album);
+    return artistScore + durationScore + (sameAlbum ? 30 : 0);
 }
 
 // Leading "Title - Artist" line some services add before the lyrics (QQ Music, Kugou).
@@ -131,6 +143,59 @@ std::string Base64Decode(const std::string& in) {
     return out;
 }
 
+lyrics::Lyrics AmllYrc(const char* index, double id, const LyricsRequest& r) {
+    if (id <= 0 || r.durationMs <= 0) return {};
+    char track[24]; sprintf_s(track, "%.0f", id);
+    std::string body;
+    if (!HttpGet(std::string("https://raw.githubusercontent.com/amll-dev/amll-ttml-db/refs/heads/main/") +
+            index + "/" + track + ".yrc", body, 0, 0, 2u * 1024 * 1024, L"DockOver Music Player")) return {};
+    auto timed = Finish(lyrics::ParseYrc(LyricsSource::DecodeText(body)), r);
+    if (!timed.WordTimed()) return {};
+    timed.source = L"AMLL";
+    return timed;
+}
+
+using RankedTrackIds = std::vector<std::pair<int, double>>;
+
+lyrics::Lyrics FindAmllLyrics(const char* index, RankedTrackIds& candidates, const LyricsRequest& r) {
+    if (r.durationMs <= 0) return {};
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    });
+    std::vector<double> checked;
+    for (const auto& [score, id] : candidates) {
+        if (score < 0 || checked.size() >= 3) break;
+        if (id <= 0 || std::find(checked.begin(), checked.end(), id) != checked.end()) continue;
+        checked.push_back(id);
+        if (auto timed = AmllYrc(index, id, r); timed.WordTimed()) return timed;
+    }
+    return {};
+}
+
+lyrics::Lyrics AppleCatalogLyrics(const LyricsRequest& r) {
+    if (r.durationMs <= 0 || r.artist.empty()) return {};
+    wchar_t region[4]{};
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SISO3166CTRYNAME, region, ARRAYSIZE(region));
+    const std::string country = region[0] && region[1] ? dock::json::ToUtf8(region) : "US";
+    const std::string url = "https://itunes.apple.com/search?entity=song&limit=20&country=" + country +
+        "&term=" + UrlEncodeQuery(r.title + L" " + r.artist);
+    std::string body, error;
+    dock::json::Value json;
+    if (!HttpGet(url, body, 0, 0, 2u * 1024 * 1024, kAgent) || !dock::json::Parse(body, json, error)) return {};
+    const auto* results = json.Find("results");
+    if (!results || results->type != dock::json::Value::Type::Array) return {};
+    RankedTrackIds candidates;
+    for (const auto& track : results->array) {
+        const int score = Candidate(r, dock::json::FromUtf8(JsonString(track, "trackName")),
+            {dock::json::FromUtf8(JsonString(track, "artistName"))}, JsonNumber(track, "trackTimeMillis"),
+            dock::json::FromUtf8(JsonString(track, "collectionName")));
+        if (score >= 0) candidates.emplace_back(score, JsonNumber(track, "trackId"));
+    }
+    auto found = FindAmllLyrics("am-lyrics", candidates, r);
+    if (found.WordTimed()) found.source = L"AMLL (Apple catalog)";
+    return found;
+}
+
 // QQ Music public web API (no account): search, then the song's LRC.
 lyrics::Lyrics QQMusic(const LyricsRequest& r) {
     const wchar_t* referer = L"Referer: https://y.qq.com/\r\n";
@@ -140,13 +205,17 @@ lyrics::Lyrics QQMusic(const LyricsRequest& r) {
     const auto* data = v.Find("data"); const auto* song = data ? data->Find("song") : nullptr; const auto* list = song ? song->Find("list") : nullptr;
     if (!list || list->type != dock::json::Value::Type::Array) return {};
     std::string mid; int best = -1;
+    RankedTrackIds candidates;
     for (const auto& s : list->array) {
         std::vector<std::wstring> artists;
         if (const auto* singers = s.Find("singer"); singers && singers->type == dock::json::Value::Type::Array)
             for (const auto& a : singers->array) artists.push_back(dock::json::FromUtf8(JsonString(a, "name")));
-        const int score = Candidate(r, dock::json::FromUtf8(JsonString(s, "songname")), artists, JsonNumber(s, "interval") * 1000);
+        const int score = Candidate(r, dock::json::FromUtf8(JsonString(s, "songname")), artists, JsonNumber(s, "interval") * 1000,
+            dock::json::FromUtf8(JsonString(s, "albumname")));
+        if (score >= 0) candidates.emplace_back(score, JsonNumber(s, "songid"));
         if (score > best) { best = score; mid = JsonString(s, "songmid"); }
     }
+    if (auto timed = FindAmllLyrics("qq-lyrics", candidates, r); timed.WordTimed()) return timed;
     if (mid.empty()) return {};
     if (!HttpGet("https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_new.fcg?format=json&nobase64=1&songmid=" + mid, body, 0, 0, 2u * 1024 * 1024, nullptr, referer) ||
         !dock::json::Parse(body, v, error)) return {};
@@ -187,49 +256,46 @@ lyrics::Lyrics Kugou(const LyricsRequest& r) {
 }
 
 lyrics::Lyrics NetEase(const LyricsRequest& r) {
-    const std::wstring wantArtist = NormalizeName(r.artist);
     std::string body, error; dock::json::Value v;
     const std::string search = "https://music.163.com/api/search/get?type=1&limit=20&s=" + UrlEncodeQuery(r.title + L" " + r.artist);
     if (!HttpGet(search, body, 0, 0, 2u * 1024 * 1024, nullptr) || !dock::json::Parse(body, v, error)) return {};
     const auto* result = v.Find("result"); const auto* songs = result ? result->Find("songs") : nullptr;
     if (!songs || songs->type != dock::json::Value::Type::Array) return {};
     double bestId = 0; int bestScore = -1;
+    RankedTrackIds candidates;
     for (const auto& song : songs->array) {
-        const std::wstring nameRaw = dock::json::FromUtf8(JsonString(song, "name"));
-        if (!SameRecording(nameRaw, r.title)) continue;
-        bool artistOk = false, exact = false;
-        if (const auto* artists = song.Find("artists"); artists && artists->type == dock::json::Value::Type::Array)
-            for (const auto& a : artists->array) {
-                const std::wstring n = NormalizeName(dock::json::FromUtf8(JsonString(a, "name")));
-                if (n.empty()) continue;
-                if (n == wantArtist) exact = artistOk = true;
-                else if (wantArtist.find(n) != std::wstring::npos || n.find(wantArtist) != std::wstring::npos) artistOk = true;
+        std::vector<std::wstring> names;
+        if (const auto* artists = song.Find("artists"); artists && artists->type == dock::json::Value::Type::Array) {
+            for (const auto& artist : artists->array) {
+                names.push_back(dock::json::FromUtf8(JsonString(artist, "name")));
+                if (const auto* aliases = artist.Find("alias"); aliases && aliases->type == dock::json::Value::Type::Array)
+                    for (const auto& alias : aliases->array)
+                        if (alias.type == dock::json::Value::Type::String) names.push_back(dock::json::FromUtf8(alias.string));
             }
-        if (!artistOk) continue;
-        const double length = JsonNumber(song, "duration");
-        if (r.durationMs > 0 && (length <= 0 || std::abs(length - r.durationMs) > 3000)) continue;
-        const int score = (exact ? 2 : 0) + (r.durationMs > 0 && std::abs(length - r.durationMs) <= 1500 ? 2 : 0);
-        if (score > bestScore) { bestScore = score; bestId = JsonNumber(song, "id"); }
+        }
+        const auto* album = song.Find("album");
+        const int score = Candidate(r, dock::json::FromUtf8(JsonString(song, "name")), names, JsonNumber(song, "duration"),
+            album ? dock::json::FromUtf8(JsonString(*album, "name")) : L"");
+        const auto id = JsonNumber(song, "id");
+        if (score >= 0) candidates.emplace_back(score, id);
+        if (id > 0 && score > bestScore) { bestScore = score; bestId = id; }
     }
     if (bestId <= 0) return {};
-    char url[160]; sprintf_s(url, "https://music.163.com/api/song/lyric?lv=1&tv=-1&id=%.0f", bestId);
+    char id[24]; sprintf_s(id, "%.0f", bestId);
+    if (auto timed = FindAmllLyrics("ncm-lyrics", candidates, r); timed.WordTimed()) return timed;
+    char url[160]; sprintf_s(url, "https://music.163.com/api/song/lyric?lv=1&tv=-1&yv=1&id=%s", id);
     if (!HttpGet(url, body, 0, 0, 2u * 1024 * 1024, nullptr) || !dock::json::Parse(body, v, error)) return {};
+    if (const auto* yrc = v.Find("yrc"); yrc) {
+        auto timed = Finish(lyrics::ParseYrc(dock::json::FromUtf8(JsonString(*yrc, "lyric"))), r);
+        if (timed.WordTimed()) return timed;
+    }
     const auto* lrc = v.Find("lrc"); const std::string text = lrc ? JsonString(*lrc, "lyric") : std::string{};
     if (text.empty() || text.find("\xE7\xBA\xAF\xE9\x9F\xB3\xE4\xB9\x90\xEF\xBC\x8C\xE8\xAF\xB7\xE6\xAC\xA3\xE8\xB5\x8F") != std::string::npos) return {};  // "纯音乐，请欣赏"
     return Finish(lyrics::ParseLrc(dock::json::FromUtf8(text)), r);
 }
 
 // Saved form of the lyrics (LRC with translations as same-time lines), so the cache keeps translations.
-std::string ToLrc(const lyrics::Lyrics& l) {
-    std::wstring out;
-    for (const auto& line : l.lines) {
-        if (line.ms < 0) { out += line.text + L"\n"; continue; }
-        wchar_t tag[24]; swprintf_s(tag, L"[%02d:%02d.%02d]", line.ms / 60000, (line.ms / 1000) % 60, (line.ms % 1000) / 10);
-        out += tag + line.text + L"\n";
-        if (!line.translation.empty()) out += tag + line.translation + L"\n";
-    }
-    return dock::json::ToUtf8(out);
-}
+std::string ToLrc(const lyrics::Lyrics& l) { return dock::json::ToUtf8(lyrics::FormatLrc(l)); }
 
 std::string RecordText(const dock::json::Value& o) {
     std::string synced = JsonString(o, "syncedLyrics");
@@ -279,7 +345,11 @@ void LyricsSource::Loop() {
             if (stop_) return;
             next = *pending_; pending_.reset();
         }
-        LyricsResult result{next.tag, Find(next)};
+        LyricsResult result{next.tag, Find(next, [&](const lyrics::Lyrics* provisional) {
+            { std::lock_guard l(mutex_); if (stop_ || pending_) return false; }
+            if (provisional) callback_({next.tag, *provisional});
+            return true;
+        })};
         { std::lock_guard l(mutex_); if (stop_ || pending_) continue; }  // superseded
         callback_(result);
     }
@@ -291,19 +361,29 @@ void MatchScript(lyrics::Lyrics& l, const LyricsRequest& r) {
     const std::wstring names = r.artist + r.title;
     if (names.empty() || ToSimplified(names) != names) return;  // the player uses Traditional (or no Chinese)
     if (std::none_of(names.begin(), names.end(), [](wchar_t c) { return c >= 0x3400 && c < 0xA000; })) return;
-    for (auto& line : l.lines) { line.text = ToSimplified(line.text); line.translation = ToSimplified(line.translation); }
+    for (auto& line : l.lines) {
+        auto simplified = ToSimplified(line.text);
+        if (line.words.empty() || simplified.size() == line.text.size()) line.text = std::move(simplified);
+        line.translation = ToSimplified(line.translation);
+    }
 }
 }  // namespace
 
-lyrics::Lyrics LyricsSource::Find(const LyricsRequest& raw) {
+lyrics::Lyrics LyricsSource::Find(const LyricsRequest& raw, const Preview& preview) {
     ArtworkRequest a{raw.title, raw.artist, raw.album}; a = CleanRequest(a);
     LyricsRequest r = raw; r.artist = a.artist; r.album = a.album;
     if (r.title.empty()) return {};
+    lyrics::Lyrics local;
 
     // 0. The playing local file's own lyrics (an .lrc beside it, or its lyrics tag).
     if (!r.localText.empty()) {
-        auto parsed = lyrics::ParseLrc(r.localText);
-        if (!parsed.Empty()) { parsed.source = L"local file"; Log(L"lyrics: local music file"); return parsed; }
+        auto parsed = lyrics::Parse(r.localText);
+        if (!parsed.Empty()) {
+            parsed.source = L"local file";
+            Log(L"lyrics: local music file");
+            if (parsed.WordTimed()) return parsed;
+            local = std::move(parsed);
+        }
     }
 
     // 1. The user's files.
@@ -311,49 +391,96 @@ lyrics::Lyrics LyricsSource::Find(const LyricsRequest& raw) {
         const std::wstring dir = CustomDir();
         const std::wstring want[] = {NormalizeName(r.artist + L" - " + r.title), NormalizeName(r.title + L" - " + r.artist), NormalizeName(r.title)};
         WIN32_FIND_DATAW f{}; HANDLE h = FindFirstFileW((dir + L"\\*").c_str(), &f);
-        std::wstring best; int bestRank = 99;
+        std::array<std::wstring, 6> candidates;
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
                 std::wstring name = f.cFileName; const size_t dot = name.find_last_of(L'.');
                 if (dot == std::wstring::npos) continue;
                 std::wstring ext = name.substr(dot); for (auto& c : ext) c = wchar_t(towlower(c));
-                if (ext != L".lrc" && ext != L".txt") continue;
+                if (ext != L".lrc" && ext != L".txt" && ext != L".yrc" && ext != L".eslrc") continue;
                 const std::wstring stem = name.substr(0, dot), norm = NormalizeName(stem);
                 for (int i = 0; i < 3; ++i)
-                    if (norm == want[i] && SameVersion(stem, i == 2 ? r.title : (i == 0 ? r.artist + L" - " + r.title : r.title + L" - " + r.artist)) && i < bestRank) {
-                        bestRank = i; best = dir + L"\\" + name;
+                    if (norm == want[i] && SameVersion(stem, i == 2 ? r.title : (i == 0 ? r.artist + L" - " + r.title : r.title + L" - " + r.artist))) {
+                        const int rank = 2 * i + (ext == L".yrc" || ext == L".eslrc" ? 0 : 1);
+                        if (candidates[rank].empty()) candidates[rank] = dir + L"\\" + name;
                     }
             } while (FindNextFileW(h, &f));
             FindClose(h);
         }
-        if (!best.empty()) {
-            auto parsed = lyrics::ParseLrc(DecodeText(ReadBytes(best, 2u * 1024 * 1024)));
-            if (!parsed.Empty()) { parsed.source = L"file"; Log(L"lyrics: file %ls", best.c_str()); return parsed; }
+        for (const auto& path : candidates) {
+            if (path.empty()) continue;
+            auto parsed = lyrics::Parse(DecodeText(ReadBytes(path, 2u * 1024 * 1024)));
+            if (parsed.Empty()) continue;
+            parsed.source = L"file";
+            if (parsed.WordTimed()) return parsed;
+            if (local.Empty()) local = std::move(parsed);
         }
     }
 
     // 2. Cache.
     const std::wstring key = KeyFor(r);
     if (key.empty()) return {};
-    const std::wstring cache = CacheDir() + L"\\" + key + L".lrc", none = CacheDir() + L"\\" + key + L".none";
-    if (const std::string cached = ReadBytes(cache, 2u * 1024 * 1024); !cached.empty()) {
-        auto parsed = lyrics::ParseLrc(DecodeText(cached)); parsed.source = L"cache"; MatchScript(parsed, r);
+    const std::wstring legacyCache = CacheDir() + L"\\" + key + L".lrc";
+    const std::wstring cacheKey = CacheDir() + L"\\" + key + L"-word-" + std::to_wstring((int64_t(r.durationMs) + 500) / 1000);
+    const std::wstring oldVariant = r.appleCatalog ? L"-v2-am" : L"-v2";
+    const std::wstring variant = r.appleCatalog ? L"-v3-am" : L"-v3";
+    const auto cache = cacheKey + variant + L".lrc", none = cacheKey + variant + L".none";
+    const auto readCache = [&](const std::wstring& path) {
+        auto parsed = lyrics::ParseLrc(DecodeText(ReadBytes(path, 2u * 1024 * 1024)));
+        parsed.source = L"cache"; MatchScript(parsed, r);
         for (auto& line : parsed.lines) line.translation.clear();
         return parsed;
+    };
+    auto previous = readCache(cache);
+    if (previous.WordTimed()) return previous;
+    for (const auto& path : {cacheKey + oldVariant + L".lrc", cacheKey + L".lrc", legacyCache}) {
+        auto older = readCache(path);
+        if (older.WordTimed()) return older;
+        if (previous.Empty() || (!previous.synced && older.synced)) previous = std::move(older);
     }
-    if (!r.online || FreshMarker(none)) return {};
+    if (local.synced || (!local.Empty() && !previous.synced)) previous = std::move(local);
+    if (!r.online || FreshMarker(cache) || FreshMarker(none)) return previous;
+    if (preview && !previous.Empty() && !preview(&previous)) return {};
+
+    if (r.appleCatalog && (!preview || preview(nullptr))) {
+        if (auto found = AppleCatalogLyrics(r); found.WordTimed()) {
+            WriteText(cache, ToLrc(found));
+            MatchScript(found, r);
+            return found;
+        }
+    }
 
     // 3. NetEase Cloud Music, QQ Music, Kugou (synced lyrics, broad coverage incl. Chinese), then 4. LRCLIB.
     struct Provider { const wchar_t* name; lyrics::Lyrics (*find)(const LyricsRequest&); };
+    lyrics::Lyrics fallback;
     for (const Provider& p : {Provider{L"netease", NetEase}, Provider{L"qqmusic", QQMusic}, Provider{L"kugou", Kugou}}) {
+        if (preview && !preview(nullptr)) return {};
         auto found = p.find(r);
         if (found.Empty() || !found.synced) continue;
-        WriteText(cache, ToLrc(found));
-        found.source = p.name; MatchScript(found, r);
-        Log(L"lyrics: %ls %ls / %ls (%zu lines)", p.name, r.artist.c_str(), r.title.c_str(), found.lines.size());
-        return found;
+        if (found.source.empty()) found.source = p.name;
+        if (found.WordTimed()) {
+            WriteText(cache, ToLrc(found));
+            MatchScript(found, r);
+            Log(L"lyrics: %ls %ls / %ls (%zu lines, word-timed)", found.source.c_str(), r.artist.c_str(), r.title.c_str(), found.lines.size());
+            return found;
+        }
+        if (fallback.Empty()) {
+            fallback = std::move(found);
+            if (preview && previous.Empty()) {
+                auto display = fallback;
+                MatchScript(display, r);
+                if (!preview(&display)) return {};
+            }
+        }
     }
+    if (!fallback.Empty()) {
+        WriteText(cache, ToLrc(fallback));
+        if (previous.synced) return previous;
+        MatchScript(fallback, r);
+        return fallback;
+    }
+    if (preview && !preview(nullptr)) return {};
     std::string text;
     {
         std::string url = "https://lrclib.net/api/get?artist_name=" + UrlEncodeQuery(r.artist) + "&track_name=" + UrlEncodeQuery(r.title);
@@ -384,9 +511,10 @@ lyrics::Lyrics LyricsSource::Find(const LyricsRequest& raw) {
             }
         }
     }
-    if (text.empty()) { Log(L"lyrics: none for %ls / %ls", r.artist.c_str(), r.title.c_str()); WriteText(none, "none"); return {}; }
+    if (text.empty()) { Log(L"lyrics: none for %ls / %ls", r.artist.c_str(), r.title.c_str()); WriteText(none, "none"); return previous; }
     WriteText(cache, text);
     auto parsed = Finish(lyrics::ParseLrc(dock::json::FromUtf8(text)), r);
+    if (previous.synced || (!previous.Empty() && !parsed.synced)) return previous;
     parsed.source = L"lrclib"; MatchScript(parsed, r);
     Log(L"lyrics: lrclib %ls / %ls (%zu lines, %ls)", r.artist.c_str(), r.title.c_str(), parsed.lines.size(), parsed.synced ? L"synced" : L"plain");
     return parsed;

@@ -25,6 +25,7 @@
 #include "../music_wallpaper_frame.h"
 #include "../color_output.h"
 #include "lyrics_source.h"
+#include "lyrics_clock.h"
 #include "local_tags.h"
 #include "silk_renderer.h"
 #include "../desktop_settings.h"
@@ -60,6 +61,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstring>
+#include <cwctype>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -117,13 +119,13 @@ struct Media {
     std::wstring title, artist, album, source;
     std::wstring localLyrics;  // lyrics of a matched local music file (its .lrc or lyrics tag), else empty
     int64_t position = 0, end = 0, updated = 0;  // 100 ns; updated = FILETIME (UTC) of the position sample
+    double anchoredAt = -1, rate = 1;
     std::shared_ptr<const std::vector<uint8_t>> thumb; uint32_t thumbW = 0, thumbH = 0; uint64_t thumbHash = 0;
-    std::wstring TrackKey() const { return title + L"\x1f" + artist + L"\x1f" + album; }
+    std::wstring TrackKey() const { return source + L"\x1f" + title + L"\x1f" + artist + L"\x1f" + album; }
     int64_t PositionNow() const {
-        if (!playing || !updated || end <= 0) return position;
-        FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
-        const int64_t now = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-        return std::clamp<int64_t>(position + std::max<int64_t>(0, now - updated), 0, end);
+        if (!playing || anchoredAt < 0) return position;
+        const auto advanced = position + int64_t(std::max(0.0, Now() - anchoredAt) * rate * lyrics::kTicksPerSecond);
+        return end > 0 ? std::clamp<int64_t>(advanced, 0, end) : std::max<int64_t>(0, advanced);
     }
 };
 
@@ -192,6 +194,7 @@ private:
                     next.has = true; next.source = s.SourceAppUserModelId().c_str();
                     const auto info = s.GetPlaybackInfo();
                     next.playing = info.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+                    if (const auto rate = info.PlaybackRate(); rate && rate.Value() > 0 && rate.Value() <= 4) next.rate = rate.Value();
                     const auto c = info.Controls();
                     next.canPlayPause = c.IsPlayPauseToggleEnabled(); next.canNext = c.IsNextEnabled(); next.canPrev = c.IsPreviousEnabled();
                     next.canSeek = c.IsPlaybackPositionEnabled() || Lower(next.source).find(L"applemusic") != std::wstring::npos;  // Apple Music: via its slider
@@ -226,6 +229,7 @@ private:
                     std::lock_guard l(m_);
                     changed = next.has != media_.has || next.playing != media_.playing || next.TrackKey() != media_.TrackKey() ||
                               next.thumbHash != media_.thumbHash || next.position != media_.position || next.end != media_.end ||
+                              next.updated != media_.updated || next.rate != media_.rate ||
                               next.localLyrics != media_.localLyrics || next.canPlayPause != media_.canPlayPause || next.canNext != media_.canNext || next.canPrev != media_.canPrev;
                     media_ = std::move(next);
                 }
@@ -448,6 +452,7 @@ public:
         const D2D1_GRADIENT_STOP fadeIn[] = {{0, D2D1::ColorF(1, 1, 1, 0)}, {1, D2D1::ColorF(1, 1, 1, 1)}};
         ComPtr<ID2D1GradientStopCollection> fadeStops; dc_->CreateGradientStopCollection(fadeIn, 2, &fadeStops);
         dc_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({}, {}), fadeStops.Get(), &silkFade_);
+        if (fadeStops) dc_->CreateLinearGradientBrush(D2D1::LinearGradientBrushProperties({}, {}), fadeStops.Get(), &wordSweep_);
         dc_->CreateEffect(CLSID_D2D1Border, &silkBorder_); dc_->CreateEffect(CLSID_D2D1GaussianBlur, &silkBlur_); dc_->CreateEffect(CLSID_D2D1Crop, &silkCrop_);
         if (silkBorder_ && silkBlur_ && silkCrop_) {
             silkBorder_->SetValue(D2D1_BORDER_PROP_EDGE_MODE_X, D2D1_BORDER_EDGE_MODE_CLAMP); silkBorder_->SetValue(D2D1_BORDER_PROP_EDGE_MODE_Y, D2D1_BORDER_EDGE_MODE_CLAMP);
@@ -585,6 +590,7 @@ public:
         bool lyricsView = false, lyricsAvailable = false;
         float lyricsPos = 0;             // smoothed index of the current line (fractional while scrolling)
         int lyricsActive = -1;           // line being sung
+        int64_t lyricTimeMs = 0;
         float time = 0;                  // seconds, drives the slow background drift
         bool lyricsFullArt = true;       // lyrics over the borderless artwork (it moves left) instead of the card layout
         float lyricsBlend = 0;           // 0..1 transition into the full-artwork lyrics layout
@@ -842,7 +848,17 @@ private:
         dc_->DrawBitmap(image, r, 1, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, nullptr);
         dc_->PopLayer();
     }
-    struct LyricLayout { ComPtr<IDWriteTextLayout> main; ComPtr<ID2D1CommandList> list; float height = 0; };
+    struct WordLayout {
+        std::vector<DWRITE_HIT_TEST_METRICS> boxes;
+        ComPtr<ID2D1CommandList> glow;
+        float width = 0;
+    };
+    struct LyricLayout {
+        ComPtr<IDWriteTextLayout> main;
+        ComPtr<ID2D1CommandList> list;
+        std::vector<WordLayout> words;
+        float height = 0;
+    };
     struct BlurFx { ComPtr<ID2D1Effect> blur, opacity; };
     // A line as an image (recorded once) so it can be blurred.
     ID2D1CommandList* LineImage(LyricLayout& l) {
@@ -881,9 +897,181 @@ private:
             dwrite_->CreateTextLayout(text.c_str(), UINT32(text.size()), mainFmt.Get(), width, 4000, &out.main);
             DWRITE_TEXT_METRICS m{}; if (out.main) out.main->GetMetrics(&m);
             out.height = m.height;
+            if (out.main) {
+                for (const auto& word : line.words) {
+                    WordLayout wordLayout;
+                    UINT32 count = 0;
+                    const auto start = static_cast<UINT32>(word.offset), len = static_cast<UINT32>(word.length);
+                    out.main->HitTestTextRange(start, len, 0, 0, nullptr, 0, &count);
+                    wordLayout.boxes.resize(count);
+                    if (count && SUCCEEDED(out.main->HitTestTextRange(start, len, 0, 0, wordLayout.boxes.data(), count, &count))) {
+                        wordLayout.boxes.resize(count);
+                        for (const auto& box : wordLayout.boxes) wordLayout.width += box.width;
+                    } else wordLayout.boxes.clear();
+                    out.words.push_back(std::move(wordLayout));
+                }
+            }
             layouts_.push_back(out);
         }
     }
+    static bool AddWordClip(ID2D1GeometrySink& sink, const WordLayout& word, float part) {
+        float remaining = word.width * part;
+        bool filled = false;
+        for (const auto& box : word.boxes) {
+            const float width = std::min(box.width, remaining);
+            if (width <= 0) break;
+            const bool rtl = (box.bidiLevel & 1) != 0;
+            const float left = box.left + (rtl ? box.width - width : 0);
+            const auto rect = D2D1::RectF(left, box.top, left + width, box.top + box.height);
+            sink.BeginFigure({rect.left, rect.top}, D2D1_FIGURE_BEGIN_FILLED);
+            const D2D1_POINT_2F corners[] = {{rect.right, rect.top}, {rect.right, rect.bottom}, {rect.left, rect.bottom}};
+            sink.AddLines(corners, ARRAYSIZE(corners));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            remaining -= width;
+            filled = true;
+        }
+        return filled;
+    }
+
+    ID2D1CommandList* GlowWordImage(const LyricLayout& layout, WordLayout& word) {
+        if (word.glow || word.boxes.empty()) return word.glow.Get();
+        if (!lyricGlowContext_) {
+            ComPtr<ID2D1Device> device;
+            dc_->GetDevice(&device);
+            if (!device || FAILED(device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &lyricGlowContext_))) return nullptr;
+        }
+        ComPtr<ID2D1PathGeometry> clip;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(factory_->CreatePathGeometry(&clip)) || FAILED(clip->Open(&sink))) return nullptr;
+        const bool filled = AddWordClip(*sink.Get(), word, 1);
+        if (FAILED(sink->Close()) || !filled) return nullptr;
+
+        ComPtr<ID2D1CommandList> image;
+        ComPtr<ID2D1SolidColorBrush> white;
+        auto* glow = lyricGlowContext_.Get();
+        if (FAILED(glow->CreateCommandList(&image)) || FAILED(glow->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), &white))) return nullptr;
+        glow->SetTarget(image.Get());
+        glow->BeginDraw();
+        const auto bounds = D2D1::RectF(0, 0, layout.main->GetMaxWidth(), layout.height);
+        glow->PushLayer(D2D1::LayerParameters1(bounds, clip.Get()), nullptr);
+        glow->DrawTextLayout({0, 0}, layout.main.Get(), white.Get());
+        glow->PopLayer();
+        const HRESULT drawn = glow->EndDraw();
+        glow->SetTarget(nullptr);
+        if (FAILED(drawn) || FAILED(image->Close())) return nullptr;
+        word.glow = std::move(image);
+        return word.glow.Get();
+    }
+
+    void DrawSustainedGlow(ID2D1Image* image, float strength, float alpha) {
+        if (!lyricGlowFx_.blur) {
+            BlurFx fx;
+            if (FAILED(dc_->CreateEffect(CLSID_D2D1GaussianBlur, &fx.blur)) ||
+                FAILED(dc_->CreateEffect(CLSID_D2D1Opacity, &fx.opacity))) return;
+            fx.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_BORDER_MODE, D2D1_BORDER_MODE_SOFT);
+            fx.opacity->SetInputEffect(0, fx.blur.Get());
+            lyricGlowFx_ = std::move(fx);
+        }
+        lyricGlowFx_.blur->SetInput(0, image);
+        // Diffuse light expands with the sustained vowel. Keep a smaller core close to the strokes.
+        lyricGlowFx_.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, lyricsFont_ * (.09f + .13f * strength));
+        lyricGlowFx_.opacity->SetValue(D2D1_OPACITY_PROP_OPACITY, alpha * strength * .72f);
+        dc_->DrawImage(lyricGlowFx_.opacity.Get());
+        lyricGlowFx_.blur->SetValue(D2D1_GAUSSIANBLUR_PROP_STANDARD_DEVIATION, lyricsFont_ * .052f);
+        lyricGlowFx_.opacity->SetValue(D2D1_OPACITY_PROP_OPACITY, alpha * strength * .50f);
+        dc_->DrawImage(lyricGlowFx_.opacity.Get());
+    }
+
+    void DrawWordSweep(const LyricLayout& layout, const WordLayout& word, float progress, float alpha) {
+        const float feather = std::min(word.width * .6f, lyricsFont_ * .65f);
+        if (feather <= 0) return;
+        float edge = progress * (word.width + feather);
+        wordSweep_->SetOpacity(alpha);
+        for (const auto& box : word.boxes) {
+            if (edge <= 0) break;
+            const bool rtl = (box.bidiLevel & 1) != 0;
+            const float front = rtl ? box.left + box.width - edge : box.left + edge;
+            wordSweep_->SetStartPoint({front, 0});
+            wordSweep_->SetEndPoint({front + (rtl ? feather : -feather), 0});
+            dc_->PushAxisAlignedClip(D2D1::RectF(box.left, box.top, box.left + box.width, box.top + box.height),
+                                     D2D1_ANTIALIAS_MODE_ALIASED);
+            dc_->DrawTextLayout({0, 0}, layout.main.Get(), wordSweep_.Get());
+            dc_->PopAxisAlignedClip();
+            edge -= box.width;
+        }
+    }
+
+    void DrawStationaryWords(LyricLayout& layout, const lyrics::Line& line, int64_t time, float alpha) {
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha * .42f));
+        dc_->DrawTextLayout({0, 0}, layout.main.Get(), brush_.Get());
+        if (time <= line.words.front().start) return;
+        ComPtr<ID2D1PathGeometry> clip;
+        ComPtr<ID2D1GeometrySink> sink;
+        if (FAILED(factory_->CreatePathGeometry(&clip)) || FAILED(clip->Open(&sink))) return;
+        sink->SetFillMode(D2D1_FILL_MODE_WINDING);
+        bool filled = false;
+        for (size_t i = 0; i < layout.words.size(); ++i) {
+            const float progress = lyrics::WordProgress(line.words[i], time);
+            if (wordSweep_ && progress > 0 && progress < 1)
+                DrawWordSweep(layout, layout.words[i], progress, alpha);
+            else if (progress > 0 && AddWordClip(*sink.Get(), layout.words[i], progress)) filled = true;
+        }
+        if (FAILED(sink->Close()) || !filled) return;
+        const auto bounds = D2D1::RectF(0, 0, layout.main->GetMaxWidth(), layout.height);
+        dc_->PushLayer(D2D1::LayerParameters1(bounds, clip.Get()), nullptr);
+        brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha));
+        dc_->DrawTextLayout({0, 0}, layout.main.Get(), brush_.Get());
+        dc_->PopLayer();
+    }
+
+    void DrawWordLyrics(LyricLayout& layout, const lyrics::Line& line, int64_t time, float alpha) {
+        D2D1::Matrix3x2F original;
+        dc_->GetTransform(&original);
+        struct Accent { size_t index; D2D1::Matrix3x2F transform; };
+        std::vector<Accent> accents;
+        for (size_t i = 0; i < layout.words.size(); ++i) {
+            const float strength = lyrics::SustainedWordGlow(line.words[i], time);
+            if (strength < .005f) continue;
+            auto& word = layout.words[i];
+            auto* image = GlowWordImage(layout, word);
+            if (!image) continue;
+            const auto& box = word.boxes.front();
+            const float grow = 1.f + .038f * strength;
+            // Wrapped words share a baseline shift. Scale single-box words about their own centre.
+            const auto scale = word.boxes.size() == 1 ? grow : 1.f;
+            const auto transform = D2D1::Matrix3x2F::Scale(scale, scale,
+                {box.left + box.width * .5f, box.top + box.height * .78f}) *
+                D2D1::Matrix3x2F::Translation(0, -lyricsFont_ * .094f * strength) * original;
+            dc_->SetTransform(transform);
+            DrawSustainedGlow(image, strength, alpha);
+            accents.push_back({i, transform});
+        }
+        dc_->SetTransform(original);
+        if (accents.empty()) { DrawStationaryWords(layout, line, time, alpha); return; }
+        if (!silentWord_) dc_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, 0), &silentWord_);
+        if (!silentWord_) { DrawStationaryWords(layout, line, time, alpha); return; }
+        auto range = [&](size_t i) {
+            return DWRITE_TEXT_RANGE{UINT32(line.words[i].offset), UINT32(line.words[i].length)};
+        };
+        for (const auto& a : accents) layout.main->SetDrawingEffect(silentWord_.Get(), range(a.index));
+        DrawStationaryWords(layout, line, time, alpha);
+        for (const auto& a : accents) layout.main->SetDrawingEffect(nullptr, range(a.index));
+        for (const auto& a : accents) {
+            dc_->SetTransform(a.transform);
+            const auto& word = layout.words[a.index];
+            const float progress = lyrics::WordProgress(line.words[a.index], time);
+            brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha * (progress >= 1 ? 1.f : .42f)));
+            for (const auto& box : word.boxes) {
+                dc_->PushAxisAlignedClip(D2D1::RectF(box.left, box.top, box.left + box.width, box.top + box.height),
+                                         D2D1_ANTIALIAS_MODE_ALIASED);
+                dc_->DrawTextLayout({0, 0}, layout.main.Get(), brush_.Get());
+                dc_->PopAxisAlignedClip();
+            }
+            if (progress < 1 && wordSweep_) DrawWordSweep(layout, word, progress, alpha);
+        }
+        dc_->SetTransform(original);
+    }
+
     void DrawLyrics(const Ui& ui, float left, float width, float fade) {
         if (!ui.lyrics || ui.lyrics->Empty() || width < 120) return;
         BuildLyricLayouts(*ui.lyrics, width);
@@ -897,6 +1085,11 @@ private:
         const float scroll = ys[i0] + (i0 + 1 < ys.size() ? (ys[std::min(i0 + 1, layouts_.size() - 1)] - ys[i0]) * f : 0);
         lyricsColumn_ = {left - 12 * scale_, top, left + width, bottom};
         lyricsStep_ = layouts_.empty() ? 60.f : ys.back() / float(layouts_.size());
+        float arrival = 1.f;
+        if (ui.lyricsActive >= 0 && size_t(ui.lyricsActive) < ui.lyrics->lines.size()) {
+            const float t = Clamp01(float(ui.lyricTimeMs - ui.lyrics->lines[ui.lyricsActive].ms) / 220.f);
+            arrival = t * t * (3.f - 2.f * t);
+        }
         size_t fxUsed = 0;
         for (size_t i = 0; i < layouts_.size(); ++i) {
             const float y = anchor + ys[i] - scroll;
@@ -906,12 +1099,15 @@ private:
             // the farther they are from it (not while the user scrolls).
             const float edge = std::min(Clamp01((y + layouts_[i].height - top) / (h * .22f)), Clamp01((bottom - y) / (h * .30f)));
             const float dim = ui.lyrics->synced ? .34f : .72f;  // the sung line stays white, the others grey (also while scrolling)
-            const float alpha = (active ? 1.f : dim) * edge * fade;
-            const float sc = active ? 1.f : .965f;
+            const bool departing = int(i) + 1 == ui.lyricsActive && arrival < 1;
+            const float focus = active ? arrival : (departing ? 1.f - arrival : 0.f);
+            const float alpha = (dim + (1.f - dim) * focus) * edge * fade;
+            const float sc = .965f + .035f * focus;
             const float distance = std::abs(float(i) - pos);  // follows the eased scroll: lines sharpen as they arrive
             const float sigma = ui.lyrics->synced ? std::min(distance * 1.7f, 9.f) * scale_ * (1 - ui.lyricsManual) : 0.f;
             const auto transform = D2D1::Matrix3x2F::Scale(sc, sc) * D2D1::Matrix3x2F::Translation(left, y) * base_;
-            ID2D1CommandList* image = sigma > .35f ? LineImage(layouts_[i]) : nullptr;
+            const bool wordTiming = (active || departing) && !layouts_[i].words.empty();
+            ID2D1CommandList* image = !wordTiming && sigma > .35f ? LineImage(layouts_[i]) : nullptr;
             BlurFx* fx = image ? Fx(fxUsed) : nullptr;
             if (fx) {
                 ++fxUsed;
@@ -922,8 +1118,11 @@ private:
                 dc_->DrawImage(fx->opacity.Get());
             } else if (layouts_[i].main) {
                 dc_->SetTransform(transform);
-                brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha));
-                dc_->DrawTextLayout(D2D1::Point2F(0, 0), layouts_[i].main.Get(), brush_.Get());
+                if (wordTiming) DrawWordLyrics(layouts_[i], ui.lyrics->lines[i], ui.lyricTimeMs, alpha);
+                else {
+                    brush_->SetColor(D2D1::ColorF(1, 1, 1, alpha));
+                    dc_->DrawTextLayout(D2D1::Point2F(0, 0), layouts_[i].main.Get(), brush_.Get());
+                }
             }
             dc_->SetTransform(base_);
             if (ui.lyrics->synced && fade > .5f) lyricRects_.push_back({int(i), D2D1::RectF(left - 12 * scale_, y - gap / 2, left + width, y + layouts_[i].height + gap / 2)});
@@ -1140,6 +1339,10 @@ private:
     ComPtr<ID2D1LinearGradientBrush> silkFade_; ComPtr<ID2D1Effect> silkBorder_, silkBlur_, silkCrop_;
     ComPtr<IDWriteTextFormat> title_, artist_, timeL_, timeR_, clock_, date_, pill_;
     std::vector<LyricLayout> layouts_; std::vector<BlurFx> blurPool_; D2D1_RECT_F lyricsColumn_{}; float lyricsStep_ = 60;
+    ComPtr<ID2D1DeviceContext> lyricGlowContext_;
+    BlurFx lyricGlowFx_;
+    ComPtr<ID2D1LinearGradientBrush> wordSweep_;
+    ComPtr<ID2D1SolidColorBrush> silentWord_;
     const void* lyricsKey_ = nullptr; size_t lyricsCount_ = 0; float lyricsWidth_ = 0, lyricsFont_ = 0;
     std::vector<std::pair<int, D2D1_RECT_F>> lyricRects_;
     Chain chains_[2]; ID2D1Image* lastBlur_[2]{}; float artRight_ = 0;
@@ -1213,11 +1416,10 @@ public:
                 HANDLE f = CreateFileW(testLyrics.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
                 if (f != INVALID_HANDLE_VALUE) {
                     std::string bytes(1 << 20, 0); DWORD read = 0; ReadFile(f, bytes.data(), DWORD(bytes.size()), &read, nullptr); CloseHandle(f); bytes.resize(read);
-                    currentLyrics_ = std::make_shared<lyrics::Lyrics>(lyrics::ParseLrc(LyricsSource::DecodeText(bytes)));
+                    currentLyrics_ = std::make_shared<lyrics::Lyrics>(lyrics::Parse(LyricsSource::DecodeText(bytes)));
                 }
-                FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
                 snapshot_.has = snapshot_.playing = true; snapshot_.title = L"Fixture Title"; snapshot_.artist = L"Fixture Artist";
-                snapshot_.end = 215ll * 10000000; snapshot_.position = 80ll * 10000000; snapshot_.updated = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                snapshot_.end = 215ll * 10000000; snapshot_.position = 80ll * 10000000; snapshot_.anchoredAt = Now();
             }
         } else {
             media_ = std::make_unique<MediaWorker>(hwnd_, kMusicApps); media_->SetLocalTags(localTags_);
@@ -1231,7 +1433,7 @@ public:
 
     // --snapshot: render one frame offscreen to a PNG (visual checks without a live session).
     int Snapshot(const std::wstring& out, const std::wstring& image, const std::wstring& video, UINT w, UINT h, bool extend, bool clock,
-                 const std::wstring& lyricsFile = {}, bool cardLayout = false) {
+                 const std::wstring& lyricsFile = {}, bool cardLayout = false, int64_t lyricTimeMs = 83000) {
         config_.extend = extend; config_.clock = clock;
         if (!gpu_.Init() || !scene_.Init(gpu_.device.Get())) return 1;
         scene_.SetScale(h / 1080.f * 1.25f);
@@ -1250,17 +1452,18 @@ public:
         }
         Media m; m.has = true; m.playing = true; m.canNext = m.canPrev = m.canPlayPause = true;
         m.title = L"Fixture Title"; m.artist = L"Fixture Artist"; m.album = L"Fixture Album";
-        m.position = 83ll * 10000000; m.end = 215ll * 10000000;
+        m.position = lyricTimeMs * 10000; m.end = 215ll * 10000000;
         Scene::Ui ui; ui.media = &m; ui.extend = extend; ui.clock = clock; ui.volumeOk = true; ui.volume = .6f;
         lyrics::Lyrics lyr;
         if (!lyricsFile.empty()) {
             HANDLE f = CreateFileW(lyricsFile.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
             if (f != INVALID_HANDLE_VALUE) {
                 std::string bytes(1 << 20, '\0'); DWORD read = 0; ReadFile(f, bytes.data(), DWORD(bytes.size()), &read, nullptr); CloseHandle(f);
-                bytes.resize(read); lyr = lyrics::ParseLrc(LyricsSource::DecodeText(bytes));
+                bytes.resize(read); lyr = lyrics::Parse(LyricsSource::DecodeText(bytes));
             }
             ui.lyrics = &lyr; ui.lyricsAvailable = ui.lyricsView = !lyr.Empty(); ui.lyricsBlend = 1; ui.lyricsFullArt = !cardLayout;
-            ui.lyricsActive = lyr.LineAt(83000); ui.lyricsPos = float(std::max(0, ui.lyricsActive)); ui.clock = false;
+            ui.lyricTimeMs = lyricTimeMs; ui.lyricsActive = lyr.LineAt(ui.lyricTimeMs);
+            ui.lyricsPos = float(std::max(0, ui.lyricsActive)); ui.clock = false;
         }
         if (ui.lyricsView && !art->palette.empty() && silk_.Init(gpu_.device.Get()))
         {   // test hooks: DOCKY_SILK_TIME / DOCKY_SILK_TWIST pick the flow time and beat twist of the snapshot
@@ -1459,8 +1662,10 @@ private:
             break;  // DefWindowProc cleans up
         case WM_DESTROY: if (h == hwnd_) PostQuitMessage(0); return 0;  // also when Explorer restarts and takes the host with it
         case WM_TIMER:
+            if (media_ && seekDeadline_ > 0 && Now() >= seekDeadline_) OnMedia();
             MaybeRequestArtwork();
             MaybeRequestLyrics();
+            ReadTrackLyricOffset();
             if (wallpaper_) {
                 covered_ = Covered();
                 if (liquid::settings::ReadRevision(liquid::settings::DefaultPath()) != settingsRevision_) { ReadSharedSettings(); dirty_ = true; }
@@ -1483,7 +1688,11 @@ private:
         case kArtMsg: { std::unique_ptr<ArtworkResult> r(reinterpret_cast<ArtworkResult*>(lp)); OnArtwork(*r); return 0; }
         case kLyricsMsg: {
             std::unique_ptr<LyricsResult> r(reinterpret_cast<LyricsResult*>(lp));
-            if (r->tag == trackKey_) { currentLyrics_ = std::make_shared<lyrics::Lyrics>(std::move(r->lyrics)); lyricsPos_ = -1; dirty_ = true; }
+            if (r->tag == lyricsRequestTag_ && (!r->lyrics.Empty() || !currentLyrics_)) {
+                if (!currentLyrics_) lyricsPos_ = -1;
+                currentLyrics_ = std::make_shared<lyrics::Lyrics>(std::move(r->lyrics));
+                dirty_ = true;
+            }
             return 0;
         }
         case WM_ACTIVATE:
@@ -1539,11 +1748,7 @@ private:
             }
             const int hit = scene_.Hit(float(GET_X_LPARAM(lp)), float(GET_Y_LPARAM(lp)));
             if (pressed_ == Scene::Progress && seekPreview_ >= 0) {
-                ResetMusic();
-                media_->Command(Cmd::Seek, int64_t(double(seekPreview_) * double(snapshot_.end)));
-                snapshot_.position = int64_t(double(seekPreview_) * double(snapshot_.end)); FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
-                snapshot_.updated = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-                anchorPosition_ = snapshot_.position; anchorTime_ = snapshot_.updated;
+                SeekPlayback(int64_t(double(seekPreview_) * double(snapshot_.end)));
             } else if (pressed_ == hit) {
                 if (hit == Scene::Close) Close();
                 else if (hit == Scene::LyricsButton) { config_.lyrics = !config_.lyrics; SaveConfig(config_); }
@@ -1566,6 +1771,10 @@ private:
             case 'C': config_.clock = !config_.clock; SaveConfig(config_); break;
             case 'L': config_.lyrics = !config_.lyrics; SaveConfig(config_); break;
             case VK_OEM_4: case VK_OEM_6: {  // [ and ]: lyrics later / earlier, saved for the desktop too
+                if (GetKeyState(VK_SHIFT) < 0) {
+                    AdjustTrackLyricOffset(wp == VK_OEM_6 ? 50 : -50);
+                    break;
+                }
                 lyricsOffsetMs_ = std::clamp(lyricsOffsetMs_ + (wp == VK_OEM_6 ? 100 : -100), -3000, 3000);
                 liquid::settings::WriteControlCenterInt(liquid::settings::DefaultPath(), "lyricsOffsetMs", lyricsOffsetMs_);
                 settingsRevision_ = liquid::settings::ReadRevision(liquid::settings::DefaultPath());
@@ -1622,37 +1831,66 @@ private:
         if (cur_ && cur_->video) cur_->video->SetPlaying(VideoShouldPlay());
     }
 
-    // Playback clock. Players publish the position differently:
-    //  * Apple Music for Windows posts about once a second, in whole seconds cut off (not rounded), sometimes skipping
-    //    one; right after resuming it still reports the sample from when it paused, with an old time stamp.
-    //  * Others publish exact positions with a fresh LastUpdatedTime, or only on events.
-    // The clock runs locally. Each new sample is an observation: position + its age when the stamp is fresh (<= 3 s),
-    // else the position alone (it was written when playback stopped), + 0.5 s for whole-second reporters (the middle
-    // of the cut-off second). A far observation (> 1.5 s: track change, seek, resume) sets the clock; a near one pulls
-    // it a quarter of the way, which averages out the truncation and jitter. Paused: the clock stands still.
     void AnchorClock(bool track) {
-        FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
-        const int64_t now = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-        const int64_t estimate = anchorPosition_ + (clockPlaying_ ? std::max<int64_t>(0, now - anchorTime_) : 0);
+        FILETIME ft{};
+        GetSystemTimePreciseAsFileTime(&ft);
+        const int64_t utc = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+        const double now = Now();
+        const int64_t estimate = anchorPosition_ + (clockPlaying_
+            ? int64_t(std::max(0.0, now - anchorClock_) * clockRate_ * lyrics::kTicksPerSecond) : 0);
         int64_t next = estimate;
-        const bool sample = track || snapshot_.position != rawPosition_ || snapshot_.updated != rawUpdated_;
-        if (sample) {
-            rawPosition_ = snapshot_.position; rawUpdated_ = snapshot_.updated;
-            const int64_t age = snapshot_.updated > 0 ? now - snapshot_.updated : -1;
-            int64_t observed = snapshot_.position;
-            if (snapshot_.playing && age >= 0 && age <= 3ll * 10000000) observed += age;
-            if (snapshot_.playing && snapshot_.position > 0 && snapshot_.position % 10000000 == 0) observed += 5000000;
-            if (!track && clockValid_ && clockPlaying_ && snapshot_.playing &&
-                age >= 0 && age <= 3ll * 10000000 && std::llabs(observed - estimate) > 30000000)
-                ResetMusic();
-            if (track || !clockValid_ || std::llabs(observed - estimate) > 15000000) next = observed;
-            else next = estimate + (observed - estimate) / 4;
-            clockValid_ = true;
+        if (track) seekDeadline_ = 0;
+        const bool apple = ContainsAppleMusic(snapshot_.source);
+        const bool whole = apple && snapshot_.position % lyrics::kTicksPerSecond == 0;
+        const bool positionChanged = snapshot_.position != rawPosition_;
+        const bool newSample = track || !clockValid_ || positionChanged || (!whole && snapshot_.updated != rawUpdated_);
+        const bool resumed = snapshot_.playing && !clockPlaying_ && !track;
+        if (newSample) {
+            const int64_t age = snapshot_.updated > 0 ? utc - snapshot_.updated : -1;
+            int64_t observed = std::max<int64_t>(0, snapshot_.position);
+            const auto maxAge = resumed ? lyrics::kTicksPerSecond / 2 : 3 * lyrics::kTicksPerSecond;
+            if (snapshot_.playing && age >= 0 && age <= maxAge) observed += static_cast<int64_t>(age * snapshot_.rate);
+            const bool seeking = seekDeadline_ > 0;
+            const bool confirmed = seeking && positionChanged &&
+                std::llabs(observed - estimate) <= (whole ? lyrics::kTicksPerSecond : lyrics::kTicksPerSecond / 2);
+            if (!seeking || confirmed || now >= seekDeadline_) {
+                seekDeadline_ = 0;
+                rawPosition_ = snapshot_.position;
+                rawUpdated_ = snapshot_.updated;
+                const bool reanchor = track || !clockValid_ || (seeking && !confirmed) ||
+                    (!snapshot_.playing && !clockPlaying_ && positionChanged);
+                next = lyrics::CorrectPlaybackPosition(estimate, observed, whole && (snapshot_.playing || clockPlaying_), reanchor);
+                if (!track && clockValid_ && clockPlaying_ && snapshot_.playing &&
+                    std::llabs(next - estimate) > 3 * lyrics::kTicksPerSecond) ResetMusic();
+                clockValid_ = true;
+            }
+        } else if (seekDeadline_ > 0 && now >= seekDeadline_) {
+            // Some players ignore seek while retaining their old timeline snapshot.
+            next = snapshot_.position;
+            seekDeadline_ = 0;
         }
         anchorPosition_ = snapshot_.end > 0 ? std::clamp<int64_t>(next, 0, snapshot_.end) : std::max<int64_t>(0, next);
-        anchorTime_ = now; clockPlaying_ = snapshot_.playing;
-        snapshot_.position = anchorPosition_; snapshot_.updated = anchorTime_;
+        anchorClock_ = now;
+        clockRate_ = snapshot_.rate;
+        clockPlaying_ = snapshot_.playing;
+        snapshot_.position = anchorPosition_;
+        snapshot_.anchoredAt = anchorClock_;
     }
+
+    static bool ContainsAppleMusic(std::wstring source) {
+        for (auto& ch : source) ch = static_cast<wchar_t>(std::towlower(ch));
+        return source.find(L"applemusic") != std::wstring::npos;
+    }
+
+    void SeekPlayback(int64_t position) {
+        media_->Command(Cmd::Seek, position);
+        ResetMusic();
+        anchorPosition_ = snapshot_.position = position;
+        anchorClock_ = snapshot_.anchoredAt = Now();
+        seekDeadline_ = anchorClock_ + 1.1;
+    }
+
+
 
     void OnMedia() {
         snapshot_ = media_->Snapshot();
@@ -1662,7 +1900,9 @@ private:
         if (track) {
             ResetMusic();
             trackKey_ = key; pendingVideo_.reset(); pendingRequest_.reset(); lastLyricClick_ = -1; deskPress_ = false;
-            currentLyrics_.reset(); lyricsPos_ = -1; lyricsManual_ = false; clockValid_ = false;
+            currentLyrics_.reset(); lyricsPos_ = -1; lyricsManual_ = false;
+            lyricsRequestTag_.clear(); lyricsRequestedDuration_ = 0;
+            ReadTrackLyricOffset();
             lyricsPending_ = lyrics_ && snapshot_.has && !snapshot_.title.empty() && (!wallpaper_ || wallpaperLyrics_); lyricsSince_ = Now();
             ArtworkRequest req{snapshot_.title, snapshot_.artist, snapshot_.album, H_ > W_};
             const std::wstring artKey = ArtworkSource::KeyFor(req);
@@ -1678,6 +1918,10 @@ private:
             a->palette = Scene::PaletteOfPixels(*snapshot_.thumb, snapshot_.thumbW, snapshot_.thumbH);
             thumbHash_ = snapshot_.thumbHash; Show(a);
         }
+        if (!track && lyrics_ && lyricsRequestedDuration_ <= 0 && snapshot_.end > 0 && !lyricsRequestTag_.empty()) {
+            lyricsPending_ = true;
+            ReadTrackLyricOffset();
+        }
         if (cur_ && cur_->video) cur_->video->SetPlaying(VideoShouldPlay());
         MaybeRequestArtwork();
         MaybeRequestLyrics();
@@ -1692,7 +1936,10 @@ private:
         if (snapshot_.end <= 0 && Now() - lyricsSince_ < 1.5) return;
         lyricsPending_ = false;
         if (wallpaper_ && !wallpaperLyrics_) return;
-        lyrics_->Request({snapshot_.title, snapshot_.artist, snapshot_.album, int(snapshot_.end / 10000), config_.online, trackKey_, snapshot_.localLyrics});
+        lyricsRequestedDuration_ = static_cast<int>(snapshot_.end / 10000);
+        lyricsRequestTag_ = trackKey_ + L"\x1f" + std::to_wstring(lyricsRequestedDuration_);
+        lyrics_->Request({snapshot_.title, snapshot_.artist, snapshot_.album, lyricsRequestedDuration_, config_.online,
+            lyricsRequestTag_, snapshot_.localLyrics, ContainsAppleMusic(snapshot_.source)});
     }
     // Desktop lyrics: wheel scrolls them and a double-click can seek. The pointer must be
     // on the desktop itself (icons view, Progman/WorkerW), over the lyrics, and the wallpaper is showing them.
@@ -1752,12 +1999,8 @@ private:
     }
     void SeekToLine(int line) {
         if (!currentLyrics_ || line < 0 || size_t(line) >= currentLyrics_->lines.size() || currentLyrics_->lines[size_t(line)].ms < 0 || !snapshot_.canSeek) return;
-        const int64_t t = int64_t(currentLyrics_->lines[size_t(line)].ms) * 10000;
-        media_->Command(Cmd::Seek, t);
-        ResetMusic();
-        FILETIME ft; GetSystemTimePreciseAsFileTime(&ft);
-        anchorPosition_ = t; anchorTime_ = (int64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-        snapshot_.position = anchorPosition_; snapshot_.updated = anchorTime_;
+        const int64_t t = std::max<int64_t>(0, int64_t(currentLyrics_->lines[size_t(line)].ms) - TotalLyricsOffset()) * 10000;
+        SeekPlayback(snapshot_.end > 0 ? std::min(t, snapshot_.end) : t);
         lyricsManual_ = false; dirty_ = true;
         Log(L"lyrics: play from line %d", line);
     }
@@ -1837,6 +2080,38 @@ private:
     }
     bool LyricsView() const { return (wallpaper_ ? wallpaperLyrics_ : config_.lyrics) && currentLyrics_ && !currentLyrics_->Empty(); }
 
+    std::wstring TrackLyricOffsetKey() const {
+        if (trackKey_.empty() || snapshot_.title.empty()) return {};
+        wchar_t key[24];
+        swprintf_s(key, L"%016llx", static_cast<unsigned long long>(
+            lyrics::OffsetKey(trackKey_, static_cast<int>(snapshot_.end / 10000))));
+        return key;
+    }
+
+    void ReadTrackLyricOffset() {
+        const auto key = TrackLyricOffsetKey();
+        wchar_t value[16]{};
+        if (!key.empty()) GetPrivateProfileStringW(L"lyric-track-offsets", key.c_str(), L"0", value, ARRAYSIZE(value), IniPath().c_str());
+        const int offset = std::clamp(_wtoi(value), -3000, 3000);
+        if (offset != trackLyricOffsetMs_) dirty_ = true;
+        trackLyricOffsetMs_ = offset;
+    }
+
+    void AdjustTrackLyricOffset(int delta) {
+        const auto key = TrackLyricOffsetKey();
+        if (key.empty()) return;
+        ReadTrackLyricOffset();
+        const int offset = std::clamp(trackLyricOffsetMs_ + delta, -3000, 3000);
+        const auto value = std::to_wstring(offset);
+        if (!WritePrivateProfileStringW(L"lyric-track-offsets", key.c_str(), offset ? value.c_str() : nullptr, IniPath().c_str())) return;
+        trackLyricOffsetMs_ = offset;
+        wchar_t note[64]; swprintf_s(note, docky::ui::Text(L"This song: lyrics %+.2f s"), offset / 1000.0);
+        toast_ = note; toastUntil_ = Now() + 1.6;
+    }
+
+    int TotalLyricsOffset() const { return lyricsOffsetMs_ + trackLyricOffsetMs_; }
+    int64_t LyricTimeMs() const { return snapshot_.PositionNow() / 10000 + TotalLyricsOffset(); }
+
     // Moves the smoothed lyric position toward the line being sung; true while it is still moving.
     bool StepLyrics(float dt) {
         const float blendTarget = LyricsView() ? 1.f : 0.f, blendBefore = lyricsBlend_;
@@ -1845,8 +2120,9 @@ private:
         bool moving = lyricsBlend_ != blendBefore;
         if (!currentLyrics_ || currentLyrics_->Empty()) return moving;
         const auto& l = *currentLyrics_;
-        const int64_t ms = snapshot_.PositionNow() / 10000 + 150 + lyricsOffsetMs_;
-        const int active = l.LineAt(ms);
+        const int64_t ms = LyricTimeMs();
+        const int early = l.LineAt(ms + 150);
+        const int active = early >= 0 && l.lines[early].words.empty() ? early : l.LineAt(ms);
         if (active != lyricsActive_) { lyricsActive_ = active; moving = true; }
         // Manual scrolling ends after 1.2 s without scrolling (setting), or never until a line is clicked.
         if (lyricsManual_ && !lyricsPress_ && lyricsAutoReturn_ && Now() - lyricsScrolled_ > 1.2) lyricsManual_ = false;
@@ -1865,8 +2141,11 @@ private:
     // Milliseconds until the next lyric line (wallpaper idle wait), capped at 1 s.
     DWORD UntilNextLine() const {
         if (!LyricsView() || !currentLyrics_->synced || !snapshot_.playing) return 1000;
-        const int64_t ms = snapshot_.PositionNow() / 10000 + 150 + lyricsOffsetMs_;
-        for (const auto& line : currentLyrics_->lines) if (line.ms > ms) return DWORD(std::clamp<int64_t>(line.ms - ms, 15, 1000));
+        const int64_t ms = LyricTimeMs();
+        for (const auto& line : currentLyrics_->lines) {
+            const int64_t wait = line.ms - ms - (line.words.empty() ? 150 : 0);
+            if (wait > 0) return DWORD(std::clamp<int64_t>(wait, 15, 1000));
+        }
         return 1000;
     }
 
@@ -2030,6 +2309,7 @@ private:
         ui.hover = hover_; ui.pressed = pressed_; ui.seekPreview = seekPreview_;
         ui.lyricsAvailable = !wallpaper_ && currentLyrics_ && !currentLyrics_->Empty();
         ui.lyricsView = LyricsView(); ui.lyrics = currentLyrics_.get(); ui.lyricsPos = std::max(0.f, lyricsPos_); ui.lyricsActive = lyricsActive_;
+        ui.lyricTimeMs = LyricTimeMs();
         ui.lyricsFullArt = lyricsFullArt_; ui.lyricsBlend = lyricsBlend_; ui.lyricsManual = lyricsManualBlend_;
         const double consumed = Now();
         musicTraceEvent_ = {};
@@ -2107,7 +2387,11 @@ private:
     std::unique_ptr<LyricsSource> lyrics_; std::shared_ptr<lyrics::Lyrics> currentLyrics_;
     bool lyricsPending_ = false; double lyricsSince_ = 0; float lyricsPos_ = -1, lyricsBlend_ = 0; int lyricsActive_ = -1;
     bool lyricsFullArt_ = true, wallpaperLyrics_ = true;
-    int64_t rawPosition_ = -1, rawUpdated_ = -1, anchorPosition_ = 0, anchorTime_ = 0; bool clockPlaying_ = false, clockValid_ = false;
+    std::wstring lyricsRequestTag_;
+    int lyricsRequestedDuration_ = 0;
+    int64_t rawPosition_ = -1, rawUpdated_ = -1, anchorPosition_ = 0;
+    double anchorClock_ = 0, clockRate_ = 1, seekDeadline_ = 0;
+    bool clockPlaying_ = false, clockValid_ = false;
     // Lyrics scrolling (full-screen view): wheel or drag; returns to the sung line after a pause when lyricsAutoReturn_.
     bool lyricsManual_ = false, lyricsPress_ = false, lyricsDragged_ = false, lyricsAutoReturn_ = true;
     float lyricsManualPos_ = 0, lyricsPressPos_ = 0, lyricsPressX_ = 0, lyricsPressY_ = 0, lyricsManualBlend_ = 0; double lyricsScrolled_ = 0;
@@ -2126,7 +2410,7 @@ private:
     double lastMusicSample_ = 0, musicResetAt_ = 0;
     float flowClock_ = 0;
     bool lyricsBeat_ = true;
-    int lyricsOffsetMs_ = 300;
+    int lyricsOffsetMs_ = 300, trackLyricOffsetMs_ = 0;
     double lastBeatFrame_ = 0, toastUntil_ = 0;
     std::wstring toast_;
     bool animatedArtwork_ = true, lyricsDoubleClickSeek_ = true, keepPaused_ = false, localTags_ = true;
@@ -2167,13 +2451,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     int code = 0;
     if (!arg(L"--snapshot").empty()) {
         UINT w = 1920, h = 1080; const auto size = arg(L"--size"); if (!size.empty()) swscanf_s(size.c_str(), L"%ux%u", &w, &h);
-        App app; code = app.Snapshot(arg(L"--snapshot"), arg(L"--image"), arg(L"--video"), w, h, !flag(L"--fill"), !flag(L"--no-clock"), arg(L"--lyrics"), flag(L"--card"));
+        const auto time = arg(L"--lyrics-time-ms");
+        const auto ms = time.empty() ? 83000 : std::clamp<int64_t>(_wtoi64(time.c_str()), 0, INT_MAX);
+        App app; code = app.Snapshot(arg(L"--snapshot"), arg(L"--image"), arg(L"--video"), w, h, !flag(L"--fill"),
+            !flag(L"--no-clock"), arg(L"--lyrics"), flag(L"--card"), ms);
     } else if (flag(L"--lyrics-fetch") && argc >= 4) {  // --lyrics-fetch "Artist" "Title" ["Album"] [--duration seconds]
         int i = 1; while (wcscmp(argv[i], L"--lyrics-fetch")) ++i;
         LyricsRequest r{argv[i + 2], argv[i + 1], i + 3 < argc && argv[i + 3][0] != L'-' ? argv[i + 3] : L"", _wtoi(arg(L"--duration").c_str()) * 1000, true, L"diag"};
+        r.appleCatalog = flag(L"--apple-catalog");
         LyricsSource source([](const LyricsResult&) {});
         const auto result = source.RunNow(r);
-        Log(L"lyrics-fetch: %zu lines, synced=%d, source=%ls", result.lyrics.lines.size(), result.lyrics.synced, result.lyrics.source.c_str());
+        Log(L"lyrics-fetch: %zu lines, synced=%d, word-timed=%d, source=%ls", result.lyrics.lines.size(),
+            result.lyrics.synced, result.lyrics.WordTimed(), result.lyrics.source.c_str());
         for (size_t k = 0; k < result.lyrics.lines.size() && k < 4; ++k) Log(L"  [%d] %ls", result.lyrics.lines[k].ms, result.lyrics.lines[k].text.c_str());
     } else if (flag(L"--wallpaper")) {
         HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\DockyNowPlayingWallpaper");

@@ -5,6 +5,7 @@
 #include "../src/now_playing/music_analysis.h"
 #include "../src/now_playing/hls.h"
 #include "../src/now_playing/lyrics.h"
+#include "../src/now_playing/lyrics_clock.h"
 
 #include <algorithm>
 #include <vector>
@@ -17,6 +18,24 @@ static int failures = 0;
 #define CHECK(cond) do { if (!(cond)) { std::printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #cond); ++failures; } } while (0)
 
 int main() {
+    {
+        using namespace nowplaying::lyrics;
+        const auto ticks = [](double seconds) { return static_cast<int64_t>(seconds * kTicksPerSecond); };
+        CHECK(CorrectPlaybackPosition(ticks(12.6), ticks(12), true, false) == ticks(12.6));
+        CHECK(CorrectPlaybackPosition(ticks(12.6), ticks(12), false, false) == ticks(12.45));
+        CHECK(CorrectPlaybackPosition(ticks(12.6), ticks(7), true, true) == ticks(7));
+        CHECK(CorrectPlaybackPosition(ticks(12.6), ticks(15), false, false) == ticks(15));
+        CHECK(OffsetKey(L"Track A", 180010) == OffsetKey(L"Track A", 179990));
+        CHECK(OffsetKey(L"Track A", 180010) != OffsetKey(L"Track A", 220000));
+        CHECK(OffsetKey(L"Track A", 180010) != OffsetKey(L"Track B", 180010));
+        const Word held{0, 1, 1000, 2300}, quick{0, 1, 1000, 1400};
+        CHECK(SustainedWordGlow(held, 1000) == 0 && SustainedWordGlow(held, 1050) < SustainedWordGlow(held, 1800));
+        CHECK(SustainedWordGlow(held, 1800) > SustainedWordGlow(held, 2460) && SustainedWordGlow(held, 2540) == 0);
+        CHECK(SustainedWordGlow(quick, 1250) == 0 && SustainedWordGlow({0, 1, 1000, 2300, true}, 1800) == 0);
+        const auto openEnded = ParseLrc(L"[00:01.000]<00:01.000>Long text");
+        const auto reopened = ParseLrc(FormatLrc(openEnded));
+        CHECK(reopened.WordTimed() && reopened.lines.front().words.front().estimatedEnd);
+    }
     // Recording identity must survive search fallbacks and never share a stale album cache.
     {
         using namespace nowplaying;
@@ -198,6 +217,29 @@ int main() {
             CHECK(l.lines[3].text == L"Bridge" && l.lines[4].text == L"Chorus" && l.lines[4].ms == 39500);  // trailing gap dropped
         }
         CHECK(l.LineAt(0) == -1 && l.LineAt(4500) == 0 && l.LineAt(30000) == 3 && l.LineAt(100000) == 4);
+        CHECK(l.WordTimed() && l.lines[0].words.size() == 2);
+        if (!l.lines.empty() && l.lines[0].words.size() == 2) {
+            const auto& word = l.lines[0].words[1];
+            CHECK(word.offset == 6 && word.length == 5 && word.start == 4700);
+        }
+        const auto repeated = ParseLrc(L"[00:05.000][00:10.000]<00:05.000>Hello <00:05.400>there<00:05.800>\n");
+        CHECK(repeated.lines.size() == 2 && repeated.lines[1].words.size() == 2);
+        if (repeated.lines.size() == 2 && repeated.lines[1].words.size() == 2) {
+            const auto& word = repeated.lines[1].words[1];
+            CHECK(word.start == 10400 && word.end == 10800 && WordProgress(word, 10600) == .5f);
+            CHECK(WordProgress(word, 10399) == 0 && WordProgress(word, 10800) == 1);
+        }
+        const auto yrc = Parse(L"ignored\n[5013,1400](5013,331,0)Ready (5432,111,0)go!\n");
+        CHECK(yrc.synced && yrc.WordTimed() && yrc.lines[0].text == L"Ready go!");
+        const auto restored = ParseLrc(FormatLrc(yrc));
+        CHECK(restored.lines.size() == 1 && restored.lines[0].words.size() == 2 && restored.lines[0].ms == 5013);
+        if (restored.lines.size() == 1 && restored.lines[0].words.size() == 2) {
+            CHECK(restored.lines[0].words[0].end == 5344);
+            CHECK(restored.lines[0].words[1].offset == 6 && restored.lines[0].words[1].start == 5432 &&
+                restored.lines[0].words[1].end == 5543);
+        }
+        CHECK(!ParseLrc(L"[00:10.000]A line without word times").WordTimed());
+        CHECK(ParseTime(L"9999999999999999:00") == -1);
         // NetEase credits at the start are dropped; a lyric with a colon is kept; translations merge by time.
         auto credited = ParseLrc(L"[00:00.000] 作词 : Someone\n[00:01.000] Producer : Name\n[00:12.00]I said: hello\n[00:15.00]Line two\n");
         DropCredits(credited);

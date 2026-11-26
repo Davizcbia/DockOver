@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstring>
 #include <map>
-#include <optional>
 #include <vector>
 #include <wrl/client.h>
 
@@ -24,16 +23,9 @@ public:
         return false;
     }
 
-    bool Prepare(UINT width, UINT height,
-                 std::optional<std::pair<COLORREF, COLORREF>> gradient = std::nullopt) {
+    bool Prepare(UINT width, UINT height) {
         if (!material_ || width < 8 || height < 8) return false;
-        if (backdrop_ && width_ == width && height_ == height && gradient_ == gradient) return true;
-        backdrop_.Reset();
-        panelView_.Reset();
-        panel_ = {};
-        scratch_ = {};
-        controls_.clear();
-        panelDpi_ = 0;
+        if (backdrop_ && width_ == width && height_ == height && studioBackdrop_) return true;
         const auto smooth = [](float low, float high, float value) {
             const float t = std::clamp((value - low) / (high - low), 0.0f, 1.0f);
             return t * t * (3.0f - 2.0f * t);
@@ -45,18 +37,6 @@ public:
             const float v = (y + 0.5f) / height;
             const float grey = std::lerp(std::lerp(0.46f, 0.30f, smooth(0, 0.6f, v)),
                 0.10f, smooth(0.45f, 0.95f, v));
-            if (gradient) {
-                const auto [top, bottom] = *gradient;
-                const float t = std::clamp((v - 78.0f / height) / (1.0f - 78.0f / height), 0.0f, 1.0f);
-                const auto channel = [t](int a, int b) {
-                    return static_cast<uint32_t>(std::lround(std::lerp(float(a), float(b), t)));
-                };
-                std::fill_n(pixels.data() + static_cast<size_t>(y) * width, width, 0xff000000u |
-                    (channel(GetRValue(top), GetRValue(bottom)) << 16) |
-                    (channel(GetGValue(top), GetGValue(bottom)) << 8) |
-                     channel(GetBValue(top), GetBValue(bottom)));
-                continue;
-            }
             for (UINT x = 0; x < width; ++x) {
                 const float u = (x + 0.5f) / width - 0.5f;
                 const float level = grey * (1.0f - 0.25f * u * u);
@@ -64,14 +44,28 @@ public:
                     (byte(level * 0.95f) << 16) | (byte(level * 0.97f) << 8) | byte(level);
             }
         }
+        if (!PreparePixels(width, height, pixels.data())) return false;
+        studioBackdrop_ = true;
+        return true;
+    }
+
+    bool PreparePixels(UINT width, UINT height, const uint32_t* pixels) {
+        if (!material_ || width < 8 || height < 8) return false;
+        panelView_.Reset();
+        if (width_ != width || height_ != height) {
+            panel_ = {};
+            scratch_ = {};
+        }
+        controls_.clear();
+        panelDpi_ = 0;
+        studioBackdrop_ = false;
         auto desc = TextureDesc(width, height);
         desc.Usage = D3D11_USAGE_IMMUTABLE;
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        const D3D11_SUBRESOURCE_DATA data{pixels.data(), static_cast<UINT>(width * sizeof(uint32_t)), 0};
-        if (FAILED(device_->CreateTexture2D(&desc, &data, &backdrop_))) return false;
+        const D3D11_SUBRESOURCE_DATA data{pixels, static_cast<UINT>(width * sizeof(uint32_t)), 0};
+        if (FAILED(device_->CreateTexture2D(&desc, &data, backdrop_.ReleaseAndGetAddressOf()))) return false;
         width_ = width;
         height_ = height;
-        gradient_ = gradient;
         ++frameId_;
         return true;
     }
@@ -213,7 +207,7 @@ private:
     std::map<UINT, ControlPixels> controls_;
     UINT width_ = 0, height_ = 0, stageWidth_ = 0, stageHeight_ = 0;
     uint64_t frameId_ = 0;
-    std::optional<std::pair<COLORREF, COLORREF>> gradient_;
+    bool studioBackdrop_ = false;
     float panelDpi_ = 0;
 };
 

@@ -20,7 +20,13 @@
 namespace nowplaying {
 
 // localText: lyrics of the matched local music file (local_tags.h); used first when it parses.
-struct LyricsRequest { std::wstring title, artist, album; int durationMs = 0; bool online = true; std::wstring tag; std::wstring localText; };
+struct LyricsRequest {
+    std::wstring title, artist, album;
+    int durationMs = 0;
+    bool online = true;
+    std::wstring tag, localText;
+    bool appleCatalog = false;
+};
 struct LyricsResult { std::wstring tag; lyrics::Lyrics lyrics; };
 
 class LyricsSource {
@@ -39,7 +45,10 @@ public:
 
 private:
     void Loop();
-    lyrics::Lyrics Find(const LyricsRequest& request);
+    // A preview can show the first synced match while the worker looks for native word timing.
+    // A null preview only checks whether the request is still current.
+    using Preview = std::function<bool(const lyrics::Lyrics*)>;
+    lyrics::Lyrics Find(const LyricsRequest& request, const Preview& preview = {});
     Callback callback_;
     std::mutex mutex_; std::condition_variable wake_;
     std::optional<LyricsRequest> pending_; bool stop_ = false;

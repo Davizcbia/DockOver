@@ -454,6 +454,7 @@ inline const wchar_t* Text(const wchar_t* source) {
         {L"The games list could not be created next to the settings file.", L"无法在设置文件旁创建游戏列表。"},
         {L"The music wallpaper also shows the lyrics of the playing song, from your files or the online lyrics services.", L"在音乐壁纸上显示当前歌曲的本地或在线歌词。"},
         {L"The update did not complete.", L"更新未完成。"},
+        {L"This song: lyrics %+.2f s", L"本曲歌词偏移 %+.2f 秒"},
         {L"Tint", L"色调"},
         {L"Today", L"今天"},
         {L"Toggle taskbar hotkey", L"切换任务栏快捷键"},

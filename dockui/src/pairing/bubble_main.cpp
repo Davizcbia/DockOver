@@ -169,6 +169,10 @@ std::wstring g_receiveFolder, g_lastText, g_activePhone, g_targetPhone, g_shellS
 constexpr ULONG_PTR kShellSendFile = 0x44444631;
 constexpr UINT kShellSendReady = WM_APP + 42;
 constexpr UINT kWidgetDraftReady = WM_APP + 43;
+constexpr UINT kTrayCallback = WM_APP + 44;
+constexpr UINT kTrayIconId = 1;
+const UINT kTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+bool g_trayAdded = false, g_trayVersion4 = false;
 std::wstring g_receivePrompt;
 bool g_offerSending = false;
 constexpr UINT kPhoneOffer = WM_APP + 41;
@@ -645,7 +649,7 @@ void ReplyPhone(const std::wstring& reply) {
 
 // The phone page is what the user sees (not hidden in the background, not the PC picker): only then does the phone host
 // keep a room open for the QR code. Remembered phones are listened for either way.
-bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && g_opt.pairPhone; }
+bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && !IsIconic(g_wnd) && g_opt.pairPhone; }
 bool g_qrListening = true;
 void SyncQrListening() {
     const bool shown = PhonePageShown();
@@ -959,7 +963,7 @@ void CreatePhoneControls(HWND window) {
     g_guide = create(L"STATIC", kScanLink, WS_VISIBLE | SS_OWNERDRAW, kGuide);
     g_fallbackButton = create(L"BUTTON", Ui(L"备用光纹"), WS_VISIBLE | WS_TABSTOP | WS_DISABLED | BS_OWNERDRAW, kFallbackToggle);
     g_close = create(L"BUTTON", Ui(L"关闭"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kClose);
-    g_back = create(L"BUTTON", Ui(L"返回"), WS_TABSTOP | BS_OWNERDRAW, kBack);
+    g_back = create(L"BUTTON", Ui(L"返回"), WS_TABSTOP | BS_OWNERDRAW | (g_unified ? WS_VISIBLE : 0), kBack);
     g_receiveSettings = create(L"BUTTON", Ui(L"接收设置"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kReceiveSettings);
     g_copyText = create(L"BUTTON", Ui(L"复制文字"), WS_TABSTOP | BS_OWNERDRAW, kCopyText);
     g_openFolder = create(L"BUTTON", Ui(L"打开文件夹"), WS_TABSTOP | BS_OWNERDRAW, kOpenFolder);
@@ -2169,6 +2173,31 @@ constexpr auto kRunValue = L"DockDrop";
 #else
 constexpr auto kRunValue = L"DockOver DockDrop";
 #endif
+void SyncTrayIcon(HWND window, bool show, bool rebuild = false) {
+    if (show == g_trayAdded && !rebuild) return;
+
+    NOTIFYICONDATAW icon{sizeof(icon)};
+    icon.hWnd = window;
+    icon.uID = kTrayIconId;
+    if (!show) {
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+        g_trayAdded = g_trayVersion4 = false;
+        return;
+    }
+
+    icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    icon.uCallbackMessage = kTrayCallback;
+    icon.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICONSM));
+    wcscpy_s(icon.szTip, L"DockDrop");
+    g_trayAdded = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+    icon.uVersion = NOTIFYICON_VERSION_4;
+    g_trayVersion4 = g_trayAdded && Shell_NotifyIconW(NIM_SETVERSION, &icon);
+}
+
+bool NeedsTrayIcon(HWND window) {
+    return g_unified && (!IsWindowVisible(window) || IsIconic(window));
+}
+
 void SyncAutostart(bool on) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr,
@@ -2371,7 +2400,6 @@ bool EnterPhonePage(bool animate) {
             g_phoneReady = true;
             g_parkControls = true;  // created parked; revealed below
             CreatePhoneControls(g_wnd);
-            ShowWindow(g_back, SW_SHOW);
             DragAcceptFiles(g_wnd, TRUE);
             LoadWidgetDraft();
             g_phoneHost = docky::pairing::StartPhoneHost(g_wnd, ReceivePhoneMessage);
@@ -2424,8 +2452,25 @@ void ClosePicker() {
 #endif
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+#ifdef DOCKY_PHONE_PAIRING
+    if (kTaskbarCreated && msg == kTaskbarCreated) {
+        if (NeedsTrayIcon(h)) SyncTrayIcon(h, true, true);
+        return 0;
+    }
+#endif
     switch (msg) {
 #ifdef DOCKY_PHONE_PAIRING
+    case kTrayCallback: {
+        if (!g_trayAdded) return 0;
+        const UINT id = g_trayVersion4 ? HIWORD(lp) : static_cast<UINT>(wp);
+        const UINT event = g_trayVersion4 ? LOWORD(lp) : static_cast<UINT>(lp);
+        if (id == kTrayIconId && (g_trayVersion4 ? event == NIN_SELECT || event == NIN_KEYSELECT
+                                               : event == WM_LBUTTONUP)) {
+            ShowWindow(h, IsIconic(h) ? SW_RESTORE : SW_SHOW);
+            SetForegroundWindow(h);
+        }
+        return 0;
+    }
     case WM_COPYDATA: {
         const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lp);
         if (data && data->dwData == kShowPicker && g_unified) {  // a second "DockDrop" launch: show the picker here
@@ -3127,7 +3172,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (g_quit) break;
 #ifdef DOCKY_PHONE_PAIRING
         if (g_phoneReady || g_opt.pairPhone) SyncQrListening();
-        if ((g_opt.pairPhone || g_opt.devicePreviewCount) && !IsWindowVisible(g_wnd)) {
+        SyncTrayIcon(g_wnd, NeedsTrayIcon(g_wnd));
+        if ((g_opt.pairPhone || g_opt.devicePreviewCount) && (!IsWindowVisible(g_wnd) || IsIconic(g_wnd))) {
             MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             continue;
         }
@@ -3137,6 +3183,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
     app.Shutdown();
 #ifdef DOCKY_PHONE_PAIRING
+    SyncTrayIcon(g_wnd, false);
     if (g_opt.pairPhone || g_phoneReady) SaveRadius();
     g_incoming.Cancel();
     g_phoneHost.reset();
