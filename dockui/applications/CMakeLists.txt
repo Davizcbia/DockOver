@@ -10,7 +10,7 @@ add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h"
         /Fh "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h" "${CMAKE_CURRENT_SOURCE_DIR}/glass.hlsl"
     DEPENDS glass.hlsl ../shaders/quantize.hlsli VERBATIM)
 add_executable(${target} WIN32 main.cpp "${CMAKE_CURRENT_BINARY_DIR}/glass_ps.h" "${src}/app_registry.cpp"
-    "${src}/shell_items.cpp" "${src}/liquid_glass.cpp" "${src}/glass_params.cpp" "${src}/json_lite.cpp")
+    "${src}/shell_items.cpp" "${src}/liquid_glass.cpp" "${src}/glass_params.cpp" "${src}/json_lite.cpp" "${src}/desktop_settings.cpp" "${src}/launchpad_model.cpp")
 add_dependencies(${target} LiquidDockShaders)
 set_target_properties(${target} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${output}" MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
 target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_BINARY_DIR}" "${SHADER_OUT}" "${src}")

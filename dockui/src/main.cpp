@@ -57,6 +57,7 @@ static volatile const char liquidBuildMarker[] = LIQUID_BUILD_MARKER;
 #include "vblank.h"
 #include "fullscreen_window.h"
 #include "stage_manager.h"
+#include "display_adapter.h"
 #include "desktop_settings.h"
 #include "theme_state.h"
 #include "status_group.h"
@@ -103,7 +104,7 @@ constexpr UINT kMenuPairPhone = 80;
 constexpr UINT kMenuShowBase=1100;  // Dock menu > Show in Dock: +0 divider, +1 Downloads, +2 Recycle Bin, +10.. status cells
 // The status items a user can put in the Dock, in menu order: whole-icon tiles first, then the half-size cells.
 // Whole-icon tiles first (kStatusTileCount), then the half-size cells of the status group.
-static const wchar_t* const kStatusMenuIds[] = {L"combo", L"analog", L"date", L"digital", L"tray", L"control", L"wifi", L"bluetooth", L"sound", L"battery", L"input", L"clock"};
+static const wchar_t* const kStatusMenuIds[] = {L"combo", L"analog", L"date", L"digital", L"tray", L"control", L"wifi", L"bluetooth", L"sound", L"battery", L"input", L"clock", L"system"};
 static constexpr UINT kStatusTileCount = 5;
 constexpr UINT kMenuNewFinder = 70, kMenuNewWindow = 71, kMenuDockySettings = 72, kMenuQuitApp = 73, kMenuJumpBase = 700;
 constexpr size_t kJumpMax = 12;
@@ -317,6 +318,7 @@ private:
     // macOS: an app in true full screen (covering the whole monitor, e.g. F11 / its full-screen button) hides the Dock;
     // a maximized window keeps it. Detection also runs when the menu bar is disabled.
     docky::StageManager stageManager_;
+    int bottomOffsetPercent_ = 0;
     HWND fullscreenWindow_ = nullptr;
     bool fullscreenApp_ = false;
     bool gameSuppressed_ = false;
@@ -416,7 +418,12 @@ private:
     // Status group: the menu bar's status items as one Dock tile (status_group.h), cells from shared settings.
     std::vector<std::wstring> statusCells_;
     dock::statusgroup::State statusState_;
+    struct StatusReadout {
+        liquid::status::Snapshot snapshot;
+        bool bluetoothOn;
+    };
     liquid::status::Snapshot statusSnapshot_;
+    bool statusBluetoothOn_ = false;
     HKL statusLayout_ = nullptr; HWND statusInputTarget_ = nullptr;
     std::atomic<bool> statusQuerying_{false};
     int statusTick_ = 0;
@@ -676,6 +683,7 @@ DWORD App::DragDropped(const std::vector<std::wstring>& paths, POINTL screen, DW
 
 int App::Run(HINSTANCE instance, const Options& options) {
     opt_ = options;
+    docky::SetRenderSettingsPath(opt_.desktopSettingsPath);
     liquid::cc::SetSettingsPath(opt_.desktopSettingsPath);
     iconMaskEnabled_=options.iconMask;
     autoHide_=options.autoHide;
@@ -769,6 +777,7 @@ int App::Run(HINSTANCE instance, const Options& options) {
     LoadItems();
     if (!statusCells_.empty()) RefreshStatus(true);  // time, input layout now; Wi-Fi / battery / volume when the first query returns
     { const auto dockPrefs = liquid::settings::Load(opt_.desktopSettingsPath).value.dock;
+      bottomOffsetPercent_ = dockPrefs.bottomOffsetPercent;
       model_.m.SetIconSize(static_cast<float>(dockPrefs.iconSize));
       model_.m.maxScale = 1.0f + dockPrefs.magnification / 100.0f; }  // Settings > Dock > Magnification
     RefreshRunningState(items_, hwnd_);
@@ -1106,8 +1115,13 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 const bool mask=opt_.iconMaskOverride<0?current.value.dock.useMacIconMask:opt_.iconMaskOverride!=0;
                 if(mask!=iconMaskEnabled_){iconMaskEnabled_=mask;BuildIcons();needsFrame_=true;DLOG(L"icon mask: %ls",mask?L"on":L"off");}
                 if(current.value.dock.genieMinimize!=genie_)ApplyGenie(current.value.dock.genieMinimize);
-                if(const float mag=1.0f+current.value.dock.magnification/100.0f;std::fabs(mag-model_.m.maxScale)>0.001f){
-                    model_.m.maxScale=mag;ApplyWindowLayout(L"magnification");needsFrame_=true;StartAnimating();DLOG(L"magnification: %.2fx",mag);}
+                const float mag = 1.0f + current.value.dock.magnification / 100.0f;
+                if (std::fabs(mag - model_.m.maxScale) > 0.001f || bottomOffsetPercent_ != current.value.dock.bottomOffsetPercent) {
+                    model_.m.maxScale = mag;
+                    bottomOffsetPercent_ = current.value.dock.bottomOffsetPercent;
+                    ApplyWindowLayout(L"Dock geometry settings");
+                    StartAnimating();
+                }
                 gameCompatSetting_=current.value.dock.gameCompatibility;
                 stageManager_.SetPerspective(current.value.dock.stagePerspective);
                 if(!lowLatForced_)SetLowLatency(current.value.dock.lowLatencyGlass,L"settings changed");
@@ -1187,9 +1201,9 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
         ApplyWindowLayout(L"WM_DISPLAYCHANGE");
         return 0;
     case kStatusReadyMsg: {  // a status query finished on its worker
-        std::unique_ptr<liquid::status::Snapshot> snapshot(reinterpret_cast<liquid::status::Snapshot*>(lp));
+        std::unique_ptr<StatusReadout> readout(reinterpret_cast<StatusReadout*>(lp));
         statusQuerying_ = false;
-        if (snapshot) { statusSnapshot_ = *snapshot; RefreshStatus(false); }
+        if (readout) { statusSnapshot_ = std::move(readout->snapshot); statusBluetoothOn_ = readout->bluetoothOn; RefreshStatus(false); }
         return 0;
     }
     case kStatusPanelMsg: RefreshStatus(true); StartAnimating(); return 0;  // a status panel changed something or closed
@@ -1656,7 +1670,8 @@ void App::UpdateTrayCells() {
 }
 std::wstring App::StatusCellLabel(const std::wstring& id) const {
     if (dock::statusgroup::TrayCell(id)) if (const auto it = statusState_.trayIcons.find(id); it != statusState_.trayIcons.end() && !it->second.name.empty()) return it->second.name;
-    return dock::statusgroup::CellLabel(id);
+    const auto label = dock::statusgroup::CellLabel(id);
+    return docky::ui::Text(label.c_str());
 }
 RECT App::StatusCellScreenRect(int index, int cell) const {
     if (index < 0 || static_cast<size_t>(index) >= frame_.items.size() || static_cast<size_t>(index) >= items_.size()) return RECT{};
@@ -1677,7 +1692,11 @@ void App::RefreshStatus(bool query) {
     const bool h24 = wcschr(pattern, L'H') != nullptr;
     wchar_t time[32]{}; GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &now, h24 ? L"H:mm" : L"h:mm", time, 32);
     next.time = time;
-    next.hour = now.wHour; next.minute = now.wMinute; next.second = now.wSecond; next.day = now.wDay;  // Clock and Calendar tiles (live)
+    next.hour = now.wHour; next.minute = now.wMinute; next.day = now.wDay;
+    next.second = std::find(statusCells_.begin(), statusCells_.end(), L"analog") != statusCells_.end() ? now.wSecond : 0;
+    wchar_t date[64]{};
+    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &now, nullptr, date, ARRAYSIZE(date), nullptr);
+    next.shortDate = date;  // Clock and Calendar tiles (live)
     wchar_t weekday[32]{}; GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &now, L"ddd", weekday, 32, nullptr); next.weekday = weekday;
     next.tileStyle = statusTileStyle_;
     statusLayout_ = docky::statuspopup::ForegroundLayout(statusLayout_, statusInputTarget_);
@@ -1740,6 +1759,7 @@ void App::RefreshStatus(bool query) {
     }
     next.dark = !statusLight_ && liquid::theme::IsDark(appearanceMode_, systemDark_);  // black glyphs on a bright backdrop or a light Dock
     next.wifi = s.wifi == liquid::status::Wifi::Connected ? 2 : s.wifi == liquid::status::Wifi::Disconnected ? 1 : 0;
+    next.bluetoothOn = statusBluetoothOn_;
     next.audio = s.audioAvailable; next.muted = s.muted; next.volume = s.volumePercent;
     if (!(next == statusState_)) { statusState_ = next; needsFrame_ = true; }
     if (query && !statusQuerying_.exchange(true)) {
@@ -1747,7 +1767,7 @@ void App::RefreshStatus(bool query) {
         std::thread([target] {
             const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             const double w0 = Now();
-            auto* snapshot = new liquid::status::Snapshot(liquid::status::Query(false));  // no nearby-network list: the tiles do not show it
+            auto* snapshot = new StatusReadout{liquid::status::Query(false), liquid::controls::ReadBluetoothRadio() == liquid::controls::Radio::On};
             DLOG_DEBUG(L"status query: %.1f ms", (Now() - w0) * 1000.0);
             if (SUCCEEDED(co)) CoUninitialize();
             if (!PostMessageW(target, kStatusReadyMsg, 0, reinterpret_cast<LPARAM>(snapshot))) delete snapshot;
@@ -1765,7 +1785,11 @@ void App::OpenStatusCell(int index, int cell) {
     // The anchor spans the cell horizontally and starts at the top of the plate (panels open above the whole Dock).
     const RECT anchor{windowRect_.left + static_cast<LONG>(r.left * scale_), windowRect_.top + static_cast<LONG>(std::min(r.top, frame_.dockTop) * scale_),
                       windowRect_.left + static_cast<LONG>(r.right * scale_), windowRect_.top + static_cast<LONG>(r.bottom * scale_)};
-    const std::wstring id = cells[static_cast<size_t>(cell)];
+    std::wstring id = cells[static_cast<size_t>(cell)];
+    if (id == L"system") {
+        id = dock::statusgroup::SystemStatusPart(r, {mouseX_, mouseY_});
+        if (id == L"battery" && !statusState_.batteryPresent) id = L"control";
+    }
     DLOG(L"status group: open %ls", id.c_str());
     liquid::cc::SetOpenAbove(true);
     const POINT above{anchor.left, anchor.top - static_cast<LONG>(8 * scale_)};
@@ -2022,6 +2046,7 @@ bool App::SyncRunningApps() {
 }
 
 void App::MinimizedChanged(HWND w, bool added) {
+    if (added && dock::minimize::StageOwnsMinimize(w)) return;
     const auto it = std::find(minimized_.begin(), minimized_.end(), w);
     if (added) {
         if (it != minimized_.end()) return;
@@ -2080,6 +2105,8 @@ void App::ApplyWindowLayout(const wchar_t* reason) {
     GetMonitorInfoW(MonitorFromWindow(hwnd_, MONITOR_DEFAULTTOPRIMARY), &mi);
     const RECT monitor = mi.rcMonitor;
     const int monitorWidth = monitor.right - monitor.left, monitorHeight = monitor.bottom - monitor.top;
+    const int bottomOffsetPixels = static_cast<int>(static_cast<long long>(monitorHeight) * bottomOffsetPercent_ / 100);
+    model_.m.bottomMargin = bottomOffsetPixels / scale_;
     resizeMaxSize_ = model_.MaxIconSizeForWidth(monitorWidth / scale_);
     if (model_.m.icon > resizeMaxSize_) model_.SetIconSize(static_cast<float>(resizeMaxSize_));
     // Keep one stable, screen-sized-or-smaller canvas throughout the drag.
@@ -2134,7 +2161,8 @@ void App::SetFullRegion(bool full, bool force) {
     const float pad = model_.m.shadowPad;
     HRGN rgn = CreateRectRgn(static_cast<int>(std::floor((r.left - pad) * scale_)),
                              static_cast<int>(std::floor((r.top - pad) * scale_)),
-                             static_cast<int>(std::ceil((r.right + pad) * scale_)), static_cast<int>(pxH_));
+                             static_cast<int>(std::ceil((r.right + pad) * scale_)),
+                             std::min(static_cast<int>(pxH_), static_cast<int>(std::ceil((r.bottom + pad) * scale_ + appliedOffset_))));
     if (!SetWindowRgn(hwnd_, rgn, TRUE)) DeleteObject(rgn);
     sceneRegion_.clear();
 }
@@ -2483,11 +2511,18 @@ void App::Frame() {
             const auto& g = frame_.items[hovered];
             const auto& cells = items_[hovered].statusCells;
             const int cell = dock::statusgroup::CellAt(D2D1::RectF(g.left, g.top, g.left + g.width, g.top + g.size), cells, D2D1::Point2F(mouseX_, mouseY_));
-            if (cell >= 0) scene.label = StatusCellLabel(cells[static_cast<size_t>(cell)]);
+            if (cell >= 0) {
+                const auto& id = cells[static_cast<size_t>(cell)];
+                if (id == L"system") {
+                    const auto part = dock::statusgroup::SystemStatusPart(
+                        D2D1::RectF(g.left, g.top, g.left + g.width, g.top + g.size), {mouseX_, mouseY_});
+                    scene.label = StatusCellLabel(!statusState_.batteryPresent && wcscmp(part, L"battery") == 0 ? L"control" : part);
+                } else scene.label = StatusCellLabel(id);
+            }
             // Control Center's device takes ~170 ms to create: make it while the pointer is on a tile that opens it, so
             // the first opening is as quick as the later ones (it is kept afterwards anyway).
             if (!ccPrewarmed_ && std::any_of(cells.begin(), cells.end(), [](const std::wstring& id) {
-                    return id == L"combo" || id == L"control" || id == L"wifi" || id == L"bluetooth" || id == L"sound" || id == L"battery"; })) {
+                    return id == L"system" || id == L"combo" || id == L"control" || id == L"wifi" || id == L"bluetooth" || id == L"sound" || id == L"battery"; })) {
                 ccPrewarmed_ = true; liquid::cc::Prewarm();
             }
         }
@@ -3112,7 +3147,7 @@ void App::OnRButtonUp(float x, float y) {
         AppendMenuW(show, MF_SEPARATOR, 0, nullptr);
         for (UINT i = 0; i < ARRAYSIZE(kStatusMenuIds); ++i) {
             const bool on = std::find(statusCells_.begin(), statusCells_.end(), kStatusMenuIds[i]) != statusCells_.end();
-            AppendMenuW(show, MF_STRING | (on ? MF_CHECKED : 0), kMenuShowBase + 10 + i, i == 0 ? docky::ui::Text(L"Status (Battery, Wi-Fi, Volume)") : dock::statusgroup::CellLabel(kStatusMenuIds[i]).c_str());
+            AppendMenuW(show, MF_STRING | (on ? MF_CHECKED : 0), kMenuShowBase + 10 + i, i == 0 ? docky::ui::Text(L"Status (Battery, Wi-Fi, Volume)") : StatusCellLabel(kStatusMenuIds[i]).c_str());
             if (i == 2) AppendMenuW(show, MF_SEPARATOR, 0, nullptr);
         }
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(show), docky::ui::Text(L"Show in Dock"));
@@ -3459,7 +3494,7 @@ bool App::StartApplications(bool background){
     if(applicationsProcess_){CloseHandle(applicationsProcess_);applicationsProcess_=nullptr;}
     wchar_t path[32768]{};GetModuleFileNameW(nullptr,path,32768);
     std::wstring exe(path);exe.resize(exe.find_last_of(L"\\/")+1);exe+=L"applications-menu\\DockOverApplications.exe";
-    std::wstring command=L"\""+exe+L"\" --resident";if(background)command+=L" --background";
+    std::wstring command=L"\""+exe+L"\" --resident --settings-path \""+opt_.desktopSettingsPath+L"\" --launchpad-path \""+launchpadPath_+L"\"";if(background)command+=L" --background";
     STARTUPINFOW startup{sizeof(startup)};PROCESS_INFORMATION proc{};
     if(!CreateProcessW(exe.c_str(),command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&proc))return false;
     applicationsProcess_=proc.hProcess;CloseHandle(proc.hThread);
@@ -3573,8 +3608,20 @@ bool App::LowLatActive() const {
 void App::RequestBackdrop(bool enabled, HMONITOR monitor) {
     if (lowLat_ && enabled && monitor && renderer_.Device() && monitor != ownedMonitor_) {
         ReleaseCaptureOwner();
-        docky::desk::SharedDesktop::ForMonitor(monitor).SetOwner(renderer_.Device());
-        ownedMonitor_ = monitor;
+        // DuplicateOutput can only run on the adapter that owns this monitor.
+        const auto display = docky::DisplayAdapter(monitor);
+        ComPtr<IDXGIDevice> dxgi;
+        ComPtr<IDXGIAdapter> render;
+        DXGI_ADAPTER_DESC1 displayDesc{};
+        DXGI_ADAPTER_DESC renderDesc{};
+        if (display && SUCCEEDED(display->GetDesc1(&displayDesc)) &&
+            SUCCEEDED(renderer_.Device()->QueryInterface(IID_PPV_ARGS(&dxgi))) &&
+            SUCCEEDED(dxgi->GetAdapter(&render)) && SUCCEEDED(render->GetDesc(&renderDesc)) &&
+            displayDesc.AdapterLuid.HighPart == renderDesc.AdapterLuid.HighPart &&
+            displayDesc.AdapterLuid.LowPart == renderDesc.AdapterLuid.LowPart) {
+            docky::desk::SharedDesktop::ForMonitor(monitor).SetOwner(renderer_.Device());
+            ownedMonitor_ = monitor;
+        }
     }
     backdrop_.Request(enabled, monitor);
 }

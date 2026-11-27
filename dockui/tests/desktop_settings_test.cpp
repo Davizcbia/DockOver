@@ -29,6 +29,7 @@ int wmain(int argc, wchar_t** argv) {
        SearchCategories(L"density")!=std::vector<int>{4} ||
        SearchCategories(L"menu bar size")!=std::vector<int>{3} ||
        SearchCategories(L"legacy backup")!=std::vector<int>{8} || SearchCategories(L"about")!=std::vector<int>{9} ||
+       SearchCategories(L"upd")!=std::vector<int>{9} || SearchCategories(L"check for updates")!=std::vector<int>{9} ||
        SearchCategories(L"no-such-setting").size()!=0)return 20;
     if(argc==3 && std::wstring(argv[1])==L"--density-writer"){
         for(int i=0;i<40;++i)if(WriteDensityInt(argv[2],"iconSize",32+(i%17)*8)!=SaveStatus::Saved)return 11;
@@ -77,7 +78,7 @@ int wmain(int argc, wchar_t** argv) {
     // Menu bar on/off and the Dock status group's cells.
     ok=ok&&Load(file).value.menuBar.enabled&&WriteBool(file,"menuBar","enabled",false)==SaveStatus::Saved&&!Load(file).value.menuBar.enabled;
     ok=ok&&WriteBool(file,"menuBar","enabled",true)==SaveStatus::Saved&&Load(file).value.menuBar.enabled;
-    {const auto defaults=Load(file).value.dock.statusCells;ok=ok&&defaults==std::vector<std::wstring>{L"combo",L"analog",L"date",L"tray"};}
+    {const auto defaults=Load(file).value.dock.statusCells;ok=ok&&defaults==std::vector<std::wstring>{L"system",L"tray"};}
     ok=ok&&WriteStatusCells(file,{L"wifi",L"bluetooth",L"ext:com.example.vpn"})==SaveStatus::Saved&&
            Load(file).value.dock.statusCells==std::vector<std::wstring>{L"wifi",L"bluetooth",L"ext:com.example.vpn"};
     ok=ok&&WriteStatusCells(file,{L"wifi",L"wifi"})==SaveStatus::Invalid&&WriteStatusCells(file,{L"nope"})==SaveStatus::Invalid&&WriteStatusCells(file,{L"ext:bad id"})==SaveStatus::Invalid;
@@ -87,6 +88,8 @@ int wmain(int argc, wchar_t** argv) {
     ok=ok&&WriteStatusCells(file,{L"combo",L"tray:clash-verge.exe#1",L"tray"})==SaveStatus::Saved&&
            Load(file).value.dock.statusCells==std::vector<std::wstring>{L"combo",L"tray:clash-verge.exe#1",L"tray"};
     ok=ok&&WriteStatusCells(file,{})==SaveStatus::Saved&&Load(file).value.dock.statusCells.empty()&&Load(file).status==LoadStatus::Loaded;
+    ok=ok&&Load(file).value.appearance.applicationsLaunchpadOnly;
+    ok=ok&&WriteBool(file,"appearance","applicationsLaunchpadOnly",false)==SaveStatus::Saved && !Load(file).value.appearance.applicationsLaunchpadOnly;
     ok=ok&&WriteStatusCells(file,{L"combo",L"control",L"clock",L"tray"})==SaveStatus::Saved&&Load(file).value.dock.statusCells.size()==4;
     ok=ok&&!Load(file).value.dock.statusBatteryPercent&&WriteBool(file,"dock","statusBatteryPercent",true)==SaveStatus::Saved&&Load(file).value.dock.statusBatteryPercent;
     if(!ok){std::puts("FAIL menu bar enabled / status cells");return 1;}

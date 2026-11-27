@@ -1,4 +1,5 @@
 #include "genie_gpu.h"
+#include "display_adapter.h"
 #include "backdrop_wgc.h"
 #include "vblank.h"
 
@@ -149,8 +150,7 @@ struct Renderer {
 
     bool Init() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2,
-                                     D3D11_SDK_VERSION, &device, nullptr, &context))) return false;
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, &device, nullptr, &context))) return false;
         ComPtr<IDXGIDevice> dxgi; device.As(&dxgi);
         ComPtr<IDXGIAdapter> adapter; dxgi->GetAdapter(&adapter);
         if (FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) return false;

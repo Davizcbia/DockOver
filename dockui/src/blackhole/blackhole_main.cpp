@@ -19,6 +19,7 @@
 //   --snapshot <file.bmp> [--snapshot-after <s>]   --exit-after <s>   --bench <s per mode> [--bench-out <file>]
 //   --quit  (closes a running instance)
 #include <windows.h>
+#include "display_adapter.h"
 #include <windowsx.h>
 #include <commctrl.h>
 #include <d3d11_4.h>
@@ -272,7 +273,7 @@ public:
 private:
     bool Init() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &device_, nullptr, &ctx_))) return false;
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, &device_, nullptr, &ctx_))) return false;
         ComPtr<IDXGIDevice> dxgi; device_.As(&dxgi);
         ComPtr<IDXGIAdapter> adapter; dxgi->GetAdapter(&adapter);
         adapter->GetParent(IID_PPV_ARGS(&factory_));

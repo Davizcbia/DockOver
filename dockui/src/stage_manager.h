@@ -1,4 +1,5 @@
 #pragma once
+#include "minimize_dock.h"
 
 #include "fullscreen_window.h"
 #include "vblank.h"
@@ -479,6 +480,7 @@ class StageManager {
             for (auto& m : members_) {
                 if (m.group == active_ && m.parked && Live(m)) {
                     ShowWindowAsync(m.window, SW_RESTORE);
+                    dock::minimize::StageRestore(m.window);
                     m.parked = false;
                 }
             }
@@ -491,7 +493,10 @@ class StageManager {
         if (member.parked || IsIconic(member.window) || !Eligible(member.window))
             return;
         member.maximized = IsZoomed(member.window) != FALSE;
+        dock::minimize::StagePark(member.window);
         member.parked = ShowWindowAsync(member.window, SW_SHOWMINNOACTIVE) != FALSE;
+        if (!member.parked)
+            dock::minimize::StageRestore(member.window);
     }
     bool Animate(HWND w, RECT start) {
         EndAnimation();
@@ -581,6 +586,7 @@ class StageManager {
             if (m.group == group) {
                 if (m.parked) {
                     ShowWindowAsync(m.window, SW_RESTORE);
+                    dock::minimize::StageRestore(m.window);
                     m.parked = false;
                 }
                 if (!target)
@@ -852,8 +858,10 @@ class StageManager {
             DestroyWindow(outgoing_);
         shelf_ = transition_ = outgoing_ = nullptr;
         for (const auto& m : members_)
-            if (m.parked && Live(m))
+            if (m.parked && Live(m)) {
                 ShowWindowAsync(m.window, m.maximized ? SW_SHOWMAXIMIZED : SW_SHOWNOACTIVATE);
+                dock::minimize::StageRestore(m.window);
+            }
         members_.clear();
         active_ = pressed_ = 0;
         scroll_ = maxScroll_ = 0;

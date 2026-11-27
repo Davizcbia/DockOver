@@ -56,6 +56,12 @@ foreach ($p in $programs) {
     if (-not (Test-Path -LiteralPath $from)) { throw "$p is missing from $BuildDir." }
     Copy-Item -LiteralPath $from -Destination $programDir
 }
+# The suite contains the integrated DockDrop and Music Player under runtime; standalone distributions are built separately.
+foreach ($helper in 'DockDropPc.exe', 'DockDropPc.dll', 'DockDropPc.deps.json', 'DockDropPc.runtimeconfig.json') {
+    if (-not (Test-Path -LiteralPath (Join-Path $BuildDir "dockdrop-pc\$helper") -PathType Leaf)) {
+        throw "DockDrop LAN component $helper is missing. Rebuild DockOver with phone pairing enabled."
+    }
+}
 Copy-Item (Join-Path $BuildDir 'dockdrop-pc') -Destination (Join-Path $programDir 'dockdrop-pc') -Recurse
 $appsDir = Join-Path $BuildDir 'applications-menu'
 if (-not (Test-Path (Join-Path $appsDir 'DockOverApplications.exe'))) { throw 'Applications menu is missing. Rebuild DockOver.' }

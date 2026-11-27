@@ -71,6 +71,10 @@ Result Load(const std::wstring& path) {
             r.value.dock.iconSize=static_cast<int>(iconSize->number);
         }
     }
+    if (const auto* section = root.Find("dock")) {
+        if (const auto* offset = section->Find("bottomOffsetPercent"); offset && offset->type == dock::json::Value::Type::Number && std::isfinite(offset->number))
+            r.value.dock.bottomOffsetPercent = static_cast<int>(std::lround(std::clamp(offset->number, 0.0, 25.0)));
+    }
     if(const auto* section=root.Find("dock")) if(const auto* mag=section->Find("magnification");mag&&mag->type==dock::json::Value::Type::Number&&std::isfinite(mag->number))
         r.value.dock.magnification=std::clamp(static_cast<int>(std::lround(mag->number)),0,150);
     if(const auto* section=root.Find("dock")) if(const auto* count=section->Find("downloadsCount")){
@@ -151,6 +155,8 @@ Result Load(const std::wstring& path) {
     }
     if(const auto* section=root.Find("performance")){  // an unknown value is ignored (unlimited), never invalidates the file
         auto cap=[&](const char* key,int& out){if(const auto* v=section->Find(key);v&&v->type==dock::json::Value::Type::Number&&std::isfinite(v->number)&&ValidFrameCap(static_cast<int>(v->number)))out=static_cast<int>(v->number);};
+        if (const auto* gpu = section->Find("useDiscreteGpu"); gpu && gpu->type == dock::json::Value::Type::Bool)
+            r.value.performance.useDiscreteGpu = gpu->boolean;
         cap("animationFps",r.value.performance.animationFps);cap("captureFps",r.value.performance.captureFps);
     }
     if(const auto* section=root.Find("updates")){  // a value of the wrong type is ignored (default), never invalidates the file
@@ -217,6 +223,8 @@ Result Load(const std::wstring& path) {
         r.value.controlCenter.backdropBlur=static_cast<int>(blur->number);
     }
     if(const auto* section=root.Find("appearance")){
+        if (const auto* filter = section->Find("applicationsLaunchpadOnly"); filter && filter->type == dock::json::Value::Type::Bool)
+            r.value.appearance.applicationsLaunchpadOnly = filter->boolean;
         if(const auto* lang=section->Find("language");lang&&lang->type==dock::json::Value::Type::String&&(lang->string=="en"||lang->string=="zh-CN"))r.value.appearance.language=lang->string;
         if(const auto* order=section->Find("applicationsSort");order&&order->type==dock::json::Value::Type::Number&&(order->number==1||order->number==2))
             r.value.appearance.applicationsSort=static_cast<int>(order->number);
@@ -358,11 +366,11 @@ SaveStatus WritePerformanceInt(const std::wstring& path,const std::string& key,i
  return valid?WriteScalar(path,"performance",key,std::to_string(value),false):SaveStatus::Invalid;
 }
 SaveStatus WriteDockInt(const std::wstring& path,const std::string& key,int value){
- const bool valid=(key=="downloadsCount"&&value>=3&&value<=10)||(key=="magnification"&&value>=0&&value<=150)||(key=="iconSizeV2"&&value>=1&&value<=65535)||(key=="statusTileStyle"&&value>=0&&value<=2);
+ const bool valid=(key=="downloadsCount"&&value>=3&&value<=10)||(key=="bottomOffsetPercent"&&value>=0&&value<=25)||(key=="magnification"&&value>=0&&value<=150)||(key=="iconSizeV2"&&value>=1&&value<=65535)||(key=="statusTileStyle"&&value>=0&&value<=2);
  return valid?WriteScalar(path,"dock",key,std::to_string(value),false):SaveStatus::Invalid;
 }
 bool ValidStatusCell(const std::wstring& id){
- for(const wchar_t* k:{L"combo",L"analog",L"date",L"digital",L"control",L"wifi",L"bluetooth",L"sound",L"battery",L"input",L"clock",L"tray"})if(id==k)return true;
+ for(const wchar_t* k:{L"system",L"combo",L"analog",L"date",L"digital",L"control",L"wifi",L"bluetooth",L"sound",L"battery",L"input",L"clock",L"tray"})if(id==k)return true;
  if(id.rfind(L"tray:",0)==0){  // a tray icon kept in the Dock: its tray key "tray:<exe name>#<uid or guid>" (tray_host.h)
   const size_t hash=id.find(L'#');if(id.size()>200||hash==std::wstring::npos||hash<6||hash+1>=id.size())return false;
   for(size_t i=5;i<id.size();++i){const wchar_t c=id[i];if(c<0x20||c==L'"'||c==L'\\'||c==L'/'||c==0x7f)return false;}
@@ -379,7 +387,7 @@ SaveStatus WriteStatusCells(const std::wstring& path,const std::vector<std::wstr
  return WriteScalar(path,"dock","statusCells",dock::json::Write(list,0),2);
 }
 bool ValidTailKey(const std::wstring& key){
- for(const wchar_t* k:{L"status",L"status:combo",L"status:analog",L"status:date",L"status:digital",L"status:tray",L"downloads",L"trash"})if(key==k)return true;
+ for(const wchar_t* k:{L"status",L"status:system",L"status:combo",L"status:analog",L"status:date",L"status:digital",L"status:tray",L"downloads",L"trash"})if(key==k)return true;
  return false;
 }
 SaveStatus WriteTailOrder(const std::wstring& path,const std::vector<std::wstring>& keys){

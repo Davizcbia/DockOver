@@ -20,6 +20,10 @@ namespace dock::minimize {
 // changed(window, added): a minimized window gained (true) or lost (false) its Dock tile.
 bool Init(HWND dock, std::function<void(HWND, bool)> changed);
 void Shutdown();
+// Stage Manager parks windows in its own shelf, which must not create Dock minimize tiles.
+void StagePark(HWND window);
+void StageRestore(HWND window);
+bool StageOwnsMinimize(HWND window);
 // Each Dock frame: the tile's icon rectangle in screen pixels (empty rect = not visible).
 void SetTileRect(HWND window, const RECT& screen);
 bool SuppressFallbackTile(HWND window);

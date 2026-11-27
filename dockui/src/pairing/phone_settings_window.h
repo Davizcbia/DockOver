@@ -1,4 +1,5 @@
 #pragma once
+#include "../display_adapter.h"
 #include "../vblank.h"
 
 #include <windows.h>
@@ -676,8 +677,7 @@ inline void Init(HWND window, Window& model) {
     model.reducedMotion = !animations;
     if (model.color.top != model.color.bottom) {
         Microsoft::WRL::ComPtr<ID3D11Device> device;
-        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr)))
+        if (SUCCEEDED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, &device, nullptr, nullptr)))
             model.glass.Init(device.Get());
     }
     const int radius = model.Dip(kCornerRadius), inset = 2;

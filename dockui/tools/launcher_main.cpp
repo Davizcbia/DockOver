@@ -4,6 +4,7 @@
 //   runtime\                (the Desktop Manager, Dock, Menu Bar, Settings, guardian, updater, assets)
 // Starts runtime\LiquidDesktopManager.exe without a console window (command-line arguments are passed on). When DockOver
 // already runs, it opens DockOver Settings instead (the Manager's settings event), like starting an app again.
+#include "../src/suite_install.h"
 #include <windows.h>
 #include <shellapi.h>
 
@@ -14,6 +15,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     self.resize(GetModuleFileNameW(nullptr, self.data(), static_cast<DWORD>(self.size())));
     const std::wstring dir = self.substr(0, self.find_last_of(L"\\/"));
     const std::wstring runtime = dir + L"\\runtime", manager = runtime + L"\\LiquidDesktopManager.exe";
+    docky::suite::Register(dir);
+    docky::suite::StopStandaloneWindows();
     const auto dockdrop = runtime + L"\\docky-bubble.exe";
     if (GetFileAttributesW(dockdrop.c_str()) != INVALID_FILE_ATTRIBUTES) {
         std::wstring registration = L"\"" + dockdrop + L"\" --register-dockdrop-menu";

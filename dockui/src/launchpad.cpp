@@ -1,4 +1,5 @@
 #include "launchpad.h"
+#include "display_adapter.h"
 
 #include <windowsx.h>
 #include <imm.h>
@@ -598,11 +599,8 @@ bool Launchpad::CaptureDesktop() {
 
 HRESULT Launchpad::InitGraphics() {
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                                   ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, nullptr, &ctx_);
-    if (FAILED(hr))
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                               ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, nullptr, &ctx_);
+    HRESULT hr = docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
+                                   ARRAYSIZE(levels), &d3d_, nullptr, &ctx_);
     if (FAILED(hr)) return hr;
     if (FAILED(hr = d3d_.As(&dxgi_))) return hr;
     ComPtr<IDXGIFactory2> factory;

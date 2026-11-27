@@ -193,15 +193,19 @@ void QueryWifi(State& s, bool includeNetworks) {
 
 namespace wr = winrt::Windows::Devices::Radios;
 
+liquid::controls::Radio RadioState(wr::RadioState value) {
+    if (value == wr::RadioState::On) return liquid::controls::Radio::On;
+    if (value == wr::RadioState::Off || value == wr::RadioState::Disabled) return liquid::controls::Radio::Off;
+    return liquid::controls::Radio::Unknown;
+}
+
 void QueryRadios(State& s) {
     try {
         const auto access = wr::Radio::RequestAccessAsync().get();
         const bool allowed = access == wr::RadioAccessStatus::Allowed;
         for (const auto& r : wr::Radio::GetRadiosAsync().get()) {
             const auto st = r.State();
-            const liquid::controls::Radio v = st == wr::RadioState::On ? liquid::controls::Radio::On
-                                              : st == wr::RadioState::Off || st == wr::RadioState::Disabled ? liquid::controls::Radio::Off
-                                                                                                            : liquid::controls::Radio::Unknown;
+            const auto v = RadioState(st);
             if (r.Kind() == wr::RadioKind::Bluetooth) {
                 s.btRadio = v;
                 s.btSwitchable = allowed && st != wr::RadioState::Disabled;
@@ -341,6 +345,14 @@ bool QueryBrightness(int& percent) {
 }
 
 }  // namespace
+
+Radio ReadBluetoothRadio() {
+    try {
+        for (const auto& radio : wr::Radio::GetRadiosAsync().get())
+            if (radio.Kind() == wr::RadioKind::Bluetooth) return RadioState(radio.State());
+    } catch (const winrt::hresult_error&) {}
+    return Radio::Unavailable;
+}
 
 State Query(bool includeNetworks, bool includeBluetoothDevices) {
     State s;

@@ -9,12 +9,19 @@ using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using Microsoft.Win32;
 
 const int discoveryPort = 47731;
 const int transferPort = 47732;
 const string protocol = "DockDropPc/1";
 var utf8 = new UTF8Encoding(false, true);
 var localName = Environment.MachineName;
+var productDir = Directory.GetParent(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar))?.FullName;
+var edition = args.FirstOrDefault();
+var standalone = edition == "--standalone" ||
+    (edition != "--integrated" && productDir is not null && File.Exists(Path.Combine(productDir, "DockDrop.exe")));
+if (edition is "--standalone" or "--integrated") args = args[1..];
+if (standalone && SuiteActive()) return 0;
 Console.InputEncoding = Encoding.UTF8;
 Console.OutputEncoding = Encoding.UTF8;
 
@@ -120,6 +127,31 @@ catch (Exception ex) when (IsTransferError(ex) || ex is UnauthorizedAccessExcept
     if (args.FirstOrDefault() is "picker-send" or "picker-receive") System.Windows.Forms.MessageBox.Show(ex.Message, "DockDrop");
     Console.Error.WriteLine(ex.Message);
     return 1;
+}
+
+static bool SuiteActive()
+{
+    try
+    {
+        using var key = Registry.CurrentUser.OpenSubKey(@"Software\DockOver");
+        if (key?.GetValue("SuiteRoot") is string root && !string.IsNullOrWhiteSpace(root) &&
+            File.Exists(Path.Combine(root, "DockOver.exe")) &&
+            File.Exists(Path.Combine(root, @"runtime\LiquidDesktopManager.exe")) &&
+            File.Exists(Path.Combine(root, @"runtime\docky-bubble.exe")) &&
+            File.Exists(Path.Combine(root, @"runtime\docky-now-playing.exe")))
+            return true;
+        foreach (var name in new[] { @"Local\LiquidDesktopManagerV05SingleInstance", @"Local\DockOverSuiteUpdateV1" })
+        {
+            if (!Mutex.TryOpenExisting(name, out var mutex)) continue;
+            mutex.Dispose();
+            return true;
+        }
+    }
+    catch (Exception ex) when (ex is UnauthorizedAccessException or IOException or System.Security.SecurityException)
+    {
+        // The suite's registry entry or synchronization object may be inaccessible in another session.
+    }
+    return false;
 }
 
 static string AskCode(string peerName, string hint)
@@ -264,14 +296,29 @@ async Task Receive(string folder, string? popup)
     }
     using var discoveryOwner = discovery;
     using var stopping = new CancellationTokenSource();
+    using var updateQuit = new EventWaitHandle(false, EventResetMode.ManualReset,
+        $@"Local\DockOver.Update.DockDropPc.{Environment.ProcessId}");
+    var updateWait = Task.Run(() =>
+    {
+        for (;;)
+        {
+            var result = WaitHandle.WaitAny([updateQuit, stopping.Token.WaitHandle], standalone ? 3000 : Timeout.Infinite);
+            if (result == 1) break;
+            if (result == 0 || SuiteActive())
+            {
+                stopping.Cancel();
+                break;
+            }
+        }
+    });
     var advertise = Advertise(discovery, stopping.Token);
     Console.WriteLine($"Ready on {localName}. Receiving into {folder}");
     Console.WriteLine($"Device code: {pin[..4]}-{pin[4..8]}-{pin[8..12]}-{pin[12..]}");
     try
     {
-        while (true)
+        while (!stopping.IsCancellationRequested)
         {
-            using var client = await server.AcceptTcpClientAsync();
+            using var client = await server.AcceptTcpClientAsync(stopping.Token);
             try { await HandleOffer(client, serverCertificate, folder, popup); }
             catch (Exception ex) when (IsTransferError(ex) || ex is UnauthorizedAccessException)
             {
@@ -279,9 +326,11 @@ async Task Receive(string folder, string? popup)
             }
         }
     }
+    catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
     finally
     {
         await stopping.CancelAsync();
+        await updateWait;
         try { await advertise; }
         catch (OperationCanceledException) when (stopping.IsCancellationRequested) { }
     }

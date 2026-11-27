@@ -113,20 +113,17 @@ HRESULT Renderer::Init(HWND hwnd, UINT pxW, UINT pxH, float dpi, bool aboveChild
     HRESULT hr = S_OK;
     if (useDevice_) { d3d_ = useDevice_; featureLevel_ = d3d_->GetFeatureLevel(); }  // shared with another renderer on this thread
     else {
-        const auto adapter = docky::DisplayAdapter(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST));
-        if (adapter) hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                           levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
-        if (!adapter || FAILED(hr))
-            hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                                   levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
-    }
-    if (FAILED(hr)) {
-        DLOG(L"D3D11CreateDevice hardware failed 0x%08X, trying WARP", hr);
-        hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels,
-                               ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3d_, &featureLevel_, nullptr);
+        hr = docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), &d3d_,
+                                        &featureLevel_, nullptr);
         if (FAILED(hr)) return hr;
     }
+    sharedGraphicsMemory_ = docky::UsesUnifiedMemory(d3d_.Get());
     if (FAILED(hr = d3d_.As(&dxgiDevice_))) return hr;
+    ComPtr<IDXGIAdapter> renderAdapter;
+    DXGI_ADAPTER_DESC adapterDesc{};
+    if (SUCCEEDED(dxgiDevice_->GetAdapter(&renderAdapter)) && SUCCEEDED(renderAdapter->GetDesc(&adapterDesc)))
+        DLOG(L"render adapter: %ls (LUID %08lx:%08lx)", adapterDesc.Description,
+             static_cast<unsigned long>(adapterDesc.AdapterLuid.HighPart), adapterDesc.AdapterLuid.LowPart);
     d3d_->GetImmediateContext(&ctx_);
 
     D2D1_FACTORY_OPTIONS options{};
@@ -595,6 +592,12 @@ void Renderer::RenderGlassLayers(const Scene& scene) {
     lastUsedGpu_ = false;
     labelUsedGpu_ = false;
     const GlassParameters* glass = scene.glass;
+    GlassParameters lowPowerGlass;
+    if (glass && glass->blurDownsample < 4 && sharedGraphicsMemory_) {
+        lowPowerGlass = *glass;
+        lowPowerGlass.blurDownsample = 4;   // one quarter of the half-resolution blur buffer's pixels
+        glass = &lowPowerGlass;
+    }
     if (liquid_ && glass && glass->material == MaterialKind::Liquid && scene.backdrop && rtv_) {
         const float clear[4] = {0, 0, 0, 0};
         ctx_->ClearRenderTargetView(rtv_.Get(), clear);

@@ -14,7 +14,12 @@ class LanPicker {
     bool failed_ = false;
     std::filesystem::path executable_, helper_;
     HANDLE Start(std::wstring args, bool console = false) const {
-        std::wstring command = L"\"" + helper_.wstring() + L"\" " + args;
+#ifdef DOCKDROP_STANDALONE
+        constexpr auto edition = L" --standalone ";
+#else
+        constexpr auto edition = L" --integrated ";
+#endif
+        std::wstring command = L"\"" + helper_.wstring() + L"\"" + edition + args;
         STARTUPINFOW si{sizeof(si)};
         PROCESS_INFORMATION pi{};
         if (!CreateProcessW(helper_.c_str(), command.data(), nullptr, nullptr, FALSE,

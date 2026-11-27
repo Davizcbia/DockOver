@@ -16,6 +16,7 @@ struct AppEntry {
     std::wstring name;         // display name from the Shell
     std::wstring parsingName;  // AppUserModelID or known-folder-relative path
     bool extraFile = false;    // from ExtraAppsDir: parsingName is the shortcut's full path
+    bool game = false;
     // Start-menu entries launch through the Applications folder; extra shortcuts (ExtraAppsDir) by their file path.
     std::wstring Target() const { return extraFile ? parsingName : L"shell:AppsFolder\\" + parsingName; }
 };

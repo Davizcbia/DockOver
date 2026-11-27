@@ -1,4 +1,5 @@
 #include "control_center.h"
+#include "display_adapter.h"
 #include "color_output.h"
 #include "ui_language.h"
 #include "audio_output_icons.h"
@@ -513,8 +514,7 @@ HRESULT SharedDevice(ComPtr<ID3D11Device>& device, ComPtr<ID3D11DeviceContext>& 
     if (g_device && g_device->GetDeviceRemovedReason() != S_OK) { DLOG(L"cc: shared device removed; recreating"); g_device.Reset(); g_context.Reset(); }
     if (!g_device) {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        const HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2,
-                                             D3D11_SDK_VERSION, &g_device, nullptr, &g_context);
+        const HRESULT hr = docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, &g_device, nullptr, &g_context);
         if (FAILED(hr)) { g_device.Reset(); g_context.Reset(); return hr; }
     }
     device = g_device; context = g_context; return S_OK;

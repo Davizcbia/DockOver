@@ -2,15 +2,16 @@
 //   docky-updater.exe --zip <file> --dir <program folder> [--version <v>] [--wait-pid <pid>] [--reopen-settings]
 // Always started from a temporary copy (see update_client.cpp StartInstall), never from the folder it replaces.
 // 1. Extract the zip (Windows' built-in tar.exe) into a staging folder and check its manifest.txt.
-// 2. Wait for the process that started it, then ask a running docky to quit (the Manager's quit event: the same as
-//    Menu Bar > Quit, which restores the Windows taskbar) and DockOver Desktop (WM_CLOSE to its host window: it does
-//    not listen to that event), then wait for every program in the folder to exit.
+// 2. Ask the running suite components covered by the manifest to quit, then wait for them to exit.
+//    The Manager restores the Windows taskbar as part of its regular shutdown.
 // 3. Move each listed file aside (*.update-old), copy the new one in; on any failure put every old file back.
 // 4. Start docky and DockOver Desktop again if they were running, and Settings > About if asked. Nothing is ever force-closed.
+#include "../src/suite_install.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 
+#include <algorithm>
 #include <cstdarg>
 #include <cstdio>
 #include <string>
@@ -71,47 +72,97 @@ void RemoveTree(const std::wstring& dir) {
     RemoveDirectoryW(dir.c_str());
 }
 
-// Processes whose executable lies in the program folder (the Manager, Dock, Menu Bar, Settings, guardian, ...).
-// DockOver Desktop (widgets and Stacks) is a separate program that does not listen to the Manager's quit event. Its
-// host window quits it on WM_CLOSE (the same as its own "Quit DockOver Desktop" menu item). Only a copy started from
-// this folder is asked; returns how many were asked.
-struct CloseDesktop { std::wstring prefix; int asked = 0; };
-BOOL CALLBACK CloseDesktopWindow(HWND w, LPARAM l) {
-    auto* c = reinterpret_cast<CloseDesktop*>(l);
-    wchar_t cls[64]{};
-    if (!GetClassNameW(w, cls, 64) || wcscmp(cls, L"DockyDesktopHostV1") != 0) return TRUE;
-    DWORD pid = 0; GetWindowThreadProcessId(w, &pid);
-    HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (!p) return TRUE;
-    wchar_t path[MAX_PATH * 4]{}; DWORD n = MAX_PATH * 4;
-    const bool ours = QueryFullProcessImageNameW(p, 0, path, &n) && Lower(std::wstring(path, n)).rfind(c->prefix, 0) == 0;
-    CloseHandle(p);
-    if (ours && PostMessageW(w, WM_CLOSE, 0, 0)) ++c->asked;
-    return TRUE;
-}
-int AskDesktopToQuit(const std::wstring& dir) {
-    CloseDesktop c{Lower(dir) + L"\\"};
-    EnumWindows(CloseDesktopWindow, reinterpret_cast<LPARAM>(&c));
-    return c.asked;
-}
+struct Process {
+    DWORD pid;
+    std::wstring relativePath;
+    std::wstring name;
+};
 
-std::vector<std::wstring> RunningIn(const std::wstring& dir) {
-    std::vector<std::wstring> out;
+std::vector<Process> RunningIn(const std::wstring& dir, const std::vector<std::wstring>& executables) {
+    std::vector<Process> out;
     const std::wstring prefix = Lower(dir) + L"\\";
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return out;
     PROCESSENTRY32W pe{sizeof(pe)};
     for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe)) {
-        if (pe.th32ProcessID == GetCurrentProcessId()) continue;
         HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
         if (!p) continue;
-        wchar_t path[MAX_PATH * 4]{}; DWORD n = MAX_PATH * 4;
-        if (QueryFullProcessImageNameW(p, 0, path, &n) && Lower(std::wstring(path, n)).rfind(prefix, 0) == 0)
-            out.push_back(std::wstring(pe.szExeFile) + L" (" + std::to_wstring(pe.th32ProcessID) + L")");
+        wchar_t path[32768]{}; DWORD n = ARRAYSIZE(path);
+        if (QueryFullProcessImageNameW(p, 0, path, &n)) {
+            const auto image = Lower(std::wstring(path, n));
+            if (image.starts_with(prefix)) {
+                const auto relative = image.substr(prefix.size());
+                if (std::find(executables.begin(), executables.end(), relative) != executables.end())
+                    out.push_back({pe.th32ProcessID, relative, Lower(pe.szExeFile)});
+            }
+        }
         CloseHandle(p);
     }
     CloseHandle(snap);
     return out;
+}
+
+struct CloseRequest {
+    const std::vector<Process>& running;
+    bool managerOwnsCore;
+    bool remember;
+    const UINT dockDropQuit = RegisterWindowMessageW(L"DockOver.Update.Quit");
+    std::wstring dockDropArgs;
+    HWND nowPlaying = nullptr;
+};
+
+BOOL CALLBACK CloseWindow(HWND w, LPARAM l) {
+    auto& c = *reinterpret_cast<CloseRequest*>(l);
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    const auto p = std::find_if(c.running.begin(), c.running.end(), [pid](const Process& entry) { return entry.pid == pid; });
+    if (p == c.running.end()) return TRUE;
+    wchar_t cls[128]{};
+    GetClassNameW(w, cls, ARRAYSIZE(cls));
+    if (p->name == L"docky-bubble.exe") {
+        if (c.remember && c.dockDropArgs != L"--pair-phone") {
+            if (wcscmp(cls, L"DockyPhonePairing") == 0 && IsWindowVisible(w)) c.dockDropArgs = L"--pair-phone";
+            else if (wcscmp(cls, L"DockDropDevicePreview") == 0 && IsWindowVisible(w)) c.dockDropArgs = L"--discover";
+            else if (wcscmp(cls, L"DockyPhonePairing") == 0 || wcscmp(cls, L"DockDropDevicePreview") == 0) {
+                if (c.dockDropArgs.empty()) c.dockDropArgs = L"--background";
+            }
+        }
+        if (c.dockDropQuit) PostMessageW(w, c.dockDropQuit, 0, 0);
+    } else if (p->name == L"docky-now-playing.exe") {
+        if (wcscmp(cls, L"DockyNowPlaying") == 0) {
+            c.nowPlaying = w;
+            PostMessageW(w, WM_CLOSE, 0, 0);
+        }
+    } else if (wcscmp(cls, L"DockyDesktopHostV1") == 0 ||
+               wcscmp(cls, L"DockyExtCliListener") == 0 ||
+               (p->name == L"docky-blackhole.exe" && !GetWindow(w, GW_OWNER)) ||
+               (p->name == L"dockoverapplications.exe" && !GetWindow(w, GW_OWNER)) ||
+               (!c.managerOwnsCore &&
+                (wcscmp(cls, L"LiquidDockV01") == 0 || wcscmp(cls, L"LiquidDesktopMenuBarV01") == 0 ||
+                 wcscmp(cls, L"LiquidDesktopSettingsV01") == 0))) {
+        PostMessageW(w, WM_CLOSE, 0, 0);
+    }
+    return TRUE;
+}
+
+void RequestAuxiliaryExit(CloseRequest& request) {
+    EnumWindows(CloseWindow, reinterpret_cast<LPARAM>(&request));
+    for (HWND w = nullptr; (w = FindWindowExW(HWND_MESSAGE, w, L"DockyNowPlayingWallpaperCtl", nullptr));) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(w, &pid);
+        if (std::any_of(request.running.begin(), request.running.end(), [pid](const Process& p) {
+                return p.pid == pid && p.name == L"docky-now-playing.exe";
+            }))
+            PostMessageW(w, WM_CLOSE, 0, 0);
+    }
+    for (const auto& p : request.running) {
+        if (p.name != L"dockdroppc.exe") continue;
+        const auto event = L"Local\\DockOver.Update.DockDropPc." + std::to_wstring(p.pid);
+        if (HANDLE quit = OpenEventW(EVENT_MODIFY_STATE, FALSE, event.c_str())) {
+            SetEvent(quit);
+            CloseHandle(quit);
+        }
+    }
 }
 
 bool Start(const std::wstring& exe, const std::wstring& args, const std::wstring& dir, DWORD flags) {
@@ -225,6 +276,15 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     }
     zip = FullPath(zip); dir = FullPath(dir);
     Log(L"---- update to %ls: zip=%ls dir=%ls", version.c_str(), zip.c_str(), dir.c_str());
+    // Both the automatic check and Settings can launch a temporary installer.
+    HANDLE install = CreateMutexW(nullptr, TRUE, L"Local\\DockOverSuiteUpdateV1");
+    if (!install) return Fail(L"Could not acquire the update lock.");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(install);
+        Log(L"another DockOver update is already running");
+        return 2;
+    }
+    struct InstallLock { HANDLE handle; ~InstallLock() { CloseHandle(handle); } } lock{install};
     if (!Exists(zip)) return Fail(L"The downloaded update is missing.");
     // Release folders keep the programs in runtime\ (DockOver.exe and DockOver Desktop.exe beside it); development
     // folders (build-borderless) have them at the top.
@@ -233,64 +293,97 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     if (!Exists(programs + L"\\LiquidDesktopManager.exe")) return Fail(L"The DockOver program folder was not found: " + dir);
 
     // 1. Extract and check.
-    const std::wstring stage = zip + L".staging";
-    RemoveTree(stage);
+    const std::wstring stage = zip + L".stage-" + std::to_wstring(GetCurrentProcessId());
     if (!CreateDirectoryW(stage.c_str(), nullptr)) return Fail(L"Could not create a staging folder.");
     if (!Extract(zip, stage)) { RemoveTree(stage); return Fail(L"The update package could not be extracted."); }
     std::vector<std::wstring> files;
     if (!ReadManifest(stage + L"\\manifest.txt", files)) { RemoveTree(stage); return Fail(L"The update package has no valid manifest."); }
-    bool hasManager = false, packageRelease = false;
+    std::vector<std::wstring> entries, executables;
     for (const auto& f : files) {
-        if (!Exists(stage + L"\\" + f)) { RemoveTree(stage); return Fail(L"The update package is missing " + f + L"."); }
-        if (Lower(f) == L"liquiddesktopmanager.exe") hasManager = true;
-        if (Lower(f) == L"runtime\\liquiddesktopmanager.exe") hasManager = packageRelease = true;
+        const auto name = Lower(f);
+        const DWORD attr = GetFileAttributesW((stage + L"\\" + f).c_str());
+        if (attr == INVALID_FILE_ATTRIBUTES || (attr & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+            std::find(entries.begin(), entries.end(), name) != entries.end()) {
+            RemoveTree(stage);
+            return Fail(L"The update package contains a missing, invalid or duplicate file: " + f);
+        }
+        entries.push_back(name);
+        if (name.ends_with(L".exe")) executables.push_back(name);
     }
-    if (!hasManager) { RemoveTree(stage); return Fail(L"The update package does not contain DockOver."); }
+    const auto contains = [&](const std::wstring& entry) {
+        return std::find(entries.begin(), entries.end(), entry) != entries.end();
+    };
+    const bool packageRelease = contains(L"runtime\\liquiddesktopmanager.exe");
     if (packageRelease != releaseLayout) {
         RemoveTree(stage);
-        return Fail(releaseLayout ? L"This update package is a development build and does not fit this DockOver folder."
-                                  : L"This DockOver folder is a development copy; release packages install into a folder downloaded from GitHub. Download DockOver from GitHub instead.");
+        return Fail(releaseLayout ? L"This update package does not fit this DockOver folder."
+                                  : L"This DockOver folder is a development copy. Release packages install into a folder downloaded from GitHub.");
+    }
+    const std::wstring prefix = releaseLayout ? L"runtime\\" : L"";
+    for (const auto* name : {L"liquiddesktopmanager.exe", L"liquiddock.exe", L"liquidmenubar.exe",
+                             L"liquiddesktopsettings.exe", L"docky-updater.exe", L"docky-bubble.exe",
+                             L"dockdrop-pc\\dockdroppc.exe", L"dockdrop-pc\\dockdroppc.dll",
+                             L"dockdrop-pc\\dockdroppc.deps.json", L"dockdrop-pc\\dockdroppc.runtimeconfig.json",
+                             L"docky-now-playing.exe", L"applications-menu\\dockoverapplications.exe"}) {
+        if (!contains(prefix + name)) {
+            RemoveTree(stage);
+            return Fail(L"The update package is missing " + prefix + name + L".");
+        }
+    }
+    if (!contains(L"manifest.txt") ||
+        (releaseLayout && (!contains(L"dockover.exe") || !contains(L"dockover desktop.exe")))) {
+        RemoveTree(stage);
+        return Fail(L"The update package is missing its manifest or suite launchers.");
     }
     Log(L"staged %zu files", files.size());
 
-    // 2. Close docky.
+    // 2. Close the exact copies this update will replace. The Manager handles taskbar recovery and its children.
     if (waitPid) {
         if (HANDLE p = OpenProcess(SYNCHRONIZE, FALSE, waitPid)) {
-            if (WaitForSingleObject(p, 30000) != WAIT_OBJECT_0) Log(L"caller %lu still running after 30 s", waitPid);
+            WaitForSingleObject(p, 2000);
             CloseHandle(p);
         }
     }
-    // Only a Manager started from this folder is asked to quit (and restarted): another docky copy is left alone.
-    bool wasRunning = false;
-    for (const auto& r : RunningIn(dir))
-        if (Lower(r).rfind(L"liquiddesktopmanager.exe ", 0) == 0) wasRunning = true;
+    auto running = RunningIn(dir, executables);
+    const std::wstring managerName = prefix + L"liquiddesktopmanager.exe";
+    const std::wstring desktopName = releaseLayout ? L"dockover desktop.exe" : L"dockoverdesktop.exe";
+    const auto isRunning = [&](const std::wstring& relative) {
+        return std::any_of(running.begin(), running.end(), [&](const Process& p) { return p.relativePath == relative; });
+    };
+    const bool wasRunning = isRunning(managerName);
+    const bool desktopWasRunning = isRunning(desktopName);
+    CloseRequest request{running, wasRunning, true};
     if (wasRunning) {
         if (HANDLE quit = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Local\\LiquidDesktopManagerQuitV1")) {
             SetEvent(quit);
             CloseHandle(quit);
             Log(L"asked DockOver to quit");
-        } else Log(L"DockOver is running but its quit event is unavailable (error %lu)", GetLastError());
+        } else Log(L"DockOver quit event unavailable (error %lu)", GetLastError());
     }
-    const bool desktopWasRunning = AskDesktopToQuit(dir) > 0;
-    if (desktopWasRunning) Log(L"asked DockOver Desktop to quit");
-    const std::wstring desktopExe = Exists(dir + L"\\DockOver Desktop.exe") ? dir + L"\\DockOver Desktop.exe" : dir + L"\\DockOverDesktop.exe";
-    auto restart = [&] {
-        if (wasRunning) Start(programs + L"\\LiquidDesktopManager.exe", L"", programs, CREATE_NO_WINDOW);
-        if (desktopWasRunning && Exists(desktopExe)) Start(desktopExe, L"", dir, 0);
+    const auto restart = [&] {
+        if (wasRunning && !isRunning(managerName)) Start(programs + L"\\LiquidDesktopManager.exe", L"", programs, CREATE_NO_WINDOW);
+        if (desktopWasRunning && !isRunning(desktopName)) Start(dir + L"\\" + desktopName, L"", dir, 0);
+        if (!request.dockDropArgs.empty() && !isRunning(prefix + L"docky-bubble.exe"))
+            Start(programs + L"\\docky-bubble.exe", request.dockDropArgs, programs, 0);
+        if (request.nowPlaying && !IsWindow(request.nowPlaying))
+            Start(programs + L"\\docky-now-playing.exe", L"", programs, 0);
     };
-    std::vector<std::wstring> running;
-    for (int i = 0; i < 120; ++i) {  // up to 60 s
-        running = RunningIn(dir);
-        if (running.empty()) break;
-        Sleep(500);
+    const auto started = GetTickCount64();
+    while (!running.empty()) {
+        request.managerOwnsCore = isRunning(managerName) && GetTickCount64() - started < 12000;
+        RequestAuxiliaryExit(request);
+        request.remember = false;
+        if (GetTickCount64() - started >= 25000) break;
+        Sleep(300);
+        running = RunningIn(dir, executables);
     }
     if (!running.empty()) {
         std::wstring list;
-        for (const auto& r : running) list += L"\n  " + r;
+        for (const auto& p : running) list += L"\n  " + p.relativePath + L" (" + std::to_wstring(p.pid) + L")";
         Log(L"still running:%ls", list.c_str());
         RemoveTree(stage);
-        if (RunningIn(dir).empty()) restart();
-        return Fail(L"These DockOver programs did not close, so the update was not installed:" + list);
+        restart();
+        return Fail(L"Close these DockOver programs or let their transfers finish, then retry the update:" + list);
     }
 
     // 3. Replace.
@@ -325,7 +418,11 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     DeleteFileW(zip.c_str());
     Log(L"installed %zu files", done.size());
 
-    // 4. Start again.
+    // 4. Register the installed suite and restart the components.
+    if (releaseLayout) {
+        docky::suite::Register(dir);
+        docky::suite::StopStandaloneWindows();
+    }
     restart();
     if (reopenSettings) Start(programs + L"\\LiquidDesktopSettings.exe", L"--page about", programs, 0);
     Log(L"done (DockOver %ls, DockOver Desktop %ls)", wasRunning ? L"restarted" : L"was not running",

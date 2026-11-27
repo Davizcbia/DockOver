@@ -28,6 +28,12 @@
 /dist/
 *.update-old
 *.staging/
+*.stage-*/
+
+# .NET and Wrangler local build/state output
+/dockui/tools/dockdrop-pc/bin/
+/dockui/tools/dockdrop-pc/obj/
+.wrangler/
 
 # Older copy of the sources (dockui is current)
 /upload/

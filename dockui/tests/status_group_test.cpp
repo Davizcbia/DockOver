@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 #include <cmath>
 #include <cstdio>
+#include <string_view>
 using Microsoft::WRL::ComPtr;
 
 using namespace dock::statusgroup;
@@ -99,6 +100,13 @@ int wmain(int argc, wchar_t** argv) {
     CHECK(WidthFactor(Cells{L"a", L"b", L"c", L"d", L"e"}) == 1.5f);
     // The combined status cell is a whole icon.
     CHECK(WidthFactor(Cells{L"combo"}) == 1.f);
+    CHECK(WidthFactor({L"system"}) == 3.f && StandaloneCell(L"system"));
+    const D2D1_RECT_F system{0,0,150,50};
+    CHECK(std::wstring_view(SystemStatusPart(system,{10,25})) == L"wifi");
+    CHECK(std::wstring_view(SystemStatusPart(system,{33,25})) == L"sound");
+    CHECK(std::wstring_view(SystemStatusPart(system,{55,25})) == L"battery");
+    CHECK(std::wstring_view(SystemStatusPart(system,{75,25})) == L"bluetooth");
+    CHECK(std::wstring_view(SystemStatusPart(system,{120,25})) == L"digital");
     CHECK(WidthFactor(Cells{L"combo", L"control", L"clock"}) == 1.5f);
     CHECK(WidthFactor(Cells{L"combo", L"control", L"clock", L"input"}) == 2.f);
     CHECK(WidthFactor(Cells{L"analog"}) == 1.f && WidthFactor(Cells{L"date"}) == 1.f && StandaloneCell(L"analog") && StandaloneCell(L"date") && !StandaloneCell(L"clock"));

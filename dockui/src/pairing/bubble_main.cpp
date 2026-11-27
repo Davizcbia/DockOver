@@ -39,6 +39,7 @@ using docky::pairing::Ui;
 #include <vector>
 #include <functional>
 
+#include "../suite_install.h"
 #include "../desktop/duplication.h"
 #include "../vblank.h"
 #include "bubble_ps.h"
@@ -1458,14 +1459,8 @@ class App {
 public:
     bool Init() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        const auto displayAdapter = docky::DisplayAdapter(MonitorFromWindow(g_wnd, MONITOR_DEFAULTTONEAREST));
-        const HRESULT displayDevice = displayAdapter
-            ? D3D11CreateDevice(displayAdapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev_, nullptr, &ctx_)
-            : E_FAIL;
-        if (FAILED(displayDevice) &&
-            FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &dev_, nullptr, &ctx_))) return false;
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                                             &dev_, nullptr, &ctx_))) return false;
         ComPtr<IDXGIDevice1> dxgi;
         if (FAILED(dev_.As(&dxgi))) return false;
         dxgi->SetMaximumFrameLatency(1);
@@ -2529,6 +2524,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
 #endif
+    static const UINT updateQuit = RegisterWindowMessageW(L"DockOver.Update.Quit");
+    if (updateQuit && msg == updateQuit) {
+#ifdef DOCKY_PHONE_PAIRING
+        // Leave active transfers running. The updater retries the request until its deadline.
+        if ((g_transferring && g_finishedAt < 0) ||
+            (g_pcOffer && g_pcOffer->accepted && !g_pcOffer->Terminal())) return 0;
+        if (g_pcOffer) { ClosePcBall(); return 0; }
+#endif
+        g_quit = true;
+        return 0;
+    }
     switch (msg) {
 #ifdef DOCKY_PHONE_PAIRING
     case kTrayCallback: {
@@ -3004,6 +3010,23 @@ int RunPcBallSession(HINSTANCE instance, docky::pairing::pc_receive::Offer& offe
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+#ifdef DOCKDROP_STANDALONE
+    if (docky::suite::Active()) {
+        int count = 0;
+        auto args = CommandLineToArgvW(GetCommandLineW(), &count);
+        const std::wstring_view action = count > 1 ? args[1] : L"";
+        std::wstring forward;
+        if (action.empty() || action == L"--discover") forward = L"--discover";
+        else if (action == L"--pair-phone" || action == L"--background") forward = action;
+        else if (action == L"--send-file" && count == 3 && !wcschr(args[2], L'"'))
+            forward = L"--send-file \"" + std::wstring(args[2]) + L"\"";
+        const bool background = action == L"--background";
+        if (args) LocalFree(args);
+        if (!forward.empty() && !docky::suite::Launch(docky::suite::InstalledRoot(), L"docky-bubble.exe", forward) && !background)
+            MessageBoxW(nullptr, L"Open DockDrop from DockOver.\n请从 DockOver 打开 DockDrop。", L"DockOver", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+#endif
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     int argc = 0; wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
@@ -3235,7 +3258,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
 #endif
+#ifdef DOCKDROP_STANDALONE
+    ULONGLONG lastSuiteCheck = 0;
+#endif
     while (!g_quit) {
+#ifdef DOCKDROP_STANDALONE
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastSuiteCheck >= 3000 && (!g_transferring || g_finishedAt >= 0)) {
+            lastSuiteCheck = now;
+            if (docky::suite::Active()) break;
+        }
+#endif
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
 #ifdef DOCKY_PHONE_PAIRING

@@ -22,6 +22,8 @@
 #include "../ui_language.h"
 #include "artwork_source.h"
 #include "audio_beat.h"
+#include "display_adapter.h"
+#include "../suite_install.h"
 #include "../music_wallpaper_frame.h"
 #include "../color_output.h"
 #include "lyrics_source.h"
@@ -1360,8 +1362,7 @@ struct Gpu {
     bool Init() {
         const UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
-        HRESULT hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags, levels, 3, D3D11_SDK_VERSION, &device, nullptr, &context);
-        if (FAILED(hr)) hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, flags, levels, 3, D3D11_SDK_VERSION, &device, nullptr, &context);
+        HRESULT hr = docky::CreateRenderDevice(flags, levels, 3, &device, nullptr, &context);
         if (FAILED(hr)) return false;
         ComPtr<ID3D10Multithread> mt; if (SUCCEEDED(device.As(&mt))) mt->SetMultithreadProtected(TRUE);
         if (SUCCEEDED(MFCreateDXGIDeviceManager(&mfToken, &mfManager))) mfManager->ResetDevice(device.Get(), mfToken);
@@ -2445,6 +2446,7 @@ bool App::SavePng(ID2D1DeviceContext* dc, ID2D1Bitmap1* target, UINT w, UINT h, 
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+    if (docky::suite::Active() && docky::suite::StandaloneMusicRuntime(docky::suite::ProcessImage(GetCurrentProcessId()))) return 0;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int argc = 0; LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     auto arg = [&](const wchar_t* name) -> std::wstring { for (int i = 1; i + 1 < argc; ++i) if (!wcscmp(argv[i], name)) return argv[i + 1]; return {}; };

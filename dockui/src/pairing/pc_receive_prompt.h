@@ -162,6 +162,11 @@ inline LRESULT CALLBACK WndProc(HWND window, UINT message, WPARAM wp, LPARAM lp)
     }
     auto* offer = reinterpret_cast<Offer*>(GetWindowLongPtrW(window, GWLP_USERDATA));
     if (!offer) return DefWindowProcW(window, message, wp, lp);
+    static const UINT updateQuit = RegisterWindowMessageW(L"DockOver.Update.Quit");
+    if (updateQuit && message == updateQuit) {
+        if (offer->accepted && !offer->Terminal()) return 0;
+        message = WM_CLOSE;
+    }
     switch (message) {
     case WM_PAINT: Paint(window, *offer); return 0;
     case WM_ERASEBKGND: return 1;
