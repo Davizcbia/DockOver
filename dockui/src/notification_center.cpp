@@ -1,4 +1,5 @@
 #include "notification_center.h"
+#include "display_adapter.h"
 #include "color_output.h"
 #include "ui_language.h"
 #include "notification_card_metrics.h"
@@ -425,7 +426,7 @@ HRESULT EnsureDevice() {
     if (g.d3d && g.d3d->GetDeviceRemovedReason() != S_OK) { g.d3d.Reset(); g.ctx.Reset(); }
     if (g.d3d) return S_OK;
     const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    return D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &g.d3d,
+    return docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, &g.d3d,
                              nullptr, &g.ctx);
 }
 

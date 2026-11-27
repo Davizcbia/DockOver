@@ -250,9 +250,11 @@ LRESULT CALLBACK OverlayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+std::unordered_map<HWND, ULONGLONG> g_stageMinimizes;  // 0 while parked, then a restore deadline
+
 // A minimized window gets its Dock tile (`animate`: play the Genie once the tile has a place).
 void Add(HWND w, bool animate) {
-    if (g_entries.count(w) || !Dockable(w)) return;
+    if (StageOwnsMinimize(w) || g_entries.count(w) || !Dockable(w)) return;
     if (!g_covered&&!g_gameMode&&!IsWindowVisible(g_overlay)) ShowWindow(g_overlay, SW_SHOWNOACTIVATE);  // hidden in game mode
     Entry e; e.window = w; e.normal = NormalRect(w);e.addedAt=GetTickCount64();
     if(SUCCEEDED(DwmRegisterThumbnail(g_overlay,w,&e.tile)))DwmQueryThumbnailSourceSize(e.tile,&e.source);
@@ -272,6 +274,7 @@ void CALLBACK OnEvent(HWINEVENTHOOK, DWORD event, HWND w, LONG object, LONG chil
     if (event == EVENT_SYSTEM_MINIMIZESTART) {
         Add(w, true);
     } else if (event == EVENT_SYSTEM_MINIMIZEEND) {
+        g_stageMinimizes.erase(w);
         auto it = g_entries.find(w);
         if (it != g_entries.end() && it->second.direction >= 0) { DLOG(L"minimize: restored elsewhere"); Remove(w, true); }  // taskbar, Alt+Tab
     }
@@ -348,7 +351,25 @@ void Restore(HWND window) {
     Remove(window, true);
 }
 
+void StagePark(HWND window) {
+    g_stageMinimizes[window] = 0;
+    Remove(window, true);
+}
+
+void StageRestore(HWND window) {
+    if (auto it = g_stageMinimizes.find(window); it != g_stageMinimizes.end())
+        it->second = GetTickCount64() + 1200;
+}
+
+bool StageOwnsMinimize(HWND window) {
+    return g_stageMinimizes.count(window) != 0;
+}
+
 void Prune() {
+    const auto now = GetTickCount64();
+    std::erase_if(g_stageMinimizes, [&](const auto& entry) {
+        return !IsWindow(entry.first) || (entry.second && now >= entry.second);
+    });
     std::vector<HWND> gone;
     for (auto& [w, e] : g_entries) {
         if (e.direction) continue;

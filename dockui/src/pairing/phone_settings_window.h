@@ -1,10 +1,15 @@
 #pragma once
+#include "../display_adapter.h"
+#include "../vblank.h"
 
 #include <windows.h>
+#include <commctrl.h>
+#include <windowsx.h>
 #include <dwmapi.h>
 #include <gdiplus.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -57,7 +62,18 @@ struct Window {
     HWND dialog = nullptr;
     HWND frame = nullptr;  // anti-aliased rounded backing and shadow behind the dialog (see PlaceFrame)
     PairingGlass glass;
-    std::map<UINT, std::vector<uint32_t>> glassPixels;
+    std::vector<uint32_t> backdrop;
+    int backdropWidth = 0, backdropHeight = 0;
+    bool reducedMotion = false;
+    struct SwitchMotion {
+        float from = 0, to = 0, pressFrom = 0, pressTo = 0, dragPosition = 0;
+        ULONGLONG slideAt = 0, pressAt = 0;
+        int pointerDownX = 0;
+        float pointerDownPosition = 0;
+        bool pointerDown = false, dragging = false;
+    } switches[2];
+
+    docky::vblank::Ticker switchTicker;
 
     ~Window() {
         if (frame) DestroyWindow(frame);
@@ -78,11 +94,11 @@ inline Gdiplus::Color Color(COLORREF value) {
     return Gdiplus::Color(255, GetRValue(value), GetGValue(value), GetBValue(value));
 }
 
-inline void Rounded(Gdiplus::Graphics& graphics, const RECT& bounds, int radius, COLORREF fill,
+inline void Rounded(Gdiplus::Graphics& graphics, const RECT& bounds, int radius, Gdiplus::Color fill,
                     COLORREF border = CLR_INVALID) {
     const auto width = static_cast<float>(bounds.right - bounds.left), height = static_cast<float>(bounds.bottom - bounds.top);
     const float x = static_cast<float>(bounds.left) + 0.5f, y = static_cast<float>(bounds.top) + 0.5f;
-    const auto diameter = static_cast<float>(radius * 2);
+    const auto diameter = std::max(1.0f, std::min({static_cast<float>(radius * 2), width - 1, height - 1}));
     const float right = x + width - 1.0f, bottom = y + height - 1.0f;
     Gdiplus::GraphicsPath path;
     path.AddArc(x, y, diameter, diameter, 180, 90);
@@ -90,8 +106,58 @@ inline void Rounded(Gdiplus::Graphics& graphics, const RECT& bounds, int radius,
     path.AddArc(right - diameter, bottom - diameter, diameter, diameter, 0, 90);
     path.AddArc(x, bottom - diameter, diameter, diameter, 90, 90);
     path.CloseFigure();
-    Gdiplus::SolidBrush brush(Color(fill));
+    Gdiplus::SolidBrush brush(fill);
     graphics.FillPath(&brush, &path);
+    if (border != CLR_INVALID) {
+        Gdiplus::Pen pen(Color(border));
+        graphics.DrawPath(&pen, &path);
+    }
+}
+
+inline void Rounded(Gdiplus::Graphics& graphics, const RECT& bounds, int radius, COLORREF fill,
+                    COLORREF border = CLR_INVALID) {
+    Rounded(graphics, bounds, radius, Color(fill), border);
+}
+
+inline Gdiplus::Color Tint(COLORREF color, BYTE alpha) {
+    return Gdiplus::Color(alpha, GetRValue(color), GetGValue(color), GetBValue(color));
+}
+
+inline void ContinuousPath(Gdiplus::GraphicsPath& path, float x, float y, float width, float height, float radius) {
+    // The same n=3 superellipse corner profile as the main DockOver Settings window.
+    constexpr int segments = 40;
+    static const auto quadrant = [] {
+        std::array<Gdiplus::PointF, segments + 1> profile{};
+        for (int i = 0; i <= segments; ++i) {
+            const float t = 1.57079632679f * i / segments;
+            profile[i] = {1.f - std::pow(std::max(0.f, std::sin(t)), 2.f / 3.f),
+                          1.f - std::pow(std::max(0.f, std::cos(t)), 2.f / 3.f)};
+        }
+        profile.front() = {1, 0};
+        profile.back() = {0, 1};
+        return profile;
+    }();
+    const float r = std::min({radius, width * .5f, height * .5f});
+    const float right = x + width, bottom = y + height;
+    std::array<Gdiplus::PointF, (segments + 1) * 4> points;
+    for (int i = 0; i <= segments; ++i) {
+        const auto a = r * quadrant[i].X, b = r * quadrant[i].Y;
+        points[i] = {right - a, y + b};
+        points[i + segments + 1] = {right - b, bottom - a};
+        points[i + 2 * (segments + 1)] = {x + a, bottom - b};
+        points[i + 3 * (segments + 1)] = {x + b, y + a};
+    }
+    path.AddPolygon(points.data(), static_cast<INT>(points.size()));
+}
+
+inline void PaintPlate(Gdiplus::Graphics& graphics, const RECT& bounds, int radius, Gdiplus::Color color,
+                       COLORREF border = CLR_INVALID) {
+    Gdiplus::GraphicsPath path;
+    ContinuousPath(path, bounds.left + .5f, bounds.top + .5f,
+        static_cast<float>(bounds.right - bounds.left - 1), static_cast<float>(bounds.bottom - bounds.top - 1),
+        static_cast<float>(radius));
+    Gdiplus::SolidBrush fill(color);
+    graphics.FillPath(&fill, &path);
     if (border != CLR_INVALID) {
         Gdiplus::Pen pen(Color(border));
         graphics.DrawPath(&pen, &path);
@@ -114,75 +180,205 @@ inline void UpdateToggleName(HWND toggle, bool on) {
     SetWindowTextW(toggle, name.c_str());
 }
 
-inline bool PaintGlass(HDC dc, Window& model, RECT bounds, UINT id = 0, bool focused = false, bool pressed = false) {
-    const bool toggle = id == kPcBubbleSwitch || id == kBackgroundSwitch;
-    const bool on = toggle && (id == kPcBubbleSwitch ? model.pcBubble : model.background);
-    auto& pixels = model.glassPixels[id * 8 + (on ? 4 : 0) + (focused ? 2 : 0) + (pressed ? 1 : 0)];
-    const float dpi = static_cast<float>(model.scale);
-    if (pixels.empty() && !model.glass.CopyLayers(bounds, pixels, [&](ID3D11RenderTargetView* target) {
-        const auto draw = [&](RECT rect, dock::GlassParameters params, bool interactive = false) {
-            if (rect.right <= bounds.left || rect.left >= bounds.right ||
-                rect.bottom <= bounds.top || rect.top >= bounds.bottom) return true;
-            return model.glass.Draw(target, dpi, {rect.left/dpi, rect.top/dpi, rect.right/dpi, rect.bottom/dpi},
-                params, (rect.left + rect.right) * 0.5f, (rect.top + rect.bottom) * 0.5f,
-                interactive && focused, interactive && pressed, &bounds);
-        };
-        auto card = PairingGlass::PanelMaterial();
-        card.radius = 18;
-        if (!draw(model.Rect(24,115,472,111), card) ||
-            !draw(model.Rect(24,243,472,70), card) ||
-            !draw(model.Rect(24,329,472,70), card) ||
-            !draw(model.Rect(24,kDeviceTop,472,model.Height()-kDeviceTop-25), card)) return false;
-        auto tile = PairingGlass::ControlMaterial(40);
-        tile.radius = 12;
-        if (!draw(model.Rect(43,134,40,40), tile)) return false;
-        for (size_t i = 0; i < model.phones.size(); ++i)
-            if (!draw(model.Rect(43,kDeviceTop+8+static_cast<int>(i)*kRowHeight,40,40), tile)) return false;
-        if (id == 0 || id == kFolderPath) return true;
-        if (!toggle) {
-            auto button = PairingGlass::ControlMaterial((bounds.bottom-bounds.top)/dpi);
-            button.radius = 12;
-            auto plate = bounds;
-            InflateRect(&plate, -1, -1);
-            return draw(plate, button, true);
+struct Dib {
+    BITMAPINFO info{};
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ old = nullptr;
+    uint32_t* pixels = nullptr;
+
+    Dib(HDC compatible, int width, int height) {
+        info.bmiHeader = {sizeof(BITMAPINFOHEADER), width, -height, 1, 32, BI_RGB};
+        dc = CreateCompatibleDC(compatible);
+        void* bits = nullptr;
+        bitmap = CreateDIBSection(compatible, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        if (dc && bitmap) {
+            old = SelectObject(dc, bitmap);
+            pixels = static_cast<uint32_t*>(bits);
         }
-        const auto local = [&](int x,int y,int w,int h) {
-            RECT r = model.Rect(x,y,w,h);
-            OffsetRect(&r,bounds.left,bounds.top);
-            return r;
-        };
-        auto track = PairingGlass::ControlMaterial(24);
-        track.radius = 12;
-        if (on) {
-            track.tintR = GetRValue(model.color.accent) / 255.0f;
-            track.tintG = GetGValue(model.color.accent) / 255.0f;
-            track.tintB = GetBValue(model.color.accent) / 255.0f;
-            track.tintStrength = 1.0f;
+    }
+    ~Dib() {
+        if (old) SelectObject(dc, old);
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+    }
+};
+
+inline void CaptureBackdrop(Window& model, const RECT& screenRect) {
+    const int w = (screenRect.right - screenRect.left) / 8, h = (screenRect.bottom - screenRect.top) / 8;
+    if (w < 8 || h < 8 || model.color.top == model.color.bottom) return;
+    BOOL transparency = TRUE;
+    DWORD size = sizeof(transparency);
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        L"EnableTransparency", RRF_RT_REG_DWORD, nullptr, &transparency, &size);
+    if (!transparency) return;
+
+    HDC screen = GetDC(nullptr);
+    if (!screen) return;
+    Dib capture(screen, w, h);
+    if (capture.pixels) {
+        SetStretchBltMode(capture.dc, HALFTONE);
+        if (StretchBlt(capture.dc, 0, 0, w, h, screen, screenRect.left, screenRect.top,
+                screenRect.right - screenRect.left, screenRect.bottom - screenRect.top, SRCCOPY | CAPTUREBLT)) {
+            GdiFlush();
+            const size_t count = static_cast<size_t>(w) * h;
+            std::vector<uint32_t> horizontal(count);
+            model.backdrop.resize(count);
+            const int radius = std::clamp(model.Dip(28) / 8, 2, 9);
+            const auto pass = [&](const uint32_t* source, uint32_t* dest, bool vertical) {
+                for (int y = 0; y < h; ++y) {
+                    for (int x = 0; x < w; ++x) {
+                        int r = 0, g = 0, b = 0;
+                        for (int tap = -radius; tap <= radius; ++tap) {
+                            const int px = vertical ? x : std::clamp(x + tap, 0, w - 1);
+                            const int py = vertical ? std::clamp(y + tap, 0, h - 1) : y;
+                            const auto value = source[static_cast<size_t>(py) * w + px];
+                            r += (value >> 16) & 255;
+                            g += (value >> 8) & 255;
+                            b += value & 255;
+                        }
+                        const int taps = radius * 2 + 1;
+                        dest[static_cast<size_t>(y) * w + x] = 0xff000000u |
+                            (r / taps << 16) | (g / taps << 8) | b / taps;
+                    }
+                }
+            };
+            pass(capture.pixels, horizontal.data(), false);
+            pass(horizontal.data(), model.backdrop.data(), true);
+            const auto tint = model.color.top;
+            for (auto& pixel : model.backdrop) {
+                const auto mix = [](uint32_t blur, uint32_t color) { return (blur * 3 + color * 7) / 10; };
+                pixel = 0xff000000u | (mix((pixel >> 16) & 255, GetRValue(tint)) << 16) |
+                    (mix((pixel >> 8) & 255, GetGValue(tint)) << 8) | mix(pixel & 255, GetBValue(tint));
+            }
+            model.backdropWidth = w;
+            model.backdropHeight = h;
         }
-        auto thumb = PairingGlass::ControlMaterial(18.0f);
-        const int thumbWidth = pressed ? std::clamp(static_cast<int>(std::lround(18 * thumb.switchPressWidth)), 18, 28) : 18;
-        const int thumbHeight = pressed ? std::clamp(static_cast<int>(std::lround(18 * thumb.switchPressHeight)), 18, 32) : 18;
-        thumb.radius = thumbHeight * 0.5f;
-        thumb.tintR = thumb.tintG = thumb.tintB = model.color.top == RGB(39,42,51) ? 1.0f : 0.38f;
-        thumb.tintStrength = pressed ? 0.40f : 1.0f;
-        thumb.glare = pressed ? thumb.glare : 1.2f;
-        const int x = on ? 27 : 6;
-        return draw(local(3,5,46,24), track, true) &&
-            draw(local(x+(18-thumbWidth)/2,(34-thumbHeight)/2,thumbWidth,thumbHeight), thumb, true);
-    })) return false;
-    BITMAPINFO bitmap{};
-    bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bitmap.bmiHeader.biWidth = bounds.right-bounds.left;
-    bitmap.bmiHeader.biHeight = -(bounds.bottom-bounds.top);
-    bitmap.bmiHeader.biPlanes = 1;
-    bitmap.bmiHeader.biBitCount = 32;
-    bitmap.bmiHeader.biCompression = BI_RGB;
-    return SetDIBitsToDevice(dc, 0, 0, bitmap.bmiHeader.biWidth, -bitmap.bmiHeader.biHeight, 0, 0, 0,
-        -bitmap.bmiHeader.biHeight, pixels.data(), &bitmap, DIB_RGB_COLORS) != 0;
+    }
+    ReleaseDC(nullptr, screen);
 }
 
-inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int y, bool folder, bool glass) {
-    if (!glass) Rounded(canvas, model.Rect(x, y, 40, 40), model.Dip(12), model.color.tint);
+inline void PaintBase(HDC dc, const Window& model, int left = 0, int top = 0) {
+    auto bounds = model.Rect(0, 0, kWidth, model.Height());
+    const int width = bounds.right, height = bounds.bottom;
+    OffsetRect(&bounds, left, top);
+    if (!model.backdrop.empty()) {
+        BITMAPINFO image{};
+        image.bmiHeader = {sizeof(BITMAPINFOHEADER), model.backdropWidth, -model.backdropHeight, 1, 32, BI_RGB};
+        const int previous = SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        StretchDIBits(dc, left, top, width, height, 0, 0, model.backdropWidth, model.backdropHeight,
+            model.backdrop.data(), &image, DIB_RGB_COLORS, SRCCOPY);
+        SetStretchBltMode(dc, previous);
+    } else {
+        const HBRUSH fill = CreateSolidBrush(model.color.top);
+        FillRect(dc, &bounds, fill);
+        DeleteObject(fill);
+    }
+
+    Gdiplus::Graphics canvas(dc);
+    canvas.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    const bool contrast = model.color.top == model.color.bottom;
+    const auto fill = Tint(model.color.surface, contrast ? 255 : 108);
+    const auto edge = contrast ? model.color.edge : CLR_INVALID;
+    const auto card = [&](int y, int h) {
+        auto rect = model.Rect(24, y, 472, h);
+        OffsetRect(&rect, left, top);
+        PaintPlate(canvas, rect, model.Dip(18), fill, edge);
+    };
+    card(115, 111);
+    card(243, 70);
+    card(329, 70);
+    card(kDeviceTop, model.Height() - kDeviceTop - 25);
+}
+
+
+constexpr float kTrackWidth = 46.4f, kTrackHeight = 20.0f;
+constexpr float kThumbWidth = 29.6f, kThumbHeight = 17.6f, kThumbTravel = 14.4f;
+
+inline Window::SwitchMotion& Motion(Window& model, UINT id) { return model.switches[id == kBackgroundSwitch]; }
+inline bool SwitchOn(const Window& model, UINT id) { return id == kPcBubbleSwitch ? model.pcBubble : model.background; }
+
+inline float SwitchAmount(float from, float to, ULONGLONG start, ULONGLONG now, float duration, bool back = false) {
+    if (from == to) return to;
+    const float t = std::clamp(static_cast<float>(now - start) / duration, 0.0f, 1.0f);
+    const float x = t - 1.0f;
+    const float eased = back ? 1.0f + 2.65f * x * x * x + 0.65f * x * x : 1.0f + x * x * x;
+    return std::clamp(std::lerp(from, to, eased), 0.0f, 1.0f);
+}
+
+inline void PaintSwitch(const DRAWITEMSTRUCT& item, Window& model, const RECT& bounds, bool focused, bool active) {
+    auto& motion = Motion(model, item.CtlID);
+    const auto now = docky::vblank::AnimationMillis();
+    const bool on = SwitchOn(model, item.CtlID);
+    const bool contrast = model.color.top == model.color.bottom;
+    const bool dark = GetRValue(model.color.top) < 128;
+    const float position = motion.dragging ? motion.dragPosition :
+        SwitchAmount(motion.from, motion.to, motion.slideAt, now, 420, true);
+    const float press = model.reducedMotion ? (active ? 1.0f : 0.0f) :
+        SwitchAmount(motion.pressFrom, motion.pressTo, motion.pressAt, now, 150);
+    const float dpi = static_cast<float>(model.scale);
+    const int width = item.rcItem.right - item.rcItem.left, height = item.rcItem.bottom - item.rcItem.top;
+    const float cx = width * 0.5f, cy = height * 0.5f;
+    const auto rect = [](float x, float y, float w, float h) -> RECT {
+        return {std::lround(x - w * .5f), std::lround(y - h * .5f), std::lround(x + w * .5f), std::lround(y + h * .5f)};
+    };
+    const auto track = rect(cx, cy, kTrackWidth * dpi, kTrackHeight * dpi);
+    const COLORREF trackColor = contrast ? (on ? model.color.text : model.color.surface)
+        : (on ? RGB(96, 199, 95) : dark ? RGB(75, 75, 77) : RGB(218, 218, 218));
+    const auto drawTrack = [&](HDC dc) {
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        Rounded(graphics, track, model.Dip(10), trackColor, contrast ? model.color.text : CLR_INVALID);
+    };
+    Dib frame(item.hDC, width, height);
+    const HDC dc = frame.pixels ? frame.dc : item.hDC;
+    PaintBase(dc, model, -bounds.left, -bounds.top);
+    drawTrack(dc);
+
+    const float thumbCenter = cx + (position - .5f) * kThumbTravel * dpi;
+    const auto resting = rect(thumbCenter, cy, kThumbWidth * dpi, kThumbHeight * dpi);
+    bool lensDrawn = false;
+    if (frame.pixels && press > .001f && !contrast) {
+        const auto controls = dock::ControlLensGlass(kThumbHeight);
+        const float expand = model.reducedMotion ? 0.0f : press;
+        const float w = kThumbWidth * std::lerp(1.0f, controls.switchPressWidth, expand);
+        const float h = kThumbHeight * std::lerp(1.0f, controls.switchPressHeight, expand);
+        auto lens = dock::ControlLensGlass(h);
+        lens.dark = dark;
+        lens.opacity = press;
+        lens.interactionStrength *= press;
+        GdiFlush();
+        const size_t count = static_cast<size_t>(width) * height;
+        for (size_t i = 0; i < count; ++i) frame.pixels[i] |= 0xff000000u;
+        std::vector<uint32_t> refracted;
+        POINT pointer{};
+        GetCursorPos(&pointer);
+        ScreenToClient(item.hwndItem, &pointer);
+        const float x = thumbCenter / dpi, y = cy / dpi;
+        if (model.glass.PreparePixels(width, height, frame.pixels) &&
+            model.glass.CopyLayers({0, 0, width, height}, refracted, [&](ID3D11RenderTargetView* target) {
+                return model.glass.Draw(target, dpi, {x-w*.5f, y-h*.5f, x+w*.5f, y+h*.5f},
+                    lens, static_cast<float>(pointer.x), static_cast<float>(pointer.y), true, true);
+            })) {
+            std::copy(refracted.begin(), refracted.end(), frame.pixels);
+            lensDrawn = true;
+        }
+    }
+    if (!lensDrawn || press < .999f) {
+        Gdiplus::Graphics graphics(dc);
+        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        const auto color = contrast ? (on ? model.color.surface : model.color.text) : RGB(255, 255, 255);
+        const auto alpha = static_cast<BYTE>(lensDrawn ? std::lround(255 * (1.0f - press)) : 255);
+        Rounded(graphics, resting, model.Dip(9), Tint(color, alpha));
+    }
+    if (focused) DrawFocusRect(dc, &item.rcItem);
+    // Publish the complete track, thumb and lens together, after the GPU readback.
+    if (frame.pixels) BitBlt(item.hDC, 0, 0, width, height, dc, 0, 0, SRCCOPY);
+}
+
+inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int y, bool folder) {
+    PaintPlate(canvas, model.Rect(x, y, 40, 40), model.Dip(12), Tint(model.color.tint, 150));
     Gdiplus::GraphicsState state = canvas.Save();
     canvas.TranslateTransform(static_cast<float>(model.Dip(x)), static_cast<float>(model.Dip(y)));
     canvas.ScaleTransform(static_cast<float>(model.scale), static_cast<float>(model.scale));
@@ -211,31 +407,16 @@ inline void IconTile(Gdiplus::Graphics& canvas, const Window& model, int x, int 
 inline void Paint(HWND window, Window& model) {
     PAINTSTRUCT ps{};
     HDC dc = BeginPaint(window, &ps);
-    RECT client{};
-    GetClientRect(window, &client);
     const auto& p = model.color;
-    const bool glass = PaintGlass(dc, model, client);
+    PaintBase(dc, model);
     {
         Gdiplus::Graphics graphics(dc);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        const Gdiplus::Rect bounds(0, 0, client.right, client.bottom);
-        Gdiplus::LinearGradientBrush background(bounds, Color(p.top), Color(p.bottom), Gdiplus::LinearGradientModeVertical);
-        const Gdiplus::REAL factors[]{0.0f, 0.0f, 1.0f};
-        const Gdiplus::REAL positions[]{0.0f, 78.0f / model.Height(), 1.0f};
-        background.SetBlend(factors, positions, ARRAYSIZE(factors));
-        if (!glass) {
-            graphics.FillRectangle(&background, bounds);
-            Rounded(graphics, model.Rect(24, 115, 472, 111), model.Dip(18), p.surface, p.edge);
-            Rounded(graphics, model.Rect(24, 243, 472, 70), model.Dip(18), p.surface, p.edge);
-            Rounded(graphics, model.Rect(24, 329, 472, 70), model.Dip(18), p.surface, p.edge);
-            Rounded(graphics, model.Rect(24, kDeviceTop, 472, model.Height() - kDeviceTop - 25),
-                model.Dip(18), p.surface, p.edge);
-        }
-        IconTile(graphics, model, 43, 134, true, glass);
-        Gdiplus::Pen separator(Color(p.edge));
+        IconTile(graphics, model, 43, 134, true);
+        Gdiplus::Pen separator(Tint(p.secondary, 44));
         for (size_t i = 0; i < model.phones.size(); ++i) {
             const int y = kDeviceTop + static_cast<int>(i) * kRowHeight;
-            IconTile(graphics, model, 43, y + 8, false, glass);
+            IconTile(graphics, model, 43, y + 8, false);
             if (i) graphics.DrawLine(&separator, model.Dip(100), model.Dip(y), model.Dip(476), model.Dip(y));
         }
     }
@@ -268,51 +449,35 @@ inline void PaintButton(const DRAWITEMSTRUCT& item, Window& model) {
     const auto& p = model.color;
     const bool close = item.CtlID == IDCLOSE;
     const bool remove = item.CtlID >= kFirstPhone;
-    const bool active = (item.itemState & ODS_SELECTED) != 0;
+    const bool toggle = item.CtlID == kPcBubbleSwitch || item.CtlID == kBackgroundSwitch;
+    const bool active = (item.itemState & ODS_SELECTED) != 0 || (toggle && Motion(model, item.CtlID).pointerDown);
     const bool focused = (item.itemState & ODS_FOCUS) != 0 && (item.itemState & ODS_NOFOCUSRECT) == 0;
     RECT bounds{};
     GetWindowRect(item.hwndItem, &bounds);
     MapWindowPoints(nullptr, model.dialog, reinterpret_cast<POINT*>(&bounds), 2);
-    const bool glass = PaintGlass(item.hDC, model, bounds, item.CtlID, focused, active);
-    if (!glass) {
-        auto brush = close ? CreateSolidBrush(p.top) : model.cardBrush;
-        FillRect(item.hDC, &item.rcItem, brush);
-        if (close) DeleteObject(brush);
+    if (toggle) {
+        PaintSwitch(item, model, bounds, focused, active);
+        return;
     }
+    PaintBase(item.hDC, model, -bounds.left, -bounds.top);
     if (item.CtlID == kFolderPath) {
         Label(item.hDC, model.folder.c_str(), item.rcItem, model.body, p.text,
             DT_SINGLELINE | DT_VCENTER | DT_PATH_ELLIPSIS | DT_NOPREFIX);
         return;
     }
-    if (item.CtlID == kPcBubbleSwitch || item.CtlID == kBackgroundSwitch) {
-        if (glass) {
-            if (focused) DrawFocusRect(item.hDC, &item.rcItem);
-            return;
-        }
-        const bool on = item.CtlID == kPcBubbleSwitch ? model.pcBubble : model.background;
-        Gdiplus::Graphics graphics(item.hDC);
-        graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        const auto dip = [&model](int n) { return model.Dip(n); };
-        const RECT track{dip(3), dip(5), dip(49), dip(29)};
-        Rounded(graphics, track, dip(12), on ? p.accent : p.edge, focused ? p.text : CLR_INVALID);
-        Gdiplus::SolidBrush thumb(Color(on ? p.top : p.text));
-        graphics.FillEllipse(&thumb, dip(on ? 27 : 6), dip(8), dip(18), dip(18));
-        return;
-    }
-    if (!glass) {
+    {
         Gdiplus::Graphics graphics(item.hDC);
         graphics.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         auto plate = item.rcItem;
         InflateRect(&plate, -1, -1);
-        Rounded(graphics, plate, model.Dip(12), active ? p.hover : remove ? p.surface : p.tint,
-            focused ? p.accent : p.edge);
+        PaintPlate(graphics, plate, model.Dip(12), Tint(active ? p.hover : p.tint, close || active ? 230 : 160),
+            focused || p.top == p.bottom ? p.accent : CLR_INVALID);
     }
     wchar_t title[128]{};
     if (remove) wcscpy_s(title, Ui(L"移除…"));
     else GetWindowTextW(item.hwndItem, title, ARRAYSIZE(title));
     Label(item.hDC, title, item.rcItem, model.action, remove ? p.remove : p.accent,
         DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
-    if (glass && focused) DrawFocusRect(item.hDC, &item.rcItem);
 }
 
 // A dialog with child controls cannot be a per-pixel-alpha window, and a window region alone is aliased (and turns off
@@ -337,34 +502,32 @@ inline void PaintFrame(const Window& model, int width, int height) {
             g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
             g.Clear(Gdiplus::Color(0, 0, 0, 0));
             const float r = static_cast<float>(model.Dip(kCornerRadius));
-            auto shape = [](Gdiplus::GraphicsPath& path, float x, float y, float w, float h, float radius) {
-                const float d = 2.0f * radius;
-                path.AddArc(x, y, d, d, 180, 90);
-                path.AddArc(x + w - d, y, d, d, 270, 90);
-                path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
-                path.AddArc(x, y + h - d, d, d, 90, 90);
-                path.CloseFigure();
-            };
             for (int k = s; k >= 1; --k) {  // soft shadow, slightly lower than the panel
                 const float t = 1.0f - static_cast<float>(k) / static_cast<float>(s);
                 Gdiplus::GraphicsPath ring;
-                shape(ring, static_cast<float>(s - k), static_cast<float>(s - k) + s * 0.25f, static_cast<float>(width + 2 * k),
+                ContinuousPath(ring, static_cast<float>(s - k), static_cast<float>(s - k) + s * 0.25f, static_cast<float>(width + 2 * k),
                       static_cast<float>(height + 2 * k), r + k);
                 Gdiplus::SolidBrush shade(Gdiplus::Color(static_cast<BYTE>(std::lround(10.0f * t * t)), 0, 0, 0));
                 g.FillPath(&shade, &ring);
             }
             Gdiplus::GraphicsPath panel;
-            shape(panel, static_cast<float>(s), static_cast<float>(s), static_cast<float>(width), static_cast<float>(height), r);
+            ContinuousPath(panel, static_cast<float>(s), static_cast<float>(s), static_cast<float>(width), static_cast<float>(height), r);
             const auto& p = model.color;
             const Gdiplus::Rect bounds(s, s, width, height);
-            Gdiplus::LinearGradientBrush background(bounds, Color(p.top), Color(p.bottom), Gdiplus::LinearGradientModeVertical);
-            const Gdiplus::REAL factors[]{0.0f, 0.0f, 1.0f};
-            const Gdiplus::REAL positions[]{0.0f, 78.0f / model.Height(), 1.0f};
-            background.SetBlend(factors, positions, ARRAYSIZE(factors));
+            Gdiplus::SolidBrush background(Color(p.top));
             g.FillPath(&background, &panel);
+            if (!model.backdrop.empty()) {
+                Gdiplus::Bitmap blurred(model.backdropWidth, model.backdropHeight, model.backdropWidth * 4,
+                    PixelFormat32bppRGB, reinterpret_cast<BYTE*>(const_cast<uint32_t*>(model.backdrop.data())));
+                const auto saved = g.Save();
+                g.SetClip(&panel);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBilinear);
+                g.DrawImage(&blurred, bounds, 0, 0, model.backdropWidth, model.backdropHeight, Gdiplus::UnitPixel);
+                g.Restore(saved);
+            }
             Gdiplus::GraphicsPath outline;
-            shape(outline, s + 0.5f, s + 0.5f, width - 1.0f, height - 1.0f, r - 0.5f);
-            Gdiplus::Pen pen(Color(p.edge), 1.0f);
+            ContinuousPath(outline, s + 0.5f, s + 0.5f, width - 1.0f, height - 1.0f, r - 0.5f);
+            Gdiplus::Pen pen(Tint(p.edge, 144), 1.0f);
             g.DrawPath(&pen, &outline);
         }
         RECT dialog{};
@@ -388,6 +551,104 @@ inline void PlaceFrame(HWND window, const Window& model) {
     SetWindowPos(model.frame, nullptr, r.left - s, r.top - s, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
+inline void AnimateSwitch(HWND control, Window& model) {
+    InvalidateRect(control, nullptr, FALSE);
+    if (!model.reducedMotion) model.switchTicker.Start(model.dialog, docky::vblank::kMsgVBlank);
+}
+
+inline void SetSwitchPress(HWND control, Window& model, bool pressed) {
+    auto& motion = Motion(model, GetDlgCtrlID(control));
+    const auto now = docky::vblank::AnimationMillis();
+    motion.pressFrom = SwitchAmount(motion.pressFrom, motion.pressTo, motion.pressAt, now, 150);
+    motion.pressTo = pressed ? 1.0f : 0.0f;
+    motion.pressAt = now;
+    AnimateSwitch(control, model);
+}
+
+inline void CommitSwitch(HWND control, Window& model, bool on) {
+    const UINT id = GetDlgCtrlID(control);
+    auto& checked = id == kBackgroundSwitch ? model.background : model.pcBubble;
+    auto& motion = Motion(model, id);
+    const auto now = docky::vblank::AnimationMillis();
+    motion.from = motion.dragging ? motion.dragPosition : SwitchAmount(motion.from, motion.to, motion.slideAt, now, 420, true);
+    motion.dragging = false;
+    bool failed = false;
+    if (on != checked) {
+        const char* key = id == kBackgroundSwitch ? "runInBackground" : "pcReceiveBubble";
+        failed = liquid::settings::WriteBool(model.settingsPath, "phonePairing", key, on) != liquid::settings::SaveStatus::Saved;
+        if (!failed) {
+            checked = on;
+            UpdateToggleName(control, on);
+        }
+    }
+    motion.to = checked ? 1.0f : 0.0f;
+    if (model.reducedMotion) motion.from = motion.to;
+    motion.slideAt = now;
+    AnimateSwitch(control, model);
+    if (failed) MessageBoxW(model.dialog, Ui(L"无法保存设置。"), L"DockDrop", MB_OK | MB_ICONWARNING);
+}
+
+inline LRESULT CALLBACK SwitchProc(HWND control, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR data) {
+    auto& model = *reinterpret_cast<Window*>(data);
+    const UINT id = GetDlgCtrlID(control);
+    auto& motion = Motion(model, id);
+    switch (message) {
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_LBUTTONDBLCLK:
+    case WM_LBUTTONDOWN:
+        SetFocus(control);
+        SetCapture(control);
+        motion.pointerDown = true;
+        motion.pointerDownX = GET_X_LPARAM(lp);
+        motion.pointerDownPosition = SwitchAmount(motion.from, motion.to, motion.slideAt, docky::vblank::AnimationMillis(), 420, true);
+        SetSwitchPress(control, model, true);
+        return 0;
+    case WM_MOUSEMOVE:
+        if (motion.pointerDown) {
+            const int delta = GET_X_LPARAM(lp) - motion.pointerDownX;
+            if (motion.dragging || std::abs(delta) >= GetSystemMetricsForDpi(SM_CXDRAG, GetDpiForWindow(control))) {
+                motion.dragging = true;
+                motion.dragPosition = std::clamp(motion.pointerDownPosition + delta / static_cast<float>(model.scale * kThumbTravel), 0.0f, 1.0f);
+            }
+            InvalidateRect(control, nullptr, FALSE);
+            return 0;
+        }
+        break;
+    case WM_LBUTTONUP:
+        if (motion.pointerDown) {
+            RECT bounds{};
+            GetClientRect(control, &bounds);
+            const POINT pointer{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const bool checked = SwitchOn(model, id);
+            const bool on = motion.dragging ? motion.dragPosition >= .5f : PtInRect(&bounds, pointer) ? !checked : checked;
+            motion.pointerDown = false;
+            ReleaseCapture();
+            SetSwitchPress(control, model, false);
+            CommitSwitch(control, model, on);
+            return 0;
+        }
+        break;
+    case WM_CAPTURECHANGED:
+        if (motion.pointerDown) {
+            motion.pointerDown = false;
+            SetSwitchPress(control, model, false);
+            CommitSwitch(control, model, SwitchOn(model, id));
+        }
+        break;
+    case WM_KEYDOWN:
+        if (wp == VK_SPACE && (lp & (1L << 30)) == 0) SetSwitchPress(control, model, true);
+        break;
+    case WM_KEYUP:
+        if (wp == VK_SPACE) SetSwitchPress(control, model, false);
+        break;
+    case WM_KILLFOCUS:
+        if (motion.pressTo > 0 && !motion.pointerDown) SetSwitchPress(control, model, false);
+        break;
+    }
+    return DefSubclassProc(control, message, wp, lp);
+}
+
 inline void Init(HWND window, Window& model) {
     const HWND owner = GetWindow(window, GW_OWNER);
     RECT parent{};
@@ -408,19 +669,27 @@ inline void Init(HWND window, Window& model) {
         std::clamp(static_cast<int>((parent.top + parent.bottom - height) / 2), static_cast<int>(work.top), static_cast<int>(work.bottom) - height),
         width, height, SWP_NOZORDER | SWP_NOACTIVATE);
     model.dialog = window;
+    RECT screenRect{};
+    GetWindowRect(window, &screenRect);
+    CaptureBackdrop(model, screenRect);
+    BOOL animations = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animations, 0);
+    model.reducedMotion = !animations;
     if (model.color.top != model.color.bottom) {
         Microsoft::WRL::ComPtr<ID3D11Device> device;
-        if (SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr)) &&
-            model.glass.Init(device.Get())) {
-            RECT client{};
-            GetClientRect(window, &client);
-            model.glass.Prepare(client.right, client.bottom, std::pair{model.color.top, model.color.bottom});
-        }
+        if (SUCCEEDED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0, &device, nullptr, nullptr)))
+            model.glass.Init(device.Get());
     }
     const int radius = model.Dip(kCornerRadius), inset = 2;
-    HRGN shape = CreateRoundRectRgn(inset, inset, width - inset + 1, height - inset + 1, 2 * (radius - inset), 2 * (radius - inset));
-    if (shape && !SetWindowRgn(window, shape, TRUE)) DeleteObject(shape);
+    {
+        Gdiplus::GraphicsPath path;
+        ContinuousPath(path, inset, inset, static_cast<float>(width - 2 * inset), static_cast<float>(height - 2 * inset),
+            static_cast<float>(radius - inset));
+        Gdiplus::Graphics graphics(window);
+        Gdiplus::Region clip(&path);
+        const HRGN shape = clip.GetHRGN(&graphics);
+        if (shape && !SetWindowRgn(window, shape, TRUE)) DeleteObject(shape);
+    }
     // Owned windows always sit above their owner, so the frame shares the dialog's owner and is placed right under it.
     static const bool registered = [] {
         WNDCLASSW wc{};
@@ -451,10 +720,16 @@ inline void Init(HWND window, Window& model) {
     SendMessageW(model.path, WM_SETFONT, reinterpret_cast<WPARAM>(model.body), 0);
     button(Ui(L"更改…"), kChangeFolder, 100, 175, 100, 36);
     button(Ui(L"打开文件夹"), kOpenFolder, 210, 175, 115, 36);
-    const HWND toggle = button(L"", kPcBubbleSwitch, 423, 261, 53, 34);
-    UpdateToggleName(toggle, model.pcBubble);
-    const HWND background = button(L"", kBackgroundSwitch, 423, 347, 53, 34);
-    UpdateToggleName(background, model.background);
+    const auto toggle = [&](int id, int y) {
+        const auto control = button(L"", id, 412, y, 75, 42);
+        const bool on = SwitchOn(model, id);
+        auto& motion = Motion(model, id);
+        motion.from = motion.to = on ? 1.0f : 0.0f;
+        UpdateToggleName(control, on);
+        SetWindowSubclass(control, SwitchProc, 1, reinterpret_cast<DWORD_PTR>(&model));
+    };
+    toggle(kPcBubbleSwitch, 257);
+    toggle(kBackgroundSwitch, 343);
     for (size_t i = 0; i < model.phones.size(); ++i) {
         const auto label = std::wstring(Ui(L"移除…")) + L" " + model.phones[i].name;
         button(label.c_str(), kFirstPhone + static_cast<int>(i), 391,
@@ -476,6 +751,7 @@ inline INT_PTR CALLBACK DialogProc(HWND window, UINT message, WPARAM wp, LPARAM 
         if (model) PlaceFrame(window, *model);
         break;
     case WM_DESTROY:
+        if (model) model->switchTicker.Stop();
         if (model && model->frame) { DestroyWindow(model->frame); model->frame = nullptr; }
         break;
     case WM_PAINT:
@@ -492,25 +768,26 @@ inline INT_PTR CALLBACK DialogProc(HWND window, UINT message, WPARAM wp, LPARAM 
     case WM_DRAWITEM:
         if (model) { PaintButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lp), *model); return TRUE; }
         break;
-    case WM_COMMAND:
-        if (model && LOWORD(wp) == kBackgroundSwitch && HIWORD(wp) == BN_CLICKED) {
-            if (liquid::settings::WriteBool(model->settingsPath, "phonePairing", "runInBackground", !model->background)
-                    == liquid::settings::SaveStatus::Saved) {
-                model->background = !model->background;
-                const auto toggle = GetDlgItem(window, kBackgroundSwitch);
-                UpdateToggleName(toggle, model->background);
-                InvalidateRect(toggle, nullptr, FALSE);
-            } else MessageBoxW(window, Ui(L"无法保存设置。"), L"DockDrop", MB_OK | MB_ICONWARNING);
+    case docky::vblank::kMsgVBlank:
+        if (model) {
+            model->switchTicker.Ack();
+            bool running = false;
+            const auto now = docky::vblank::AnimationMillis();
+            for (int id : {kPcBubbleSwitch, kBackgroundSwitch}) {
+                auto& motion = Motion(*model, id);
+                if (motion.from == motion.to && motion.pressFrom == motion.pressTo) continue;
+                if (now - motion.slideAt >= 420) motion.from = motion.to;
+                if (now - motion.pressAt >= 150) motion.pressFrom = motion.pressTo;
+                running = running || motion.from != motion.to || motion.pressFrom != motion.pressTo;
+                InvalidateRect(GetDlgItem(window, id), nullptr, FALSE);
+            }
+            if (!running) model->switchTicker.Stop();
             return TRUE;
         }
-        if (model && LOWORD(wp) == kPcBubbleSwitch && HIWORD(wp) == BN_CLICKED) {
-            if (liquid::settings::WriteBool(model->settingsPath, "phonePairing", "pcReceiveBubble", !model->pcBubble)
-                    == liquid::settings::SaveStatus::Saved) {
-                model->pcBubble = !model->pcBubble;
-                const auto toggle = GetDlgItem(window, kPcBubbleSwitch);
-                UpdateToggleName(toggle, model->pcBubble);
-                InvalidateRect(toggle, nullptr, FALSE);
-            } else MessageBoxW(window, Ui(L"无法保存设置。"), L"DockDrop", MB_OK | MB_ICONWARNING);
+        break;
+    case WM_COMMAND:
+        if (const UINT id = LOWORD(wp); model && (id == kBackgroundSwitch || id == kPcBubbleSwitch) && HIWORD(wp) == BN_CLICKED) {
+            CommitSwitch(GetDlgItem(window, id), *model, !SwitchOn(*model, id));
             return TRUE;
         }
         if (HIWORD(wp) == BN_CLICKED) { EndDialog(window, LOWORD(wp)); return TRUE; }

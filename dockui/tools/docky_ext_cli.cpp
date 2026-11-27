@@ -34,6 +34,7 @@ std::string WithNotify(const std::string& json, HWND h) {
     return json.substr(0, brace + 1) + "\"notifyHwnd\":" + docky_sdk::detail::Hwnd(h) + "," + json.substr(brace + 1);
 }
 LRESULT CALLBACK Listener(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
     if (m == WM_COPYDATA) {
         const auto* cds = reinterpret_cast<const COPYDATASTRUCT*>(l);
         if (cds && cds->dwData == docky_sdk::kCopyDataMagic && cds->lpData) {

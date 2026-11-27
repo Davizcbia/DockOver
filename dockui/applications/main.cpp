@@ -22,6 +22,7 @@
 #include <QFont>
 #include <QColorSpace>
 #include <QDir>
+#include <QDirIterator>
 #include <QImage>
 #include <QScreen>
 #include <QGuiApplication>
@@ -29,6 +30,15 @@
 #include <cmath>
 #include "icon_mask.h"
 #include "app_registry.h"
+#include "steam_catalog.h"
+#include "launchpad_model.h"
+#include <shlobj.h>
+#include <shobjidl.h>
+#include <structuredquery.h>
+#include "suite_install.h"
+#include <QSet>
+#include <QUrl>
+#include <QRegularExpression>
 #include "shell_items.h"
 #include "settings_motion.h"
 #include "motion.h"
@@ -54,7 +64,7 @@
 
 static QString Ui(const wchar_t* text) { return QString::fromWCharArray(docky::ui::Text(text)); }
 
-struct Item {QString id,name;std::wstring target;QImage icon;};
+struct Item {QString id,name;std::wstring target;QImage icon;bool game=false;int group=8;};
 
 class Applications final:public QWidget {
  PreviewTuning tuning{dock::GlassParameters{}},defaults=tuning;
@@ -65,11 +75,18 @@ class Applications final:public QWidget {
  QVector<QPair<QRectF,int>> hits;
  double s=1,ox=0,oy=0;
  QLineEdit* search=new QLineEdit(this);
+ QTimer searchDebounce;
+ QThreadPool fileSearch;
+ QVector<Item> indexedItems;
+ QSet<QString> launchpadHidden;
+ QString launchpadPath;
+ liquid::settings::Revision launchpadRevision{};
+ bool launchpadOnly=true;
  QPointF pressPoint;
  struct Usage { int count=0; qint64 last=0; };
  QStringList pins;
  QHash<QString,Usage> usage;
- bool catalogReady=false,pinsWritable=true;
+ bool catalogReady=false,catalogPending=false,pinsWritable=true;
  int category=-1,sortOrder=0;
  float chipOffset=0,chipStartOffset=0,chipMax=0;
  bool chipDown=false;
@@ -121,7 +138,6 @@ class Applications final:public QWidget {
    if(std::abs(target-shade[i])<0.004f)shade[i]=target;else moving=true;}
   if(moving&&!shadeTimer.isActive())shadeTimer.start();else if(!moving)shadeTimer.stop();
  }
- qint64 catalogAt=-1;  // ms after opening when the catalog arrived
  bool reduced()const{BOOL animations=TRUE;SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animations,0);return !animations;}
  void startOpening(){
   opened=true;contentStarted=false;
@@ -133,20 +149,11 @@ class Applications final:public QWidget {
   // the animation and make it jump.
   waitingFirstFrame=true;openClock.start();update();
  }
- bool firstScreenLoaded(){
-  if(!catalogReady)return false;
-  std::lock_guard lock(iconPriorityLock);
-  if(visibleIconPriority.isEmpty())return items.isEmpty()||!status.isEmpty();
-  for(const auto& id:visibleIconPriority)for(const auto& item:items)if(item.id==id&&item.icon.isNull())return false;
-  return true;
- }
  void stepOpening(){
   const double dt=std::min(0.05,animClock.nsecsElapsed()/1.e9);animClock.restart();
   bool moving=openMotion.Step(dt);
-  // Reveal when the catalog and the first screen of icons are in; at most 0.45 s after the catalog (slow icons), and
-  // regardless after 3 s (a catalog error shows its message).
-  const qint64 now=openClock.elapsed();
-  if(!contentStarted&&(firstScreenLoaded()||(catalogReady&&catalogAt>=0&&now-catalogAt>450)||now>3000)){contentStarted=true;contentMotion.SetTarget(1);}
+  // Reveal the catalog or its loading state without waiting for Shell icon I/O.
+  if(!contentStarted&&(catalogReady||openClock.elapsed()>=180)){contentStarted=true;contentMotion.SetTarget(1);}
   moving|=contentMotion.Step(dt);
   if(!moving&&contentStarted&&openMotion.AtRest()&&contentMotion.AtRest())animTimer.stop();
   update();
@@ -181,17 +188,22 @@ class Applications final:public QWidget {
   checkFocus();
  }
  static constexpr const char* categories[]={"Utilities","Productivity & Finance","Entertainment","Developer Tools","Creativity","Games","Social","Information","Other"};
- static int categoryFor(QString text){
+ static int categoryFor(const Item& item){
+   if(item.game)return 5;
+   const auto text=item.name.toCaseFolded();
    static const QStringList words[]={
-    {"settings","calculator","terminal","explorer","utility","notepad","计算器","设置"},
+    {"settings","calculator","terminal","explorer","utility","notepad","wallpaper engine","mydockfinder","lossless scaling","steamvr","game monitor","game tunnel","vortex","计算器","设置"},
     {"office","excel","word","powerpoint","outlook","calendar","finance","notion"},
     {"music","video","player","spotify","netflix","vlc"},
     {"visual studio","python","git","sdk","developer","code","cmake","node.js","docker","jetbrains"},
     {"adobe","photoshop","blender","affinity","paint"},
-    {"steam","game","xbox","epic"},
+    {"steam","game bar","xbox","epic games launcher"},
     {"discord","teams","slack","wechat","telegram"},
     {"chrome","firefox","edge","browser","news"}};
-   for(int i=0;i<8;++i)for(const auto& word:words[i])if(text.contains(word,Qt::CaseInsensitive))return i;
+   for(int i:{5,0,1,2,3,4,6,7})for(const auto& word:words[i]){
+    const auto pattern=QRegularExpression(QStringLiteral("(?<![\\p{L}\\p{N}])")+QRegularExpression::escape(word)+QStringLiteral("(?![\\p{L}\\p{N}])"));
+    if(pattern.match(text).hasMatch())return i;
+   }
    return 8;
  }
  QString pinsPath()const{return QFileInfo(sharedSettingsPath()).dir().filePath("applications-pins.json");}
@@ -244,13 +256,33 @@ class Applications final:public QWidget {
     usage.remove(it.key());
    }
  }
+ bool browseItem(const Item& item)const{
+    return (!launchpadOnly||!launchpadHidden.contains(item.id))&&(category<0||item.group==category);
+ }
+ const Item& displayItem(int index)const{
+    return index<items.size()?items[index]:indexedItems[index-items.size()];
+ }
+ void syncLaunchpad(){
+    const auto path=launchpadPath.toStdWString();
+    const auto revision=liquid::settings::ReadRevision(path);
+    if(revision==launchpadRevision)return;
+    launchpadRevision=revision;
+    dock::launchpad::Layout layout;
+    std::wstring error;
+    bool exists=false;
+    if(dock::launchpad::Load(path,layout,error,&exists)){
+        QSet<QString> hidden;
+        for(const auto& id:layout.hidden)hidden.insert(QString::fromStdString(id));
+        if(hidden!=launchpadHidden){launchpadHidden=std::move(hidden);hover=-1;scroll.Reset();update();}
+    }
+ }
  QVector<int> featuredItems()const{
    QVector<int> featured;
    if(!query.isEmpty())return featured;
-   for(const auto& id:pins)for(int i=0;i<items.size();++i)if(items[i].id==id){featured.push_back(i);break;}
+   for(const auto& id:pins)for(int i=0;i<items.size();++i)if(items[i].id==id&&browseItem(items[i])){featured.push_back(i);break;}
    if(featured.empty()){
     int latest=-1;
-    for(int i=0;i<items.size();++i)if(usage.value(items[i].id).last>0&&(latest<0||usage.value(items[i].id).last>usage.value(items[latest].id).last))latest=i;
+    for(int i=0;i<items.size();++i)if(browseItem(items[i])&&usage.value(items[i].id).last>0&&(latest<0||usage.value(items[i].id).last>usage.value(items[latest].id).last))latest=i;
     if(latest>=0)featured.push_back(latest);
    }
    return featured;
@@ -258,13 +290,77 @@ class Applications final:public QWidget {
  QVector<int> visibleItems(const QVector<int>& featured)const{
    QVector<int> result;
    for(int i=0;i<items.size();++i)
-    if(!featured.contains(i)&&(category<0||categoryFor(items[i].name)==category)&&items[i].name.contains(query,Qt::CaseInsensitive))result.push_back(i);
+    if(!featured.contains(i)&&(query.isEmpty()?browseItem(items[i]):((category<0||items[i].group==category)&&items[i].name.contains(query,Qt::CaseInsensitive))))result.push_back(i);
    if(sortOrder)std::stable_sort(result.begin(),result.end(),[&](int a,int b){
     const auto first=usage.value(items[a].id),second=usage.value(items[b].id);
     if(sortOrder==1&&first.count!=second.count)return first.count>second.count;
     return first.last>second.last;
    });
+   if(!query.isEmpty()&&category<0)for(int i=0;i<indexedItems.size();++i)result.push_back(static_cast<int>(items.size())+i);
    return result;
+ }
+ QString indexUri()const{
+    return QStringLiteral("search-ms:query=")+QString::fromLatin1(QUrl::toPercentEncoding(query.trimmed()));
+ }
+ void queryWindowsIndex(){
+    if(query.trimmed().isEmpty())return;
+    const auto requested=query;
+    const auto uri=indexUri();
+    fileSearch.clear();
+    fileSearch.start([this,requested,uri]{
+        const HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+        QVector<Item> found;
+        Microsoft::WRL::ComPtr<IShellItem> folder;
+        Microsoft::WRL::ComPtr<IEnumShellItems> results;
+        Microsoft::WRL::ComPtr<IQueryParserManager> parserManager;
+        Microsoft::WRL::ComPtr<IQueryParser> parser;
+        Microsoft::WRL::ComPtr<IQuerySolution> solution;
+        Microsoft::WRL::ComPtr<ICondition> condition;
+        Microsoft::WRL::ComPtr<ISearchFolderItemFactory> factory;
+        if(SUCCEEDED(CoCreateInstance(__uuidof(QueryParserManager),nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&parserManager)))&&
+           SUCCEEDED(parserManager->CreateLoadedParser(L"SystemIndex",GetUserDefaultLangID(),IID_PPV_ARGS(&parser)))&&
+           SUCCEEDED(parser->Parse(requested.toStdWString().c_str(),nullptr,&solution))&&
+           SUCCEEDED(solution->GetQuery(&condition,nullptr))&&condition&&
+           SUCCEEDED(CoCreateInstance(CLSID_SearchFolderItemFactory,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&factory)))&&
+           SUCCEEDED(factory->SetCondition(condition.Get()))&&SUCCEEDED(factory->GetShellItem(IID_PPV_ARGS(&folder)))&&
+           SUCCEEDED(folder->BindToHandler(nullptr,BHID_EnumItems,IID_PPV_ARGS(&results)))){
+            for(int n=0;n<30&&!stopping;++n){
+                Microsoft::WRL::ComPtr<IShellItem> result;
+                if(results->Next(1,&result,nullptr)!=S_OK)break;
+                PWSTR path=nullptr,name=nullptr;
+                if(SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH,&path))&&
+                   SUCCEEDED(result->GetDisplayName(SIGDN_NORMALDISPLAY,&name))){
+                    found.push_back({{},QString::fromWCharArray(name),path,QImage{}});
+                }
+                CoTaskMemFree(path);CoTaskMemFree(name);
+            }
+        }
+        results.Reset();folder.Reset();factory.Reset();condition.Reset();solution.Reset();parser.Reset();parserManager.Reset();
+        if(SUCCEEDED(co))CoUninitialize();
+        // Some Windows installations disable the indexer. Keep the known folders searchable by name.
+        if(found.isEmpty()&&requested.size()>=2){
+            QElapsedTimer budget;
+            budget.start();
+            for(const auto location:{QStandardPaths::DesktopLocation,QStandardPaths::DocumentsLocation,
+                    QStandardPaths::DownloadLocation,QStandardPaths::PicturesLocation,QStandardPaths::MusicLocation,QStandardPaths::MoviesLocation}){
+                const auto directory=QStandardPaths::writableLocation(location);
+                if(directory.isEmpty())continue;
+                QDirIterator entries(directory,QDir::AllEntries|QDir::NoDotAndDotDot|QDir::NoSymLinks,QDirIterator::Subdirectories);
+                for(int n=0;n<600&&found.size()<30&&budget.elapsed()<240&&!stopping&&entries.hasNext();++n){
+                    const auto file=entries.nextFileInfo();
+                    if(file.fileName().contains(requested,Qt::CaseInsensitive))
+                        found.push_back({{},file.fileName(),QDir::toNativeSeparators(file.absoluteFilePath()).toStdWString(),QImage{}});
+                }
+                if(found.size()>=30||budget.elapsed()>=240||stopping)break;
+            }
+        }
+        QMetaObject::invokeMethod(this,[this,requested,uri,found=std::move(found)]()mutable{
+            if(query!=requested)return;
+            found.push_back({{},Ui(L"Search files in Windows"),uri.toStdWString(),QImage{}});
+            found.push_back({{},Ui(L"Open Windows Search"),L"",QImage{}});
+            indexedItems=std::move(found);hits.clear();hover=-1;update();
+        },Qt::QueuedConnection);
+    });
  }
  void layoutSearch(){
     ox=-20*s;oy=-34*s;
@@ -285,17 +381,17 @@ class Applications final:public QWidget {
    QVector<Item> result;QFile file(catalogPath());
    if(!file.open(QIODevice::ReadOnly)||file.size()>8*1024*1024)return result;
    const auto root=QJsonDocument::fromJson(file.readAll()).object();
-   if(root.value("version").toInt()!=1)return result;
+   if(root.value("version").toInt()!=3)return result;
    for(const auto& value:root.value("apps").toArray()){
-    const auto o=value.toObject();Item item;item.id=o.value("id").toString();item.name=o.value("name").toString();item.target=o.value("target").toString().toStdWString();
+    const auto o=value.toObject();Item item;item.id=o.value("id").toString();item.name=o.value("name").toString();item.target=o.value("target").toString().toStdWString();item.game=o.value("game").toBool();item.group=categoryFor(item);
     if(!item.id.isEmpty()&&!item.target.empty())result.push_back(std::move(item));
    }
    return result;
  }
  static void saveCatalogCache(const QString& path,const QVector<Item>& list){
-   QJsonArray apps;for(const auto& item:list)apps.append(QJsonObject{{"id",item.id},{"name",item.name},{"target",QString::fromStdWString(item.target)}});
+   QJsonArray apps;for(const auto& item:list)apps.append(QJsonObject{{"id",item.id},{"name",item.name},{"target",QString::fromStdWString(item.target)},{"game",item.game}});
    QDir().mkpath(QFileInfo(path).absolutePath());QSaveFile file(path);
-   if(file.open(QIODevice::WriteOnly)){const auto bytes=QJsonDocument(QJsonObject{{"version",1},{"apps",apps}}).toJson(QJsonDocument::Compact);if(file.write(bytes)==bytes.size())file.commit();}
+   if(file.open(QIODevice::WriteOnly)){const auto bytes=QJsonDocument(QJsonObject{{"version",3},{"apps",apps}}).toJson(QJsonDocument::Compact);if(file.write(bytes)==bytes.size())file.commit();}
  }
  std::atomic<int> iconGeneration{0};
  // Loads the icons of `list` (visible ones first) until done or a newer list replaced it; icons go to items by id.
@@ -304,6 +400,7 @@ class Applications final:public QWidget {
    const auto pinnedAtStart=pins;
    discovery.start([this,list=std::move(list),generation,pinnedAtStart]{
     const HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);
+    const auto steamPath=QString::fromStdWString(dock::apps::steam::Directory());
     QVector<int> order;for(int i=0;i<list.size();++i)order.push_back(i);
     std::stable_sort(order.begin(),order.end(),[&](int a,int b){return pinnedAtStart.contains(list[a].first)>pinnedAtStart.contains(list[b].first);});
     std::vector<bool> requested(list.size(),false);qsizetype cursor=0;
@@ -323,8 +420,21 @@ class Applications final:public QWidget {
      }
      requested[index]=true;
      std::vector<uint32_t> pixels;UINT w=0,h=0;
-     if(dock::LoadShellIconPixels(list[index].second,128,pixels,w,h)&&w&&h){
-      QImage icon=QImage(reinterpret_cast<const uchar*>(pixels.data()),w,h,w*4,QImage::Format_ARGB32_Premultiplied).copy();
+     auto target=list[index].second;
+     QImage icon;
+     if(!steamPath.isEmpty()&&target.starts_with(L"steam://rungameid/")){
+        const auto id=QString::fromStdWString(target.substr(18));
+        const QDir cache(steamPath+QStringLiteral("/appcache/librarycache/")+id);
+        for(const auto& file:cache.entryList({QStringLiteral("*.jpg")},QDir::Files)){
+            if(file.size()!=44)continue;
+            const QImage candidate(cache.filePath(file));
+            if(candidate.width()==candidate.height()&&candidate.width()>=24){icon=candidate;break;}
+        }
+        target=(steamPath+QStringLiteral("/steam.exe")).toStdWString();
+     }
+     if(icon.isNull()&&dock::LoadShellIconPixels(target,128,pixels,w,h)&&w&&h)
+        icon=QImage(reinterpret_cast<const uchar*>(pixels.data()),w,h,w*4,QImage::Format_ARGB32_Premultiplied).copy();
+     if(!icon.isNull()){
       QMetaObject::invokeMethod(this,[this,id=list[index].first,icon=std::move(icon)]{for(auto& item:items)if(item.id==id){item.icon=icon;break;}update();},Qt::QueuedConnection);
      }
     }
@@ -336,41 +446,87 @@ class Applications final:public QWidget {
  }
  void loadApps(){
     const auto cached=loadCatalogCache();
-    if(!cached.isEmpty()){items=cached;migrateShortcutKeys();catalogReady=true;catalogAt=0;loadIcons(iconJobs(items));}
+    if(!cached.isEmpty()){items=cached;migrateShortcutKeys();catalogReady=true;loadIcons(iconJobs(items));}
     refreshCatalog(!cached.isEmpty());
  }
  // Reads the Start menu again (off the UI thread) and swaps in a changed list; also used each time the resident window
  // is shown, so apps installed meanwhile appear.
  void refreshCatalog(bool haveList){
+    if(catalogPending)return;
+    catalogPending=true;
     const QString cachePath=catalogPath();
     discovery.start([this,cachePath,hadCache=haveList]{
       const HRESULT co=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);std::vector<dock::apps::AppEntry> apps;std::wstring error;
-      if(dock::apps::DiscoverStartMenuApps(apps,error)){
-       QVector<Item> metadata;for(const auto& app:apps){Item item;item.id=QString::fromStdString(app.id);item.name=QString::fromStdWString(app.name);item.target=app.Target();metadata.push_back(std::move(item));}
+      if(dock::apps::DiscoverApps(apps,error)){
+       QVector<Item> metadata;for(const auto& app:apps){Item item;item.id=QString::fromStdString(app.id);item.name=QString::fromStdWString(app.name);item.target=app.Target();item.game=app.game;item.group=categoryFor(item);metadata.push_back(std::move(item));}
        saveCatalogCache(cachePath,metadata);
        QMetaObject::invokeMethod(this,[this,part=std::move(metadata),hadCache]() mutable{
+        catalogPending=false;
         // Same list as the cache: nothing changes on screen. Otherwise swap it in, keeping the icons already loaded.
         bool same=hadCache&&part.size()==items.size();
-        for(int i=0;same&&i<part.size();++i)same=part[i].id==items[i].id&&part[i].name==items[i].name;
+        for(int i=0;same&&i<part.size();++i)same=part[i].id==items[i].id&&part[i].name==items[i].name&&part[i].target==items[i].target&&part[i].game==items[i].game;
         if(same)return;
         for(auto& item:part)for(const auto& old:items)if(old.id==item.id){item.icon=old.icon;break;}
         items=std::move(part);migrateShortcutKeys();
-        if(!catalogReady){catalogReady=true;catalogAt=openClock.isValid()?openClock.elapsed():0;}
+        catalogReady=true;
         status=pinsWritable?QString():QString("Could not read pinned apps. The existing file was preserved.");
-        hover=-1;loadIcons(iconJobs(items));update();
+        hits.clear();hover=-1;loadIcons(iconJobs(items));update();
        },Qt::QueuedConnection);
-      }else QMetaObject::invokeMethod(this,[this,error]{if(!catalogReady){catalogReady=true;status=QString::fromStdWString(error);}update();},Qt::QueuedConnection);
+      }else QMetaObject::invokeMethod(this,[this,error]{catalogPending=false;if(!catalogReady){catalogReady=true;status=QString::fromStdWString(error);}update();},Qt::QueuedConnection);
       if(SUCCEEDED(co))CoUninitialize();
     });
  }
+ void openWindowsSearch(){
+    const auto text=query.toStdWString();
+    if(text.empty())return;
+    INPUT chord[4]{};
+    for(auto& key:chord)key.type=INPUT_KEYBOARD;
+    chord[0].ki.wVk=chord[3].ki.wVk=VK_LWIN;
+    chord[1].ki.wVk=chord[2].ki.wVk='S';
+    chord[2].ki.dwFlags=chord[3].ki.dwFlags=KEYEVENTF_KEYUP;
+    if(SendInput(ARRAYSIZE(chord),chord,sizeof(INPUT))!=ARRAYSIZE(chord))return;
+    auto* poll=new QTimer(this);
+    const auto deadline=GetTickCount64()+1500;
+    connect(poll,&QTimer::timeout,this,[this,poll,deadline,text]{
+        if(GetTickCount64()>=deadline){poll->stop();poll->deleteLater();return;}
+        const HWND foreground=GetForegroundWindow();
+        DWORD pid=0;
+        const DWORD thread=GetWindowThreadProcessId(foreground,&pid);
+        GUITHREADINFO focus{sizeof(focus)};
+        if(!thread||!GetGUIThreadInfo(thread,&focus)||!focus.hwndFocus)return;
+        if(!GetWindowThreadProcessId(focus.hwndFocus,&pid))return;
+        const auto image=docky::suite::ProcessImage(pid);
+        wchar_t windows[MAX_PATH]{};
+        if(!GetWindowsDirectoryW(windows,ARRAYSIZE(windows)))return;
+        const auto path=QString::fromStdWString(image),systemApps=QString::fromWCharArray(windows)+QStringLiteral("\\SystemApps\\");
+        if(!path.startsWith(systemApps,Qt::CaseInsensitive)||
+           !(path.endsWith(QStringLiteral("\\SearchHost.exe"),Qt::CaseInsensitive)||
+             path.endsWith(QStringLiteral("\\SearchApp.exe"),Qt::CaseInsensitive)))return;
+        poll->stop();poll->deleteLater();
+        if(GetForegroundWindow()!=foreground)return;
+        // Only send text after the native Search host owns keyboard focus.
+        std::vector<INPUT> keys;
+        for(const wchar_t ch:text){
+            if(ch<L' ')continue;
+            INPUT key{};key.type=INPUT_KEYBOARD;key.ki.wScan=ch;key.ki.dwFlags=KEYEVENTF_UNICODE;
+            keys.push_back(key);key.ki.dwFlags|=KEYEVENTF_KEYUP;keys.push_back(key);
+        }
+        if(!keys.empty())SendInput(static_cast<UINT>(keys.size()),keys.data(),sizeof(INPUT));
+        close();
+    });
+    poll->start(70);
+ }
  void launch(int i){
-    if(i<0||i>=items.size())return;
-    SHELLEXECUTEINFOW info{sizeof(info)};info.hwnd=reinterpret_cast<HWND>(winId());info.lpFile=items[i].target.c_str();
+    if(i<0||i>=items.size()+indexedItems.size())return;
+    const auto& item=displayItem(i);
+    if(i>=items.size()&&item.target.empty()){openWindowsSearch();return;}
+    SHELLEXECUTEINFOW info{sizeof(info)};info.hwnd=reinterpret_cast<HWND>(winId());info.lpFile=item.target.c_str();
     info.fMask=SEE_MASK_NOASYNC;info.nShow=SW_SHOWNORMAL;
     if(ShellExecuteExW(&info)){
-      auto& entry=usage[items[i].id];entry.count=std::min(1000000,entry.count+1);entry.last=QDateTime::currentMSecsSinceEpoch();savePins();close();
+      if(i<items.size()){auto& entry=usage[item.id];entry.count=std::min(1000000,entry.count+1);entry.last=QDateTime::currentMSecsSinceEpoch();savePins();}
+      close();
     }
-    else QMessageBox::warning(this,"DockOver",Ui(L"Could not open %1").arg(items[i].name));
+    else QMessageBox::warning(this,"DockOver",Ui(L"Could not open %1").arg(item.name));
  }
  QPointF design(QPoint p)const{return {(p.x()-ox)/s,(p.y()-oy)/s};}
  static QPainterPath continuous(QRectF r,qreal extent,qreal exponent=3.05){
@@ -503,7 +659,11 @@ class Applications final:public QWidget {
   update();
  }
  void syncUiSize(){
-  int percent=80,order=0;QFile file(sharedSettingsPath());if(file.open(QIODevice::ReadOnly)){const auto root=QJsonDocument::fromJson(file.readAll()).object();const auto appearance=root.value("appearance").toObject();const auto value=appearance.value("applicationsScalePercent");order=appearance.value("applicationsSort").toInt();docky::ui::SetLanguage(appearance.value("language").toString().toStdString());if(root.value("schemaVersion").toInt()==1&&value.isDouble()&&value.toDouble()==value.toInt()&&value.toInt()>=60&&value.toInt()<=120)percent=value.toInt();}
+  const auto preferences=liquid::settings::Load(sharedSettingsPath().toStdWString()).value.appearance;
+  const int percent=preferences.applicationsScalePercent,order=preferences.applicationsSort;
+  docky::ui::SetLanguage(preferences.language);
+  syncLaunchpad();
+  if(launchpadOnly!=preferences.applicationsLaunchpadOnly){launchpadOnly=preferences.applicationsLaunchpadOnly;hover=-1;scroll.Reset();update();}
   if(order>=0&&order<=2&&order!=sortOrder){sortOrder=order;scroll.Reset();hover=-1;update();}
   const bool sizeFile=QFile::exists(windowSizePath());
   const bool reset=hadSizeFile&&!sizeFile&&!resizing;  // Settings > Reset size
@@ -575,9 +735,16 @@ public:
   show();raise();activateWindow();SetForegroundWindow(reinterpret_cast<HWND>(winId()));setFocus();
  }
 public:
- ~Applications() override {watchClicks(false);hookOwner=nullptr;stopping=true;discovery.waitForDone();}
+ ~Applications() override {watchClicks(false);hookOwner=nullptr;stopping=true;discovery.waitForDone();fileSearch.clear();fileSearch.waitForDone();}
  Applications(){setWindowTitle("DockOver Applications");setWindowFlags(Qt::FramelessWindowHint|Qt::Tool);
   setAttribute(Qt::WA_TranslucentBackground);auto screen=QGuiApplication::screenAt(QCursor::pos());if(!screen)screen=QGuiApplication::primaryScreen();
+  const auto args=QCoreApplication::arguments();
+  const int layoutIndex=args.indexOf("--launchpad-path");
+  launchpadPath=layoutIndex>=0&&layoutIndex+1<args.size()?args[layoutIndex+1]:
+    QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation)).filePath("LiquidDock/launchpad.json");
+  fileSearch.setMaxThreadCount(1);searchDebounce.setSingleShot(true);
+  connect(&searchDebounce,&QTimer::timeout,this,[this]{queryWindowsIndex();});
+  docky::SetRenderSettingsPath(sharedSettingsPath().toStdWString());
   loadWindowSize();syncUiSize();loadPins();
   scrollTimer.setTimerType(Qt::PreciseTimer);scrollTimer.setInterval(8);
   animTimer.setTimerType(Qt::PreciseTimer);animTimer.setInterval(8);
@@ -598,7 +765,16 @@ public:
   search->setPlaceholderText(Ui(L"Applications"));search->setAccessibleName(Ui(L"Search apps"));
   search->setStyleSheet("QLineEdit{background:transparent;border:0;padding:0;color:white;selection-background-color:#3566a3;}");
   auto palette=search->palette();palette.setColor(QPalette::PlaceholderText,QColor(237,235,231,160));search->setPalette(palette);
-  connect(search,&QLineEdit::textChanged,this,[this](const QString& text){query=text;category=-1;scroll.Reset();hover=-1;update();});
+  connect(search,&QLineEdit::textChanged,this,[this](const QString& text){
+    query=text.trimmed();category=-1;scroll.Reset();hits.clear();hover=-1;indexedItems.clear();
+    searchDebounce.stop();fileSearch.clear();
+    if(!query.isEmpty()){
+        indexedItems.push_back({{},Ui(L"Search files in Windows"),indexUri().toStdWString(),QImage{}});
+        indexedItems.push_back({{},Ui(L"Open Windows Search"),L"",QImage{}});
+        searchDebounce.start(220);
+    }
+    update();
+  });
   layoutSearch();
   QImage raw;if(!QCoreApplication::arguments().contains("--dev-static"))raw=screen->grabWindow(0,x()-screen->geometry().left(),y()-screen->geometry().top(),width(),height()).toImage();
   if(raw.isNull()){raw=QImage(qRound(canvasW),qRound(canvasH),QImage::Format_RGB32);raw.fill(QColor("#242931"));}
@@ -618,7 +794,7 @@ public:
     liveEnabled=true;
     auto timer=new QTimer(this);
     connect(timer,&QTimer::timeout,this,[this]{refreshDesktop();});
-    timer->start(16);  // only renders when what is behind changed (DXGI dirty rectangles)
+    timer->start(material.sharedGraphicsMemory() ? 33 : 16);  // throttle only backdrop updates, not UI animation
   } }
  void applySurfaces(){
     std::copy(std::begin(tuning.surfaces),std::end(tuning.surfaces),material.surfaces);
@@ -662,6 +838,24 @@ public:
             pins.clear();usage.clear();loadPins();
             ok=ok&&pins==QStringList{items[0].id}&&usage.value(items[1].id).last==200;
             pins=previousPins;usage=previousUsage;ok=savePins()&&ok;
+            const auto previousHidden=launchpadHidden;
+            const bool previousFilter=launchpadOnly;
+            launchpadOnly=true;
+            launchpadHidden.insert(items[0].id);
+            ok=ok&&!visibleItems({}).contains(0);
+            query=items[0].name;
+            ok=ok&&visibleItems({}).contains(0);
+            query.clear();
+            launchpadOnly=false;
+            ok=ok&&visibleItems({}).contains(0);
+            category=5;
+            const auto games=visibleItems({});
+            int detectedSteam=0;
+            for(int i=0;i<items.size();++i)
+                if(items[i].game){ok=ok&&games.contains(i);if(items[i].target.starts_with(L"steam://"))++detectedSteam;}
+            qInfo("Applications QA: %lld catalog entries, %lld Games entries, %d discovered Steam launch targets",
+                  static_cast<long long>(items.size()),static_cast<long long>(games.size()),detectedSteam);
+            category=-1;launchpadOnly=previousFilter;launchpadHidden=previousHidden;
         }
         QCoreApplication::exit(ok?0:3);
     });
@@ -757,7 +951,7 @@ protected:
      const int row=at/columns;if(row!=rowSeen){rowSeen=row;++screenRow;}
      const qreal t=std::clamp<qreal>(reveal*1.2-0.035*(screenRow-1),0,1),ease=1-(1-t)*(1-t)*(1-t);
      g.save();g.setOpacity(t);
-     drawTile(g,items[list[at]],list[at],134+colPitch*((at%columns)+0.5)-61,top+row*rowPitch+24*(1-ease));
+     drawTile(g,displayItem(list[at]),list[at],134+colPitch*((at%columns)+0.5)-61,top+row*rowPitch+24*(1-ease));
      g.restore();
     }
    };
@@ -863,7 +1057,7 @@ protected:
    if(e->type()==QEvent::ToolTip){
     const auto* help=static_cast<QHelpEvent*>(e);
     const auto pos=design(help->pos());
-    for(const auto& hit:hits)if(hit.first.contains(pos)){QToolTip::showText(help->globalPos(),items[hit.second].name,this);return true;}
+    for(const auto& hit:hits)if(hit.first.contains(pos)){QToolTip::showText(help->globalPos(),displayItem(hit.second).name,this);return true;}
     QToolTip::hideText();return true;
    }
    return QWidget::event(e);
@@ -886,7 +1080,7 @@ protected:
   if(!panelOutline.contains(pt)&&!searchOutline.contains(pt)){close();return;}
   if(e->button()==Qt::LeftButton&&chipViewport.contains(pt)&&panelOutline.contains(pt)){chipDown=true;chipStartOffset=chipOffset;return;}
   if(QRectF(searchRect.left()+892,150,95,85).contains(pt)){QMenu menu(this);menu.addAction("Liquid Glass tuning…",this,[this]{openEditor();});menu.addAction(dark?"Use desktop background":"Use black background",this,[this]{dark=!dark;redrawMaterial();});showMenu(menu,e->globalPosition().toPoint());return;}
-  if(e->button()==Qt::RightButton&&gridViewport.contains(pt)){for(const auto& hit:hits)if(hit.first.contains(pt)){const int index=hit.second;QMenu menu(this);menu.addAction("Open",this,[this,index]{launch(index);});menu.addSeparator();menu.addAction(pins.contains(items[index].id)?"Unpin from Start":"Pin to Start",this,[this,index]{togglePin(index);});showMenu(menu,e->globalPosition().toPoint());return;}}
+  if(e->button()==Qt::RightButton&&gridViewport.contains(pt)){for(const auto& hit:hits)if(hit.first.contains(pt)){const int index=hit.second;QMenu menu(this);menu.addAction("Open",this,[this,index]{launch(index);});if(index<items.size()){menu.addSeparator();menu.addAction(pins.contains(items[index].id)?"Unpin from Start":"Pin to Start",this,[this,index]{togglePin(index);});}showMenu(menu,e->globalPosition().toPoint());return;}}
   if(e->button()==Qt::LeftButton){if(searchRect.contains(pt))search->setFocus(Qt::MouseFocusReason);else setFocus(Qt::MouseFocusReason);}
  }
  void mouseReleaseEvent(QMouseEvent* e)override{if(e->button()!=Qt::LeftButton)return;

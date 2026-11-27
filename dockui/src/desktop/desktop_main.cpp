@@ -83,6 +83,7 @@ struct WidgetWin {
     docky::motion::Spring scroll;
     float scrollMin = 0, scrollMax = 0;
     ULONGLONG lastScroll = 0;  // after 20 s without scrolling the widget glides back to its normal view
+    std::shared_ptr<docky::vblank::Ticker> scrollTicker;
     double scrollStepAt = 0;
     bool dropHover = false;
     bool dropRegistered = false;
@@ -596,24 +597,26 @@ struct Drag { HWND h = nullptr; POINT start{}, origin{}; bool moving = false; UL
 docky::vblank::Ticker glideTicker, galleryTicker, settingsTicker;
 struct Glide { HWND h = nullptr; POINT from{}, to{}; LONGLONG start = 0; };
 std::vector<Glide> glides;
-constexpr UINT_PTR kGlideTimer = 7, kScrollTimer = 8;
+constexpr UINT_PTR kGlideTimer = 7;
 double Seconds();
 // One frame of a widget's scroll spring; keeps the timer while it moves.
 void StepScroll(HWND h) {
     WidgetWin* w = WidgetOf(h);
-    if (!w) { KillTimer(h, kScrollTimer); return; }
+    if (!w || !w->scrollTicker) return;
+    w->scrollTicker->Ack();
     const double now = Seconds(), dt = std::clamp(now - w->scrollStepAt, 0.0, 0.05);
     w->scrollStepAt = now;
     const bool moving = w->scroll.Step(dt);
     PaintWidgetWin(*w);
-    if (!moving) KillTimer(h, kScrollTimer);
+    if (!moving) w->scrollTicker->Stop();
 }
 void ScrollTo(WidgetWin& w, float target) {
     target = std::clamp(target, w.scrollMin, w.scrollMax);
     w.scroll.SetSpec(docky::motion::tokens::Scroll);
     w.scroll.SetTarget(target);
     w.scrollStepAt = Seconds();
-    SetTimer(w.hwnd, kScrollTimer, 8, nullptr);
+    if (!w.scrollTicker) w.scrollTicker=std::make_shared<docky::vblank::Ticker>();
+    w.scrollTicker->Start(w.hwnd,docky::vblank::kMsgVBlank);
 }
 constexpr double kGlideSeconds = 0.24;
 double Seconds() { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); LARGE_INTEGER c{}; QueryPerformanceCounter(&c); return static_cast<double>(c.QuadPart) / f.QuadPart; }
@@ -732,7 +735,8 @@ LRESULT CALLBACK WidgetProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             if (wp == VK_LEFT || wp == VK_RIGHT) { ChangeDropPage(*w, wp == VK_LEFT ? -1 : 1); return 0; }
         }
         break;
-    case WM_TIMER: if (wp == kGlideTimer) StepGlide(h); else if (wp == kScrollTimer) StepScroll(h); return 0;
+    case docky::vblank::kMsgVBlank: StepScroll(h); return 0;
+    case WM_TIMER: if (wp == kGlideTimer) StepGlide(h); return 0;
     case WM_MOUSEWHEEL: {  // Calendar and Weather scroll (one notch = 48 DIP; touchpads send finer steps)
         WidgetWin* w = WidgetOf(h);
         if (!w || EditMode() || drag.h) return 0;

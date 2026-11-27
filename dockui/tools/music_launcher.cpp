@@ -1,4 +1,5 @@
 #include "desktop_settings.h"
+#include "suite_install.h"
 #include <windows.h>
 #include <shellapi.h>
 #include <array>
@@ -160,7 +161,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     if (!tray) return DefWindowProcW(window, message, w, l);
     if (message == tray->taskbarCreated) { tray->AddIcon(); return 0; }
     switch (message) {
-    case WM_TIMER: tray->Sync(); return 0;
+    case WM_TIMER:
+        if (docky::suite::Active()) DestroyWindow(window);
+        else tray->Sync();
+        return 0;
     case WM_HOTKEY: tray->Run(static_cast<UINT>(w)); return 0;
     case kTray:
         if (l == WM_RBUTTONUP || l == WM_LBUTTONUP) tray->Menu();
@@ -168,7 +172,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
     case kShowMenu: tray->Menu(); return 0;
     case WM_DESTROY:
         Shell_NotifyIconW(NIM_DELETE, &tray->icon);
-        if (!ManagerRunning()) tray->StopWallpaper();
+        tray->StopWallpaper();
         if (tray->ownedWallpaper) CloseHandle(tray->ownedWallpaper);
         PostQuitMessage(0);
         return 0;
@@ -178,6 +182,11 @@ LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM w, LPARAM l) {
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    if (docky::suite::Active()) {
+        if (!docky::suite::Launch(docky::suite::InstalledRoot(), L"docky-now-playing.exe", L""))
+            MessageBoxW(nullptr, L"Open Music Player from DockOver.\n请从 DockOver 打开音乐播放器。", L"DockOver", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
     HANDLE single = CreateMutexW(nullptr, TRUE, L"Local\\DockOverMusicTray");
     if (!single) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS) {

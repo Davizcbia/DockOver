@@ -1,4 +1,5 @@
 #pragma once
+#include "display_adapter.h"
 #include "material.h"
 #include "desktop/duplication.h"
 #include <QImage>
@@ -65,9 +66,9 @@ class MenuGlass {
 public:
     dock::GlassParameters surfaces[2];
     bool forceNext=false;
+    bool sharedGraphicsMemory() const { return docky::UsesUnifiedMemory(device.Get()); }
     bool init() {
-        HRESULT hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context);
-        if (FAILED(hr)) hr=D3D11CreateDevice(nullptr,D3D_DRIVER_TYPE_WARP,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&device,nullptr,&context);
+        HRESULT hr=docky::CreateRenderDevice(0, nullptr, 0, &device, nullptr, &context);
         if (FAILED(hr)) return false;
         material=dock::CreateLiquidGlassMaterial();
         if (FAILED(material->CreateGpuResources(device.Get()))) {material.reset(); return false;}

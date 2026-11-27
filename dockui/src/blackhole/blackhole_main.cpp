@@ -19,6 +19,7 @@
 //   --snapshot <file.bmp> [--snapshot-after <s>]   --exit-after <s>   --bench <s per mode> [--bench-out <file>]
 //   --quit  (closes a running instance)
 #include <windows.h>
+#include "display_adapter.h"
 #include <windowsx.h>
 #include <commctrl.h>
 #include <d3d11_4.h>
@@ -272,7 +273,7 @@ public:
 private:
     bool Init() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &device_, nullptr, &ctx_))) return false;
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, &device_, nullptr, &ctx_))) return false;
         ComPtr<IDXGIDevice> dxgi; device_.As(&dxgi);
         ComPtr<IDXGIAdapter> adapter; dxgi->GetAdapter(&adapter);
         adapter->GetParent(IID_PPV_ARGS(&factory_));
@@ -635,15 +636,10 @@ private:
     }
 
     // Waits for the next display frame: the swap chain's latency waitable (never more than one frame queued), then the
-    // compositor clock, then the animation cap of the current mode.
-    void Pace(Quality q) {
+    // compositor clock. Quality changes the render cost, so every mode can follow the screen.
+    void Pace() {
         if (waitable_ && lastPresent_ > 0) WaitForSingleObjectEx(waitable_, 100, FALSE);
-        docky::vblank::WaitFrame();
-        const double cap = q == Quality::Low ? 60.0 : 0.0;
-        if (cap > 0) {
-            const double interval = docky::vblank::CapInterval(static_cast<int>(cap));
-            while (Now() - lastPresent_ < interval) docky::vblank::WaitFrame();
-        }
+        docky::vblank::WaitFrame(g_overlay);
     }
 
     void Publish(const std::vector<Frame>& recent) {
@@ -669,9 +665,7 @@ private:
         while (!g.quit) {
             if (seconds > 0 && Now() - begin >= seconds) break;
             if (g_exitAfter > 0 && Now() - start_ >= g_exitAfter) { g.quit = true; PostMessageW(g_panel ? g_panel : g_overlay, WM_CLOSE, 0, 0); break; }
-            Quality q; { std::lock_guard<std::mutex> lock(g.m); q = forceMode ? forced : g.p.quality; }
-            if (!forceMode && BatterySaverOn()) q = Quality::Low;
-            Pace(q);
+            Pace();
             Frame f;
             if (!Tick(f, forced, forceMode)) { Sleep(15); lastPresent_ = 0; continue; }
             const double now = Now();

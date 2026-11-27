@@ -1,4 +1,5 @@
 #include "app_registry.h"
+#include "steam_catalog.h"
 
 #include <knownfolders.h>
 #include <shlobj.h>
@@ -129,6 +130,15 @@ bool DiscoverShellApps(std::vector<AppEntry>& out,std::wstring& error,bool start
         CoTaskMemFree(parsing);
         if (!IsLaunchableEntry(e.name, e.parsingName)||(startOnly&&!IsStartApplication(item.Get(),e))) continue;
         e.id = "app:" + Utf8(Lower(e.parsingName));
+        ComPtr<IShellItem2> properties;
+        PWSTR rawTarget = nullptr;
+        if (SUCCEEDED(item.As(&properties)) &&
+            SUCCEEDED(properties->GetString(PKEY_Link_TargetParsingPath, &rawTarget)) && rawTarget) {
+            const auto target = Lower(rawTarget);
+            e.game = target.starts_with(L"steam://rungameid/") || target.find(L"\\steamapps\\common\\") != std::wstring::npos ||
+                     target.find(L"\\xboxgames\\") != std::wstring::npos;
+        }
+        CoTaskMemFree(rawTarget);
         if (!seen.insert(e.id).second) continue;
         out.push_back(std::move(e));
     }
@@ -166,7 +176,15 @@ bool DiscoverApps(std::vector<AppEntry>& out,std::wstring& error){
         } while (FindNextFileW(find, &fd));
         FindClose(find);
     }
-    std::stable_sort(out.begin(), out.end(), [](const AppEntry& a, const AppEntry& b) { return NameLess(a.name, b.name); });
+    for (auto& game : steam::InstalledGames(steam::Directory())) {
+        // A matching existing shortcut retains its ID so saved Launchpad folders and pins keep working.
+        const auto match = std::find_if(out.begin(), out.end(), [&](const AppEntry& entry) {
+            return _wcsicmp(entry.name.c_str(), game.name.c_str()) == 0;
+        });
+        if (match == out.end()) out.push_back(std::move(game));
+        else match->game = game.game;
+    }
+    SortApps(out);
     return true;
 }
 

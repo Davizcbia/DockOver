@@ -33,7 +33,7 @@ struct DockMetrics {
     float maxScale = 2.26f;        // magnification directly under the pointer
     float rangeSlots = 4.0f;       // cosine falloff reaches zero this many resting pitches away
     float liftFactor = 0.11f;      // magnified icon bottom rises (s-1)*liftFactor*icon
-    float bottomMargin = 5.5f;     // plate bottom to work-area bottom
+    float bottomMargin = 5.5f;     // plate bottom to the window canvas edge
     float sideMargin = 24.0f;      // transparent margin on each side of the window
     float labelSpace = 50.0f;      // label pill (25) + pointer (6) + gap to icon (16) + margin
     float bounceHeight = 21.0f;    // launch bounce amplitude (dynamic behaviour not yet measured)

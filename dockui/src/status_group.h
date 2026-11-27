@@ -29,9 +29,11 @@ struct State {
     int tileStyle = 0;             // Clock / Calendar plates: 0 light (white), 1 dark (black), 2 Liquid Glass
     int battery = -1;              // 0..100, -1 unknown
     int wifi = 0;                  // 0 unavailable, 1 not connected, 2 connected
+    bool bluetoothOn = false;
     bool audio = false, muted = false;
     int volume = 0;                // 0..100
     std::wstring inputBadge;       // the layout badge, e.g. EN (status_popups InputBadge)
+    std::wstring shortDate;
     std::wstring time;             // "9:41"
     // The Wi-Fi glyph of the active Workshop pack ("wifi.connected", premultiplied BGRA); drawn in the combined cell.
     std::shared_ptr<const std::vector<std::uint32_t>> wifiIcon;
@@ -66,6 +68,7 @@ float WidthFactor(const std::vector<std::wstring>& cells);
 // Cell `index` inside the tile body (DIP rectangle), packed as described above.
 D2D1_RECT_F CellRect(D2D1_RECT_F body, const std::vector<std::wstring>& cells, size_t index);
 // The cell under `p`, or -1.
+const wchar_t* SystemStatusPart(D2D1_RECT_F body, D2D1_POINT_2F point);
 int CellAt(D2D1_RECT_F body, const std::vector<std::wstring>& cells, D2D1_POINT_2F p);
 // The tooltip-style label shown above the hovered cell ("Wi-Fi", "Control Center", the extension id ...). A kept tray
 // icon's label is its exe name without ".exe" here; the Dock shows the app's own name while it runs (State::trayIcons).

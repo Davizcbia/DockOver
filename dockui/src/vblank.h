@@ -9,6 +9,8 @@
 // ticker's thread sleeps on an event and costs nothing.
 #include <windows.h>
 #include <dwmapi.h>
+#include <dxgi1_2.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,6 +31,7 @@ inline double Seconds() {
     static const double f = [] { LARGE_INTEGER q{}; QueryPerformanceFrequency(&q); return static_cast<double>(q.QuadPart); }();
     LARGE_INTEGER c{}; QueryPerformanceCounter(&c); return static_cast<double>(c.QuadPart) / f;
 }
+inline ULONGLONG AnimationMillis() { return static_cast<ULONGLONG>(Seconds() * 1000.0); }
 // The display frame period in seconds, measured by the tickers (1/240 on a 240 Hz display).
 inline std::atomic<double>& FramePeriod() {
     static std::atomic<double> p{[] {  // starts at the display's refresh period (DWM), refined by the tickers
@@ -62,7 +65,48 @@ inline void Pause(double seconds) {
 }
 
 // One compositor frame. Exposed for loops that pace themselves on their own thread.
-inline void WaitFrame() {
+inline void WaitFrame(HWND target = nullptr) {
+    // The compositor clock can follow a different output on mixed-refresh desktops.
+    // Keep one output per pacing thread and reopen it when the window moves or the driver resets.
+    if (target && GetSystemMetrics(SM_CMONITORS) > 1) {
+        using Microsoft::WRL::ComPtr;
+        thread_local HMONITOR previous{};
+        thread_local ComPtr<IDXGIOutput> output;
+        thread_local double retry = 0;
+        thread_local unsigned immediateReturns = 0;
+        const auto monitor = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+        if (monitor != previous || (!output && Seconds() >= retry)) {
+            previous = monitor; output.Reset(); immediateReturns = 0; retry = Seconds() + 2;
+            using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
+            static const auto create = [] {
+                auto dll = LoadLibraryW(L"dxgi.dll");
+                return dll ? reinterpret_cast<CreateFactory>(GetProcAddress(dll,"CreateDXGIFactory1")) : nullptr;
+            }();
+            ComPtr<IDXGIFactory1> factory;
+            if (monitor && create && SUCCEEDED(create(IID_PPV_ARGS(&factory)))) {
+                for (UINT i=0; !output; ++i) {
+                    ComPtr<IDXGIAdapter1> adapter;
+                    if (FAILED(factory->EnumAdapters1(i,&adapter))) break;
+                    for (UINT j=0;;++j) {
+                        ComPtr<IDXGIOutput> candidate;
+                        if (FAILED(adapter->EnumOutputs(j,&candidate))) break;
+                        DXGI_OUTPUT_DESC desc{};
+                        if (SUCCEEDED(candidate->GetDesc(&desc)) && desc.Monitor==monitor) {
+                            output=candidate; break;
+                        }
+                    }
+                }
+            }
+        }
+        if (output) {
+            const double before = Seconds();
+            if (SUCCEEDED(output->WaitForVBlank())) {
+                if (Seconds()-before > 0.00005) { immediateReturns=0; return; }
+                if (++immediateReturns < 3) return;
+            }
+            output.Reset(); retry=Seconds()+2;
+        }
+    }
     using WaitClock = DWORD(WINAPI*)(UINT, const HANDLE*, DWORD);
     static const WaitClock wait = [] {
         HMODULE dcomp = LoadLibraryW(L"dcomp.dll");
@@ -90,7 +134,7 @@ public:
                 double lastFrame = 0, lastPost = 0;
                 while (!s->quit) {
                     if (!s->run) { WaitForSingleObject(s->wake, INFINITE); lastFrame = 0; continue; }
-                    WaitFrame();
+                    WaitFrame(s->window.load());
                     const double now = Seconds();
                     if (lastFrame > 0) { const double d = now - lastFrame; if (d > 0.001 && d < 0.1) FramePeriod() = FramePeriod().load() * 0.9 + d * 0.1; }
                     lastFrame = now;
@@ -103,6 +147,7 @@ public:
                 CloseHandle(s->wake);
             }).detach();
         }
+        if (state_->run && state_->window == window && state_->msg == msg) return;
         state_->window = window; state_->msg = msg;
         state_->pending = false;
         if (!state_->run.exchange(true)) SetEvent(state_->wake);

@@ -185,6 +185,7 @@ private:
     std::wstring snapshotPath_;
     HWND hwnd_ = nullptr;
     float dpi_ = 96.0f;
+    bool sharedGraphicsMemory_ = false;
     D3D_FEATURE_LEVEL featureLevel_ = D3D_FEATURE_LEVEL_11_0;
     HANDLE waitable_ = nullptr;
     ComPtr<ID3D11Device> d3d_;

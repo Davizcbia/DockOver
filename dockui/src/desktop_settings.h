@@ -8,9 +8,10 @@ namespace liquid::settings {
 // program from the game list (GameListPath: game-compat.txt beside the settings file, one .exe name per line) runs.
 // lowLatencyGlass (opt-in): the Dock's glass shows the desktop one display frame after it was composed (one-frame DXGI
 // path, dockui/docs/glass-one-frame-latency-v01.md); off = the standard path.
-struct Dock { bool diagnostics = false; bool useMacIconMask = true; bool autoHide = false; bool hideSnapLayouts = false; bool genieMinimize = false; bool gameCompatibility = false;
+struct Dock { bool diagnostics = false; bool useMacIconMask = true; bool autoHide = false; bool hideSnapLayouts = false; bool genieMinimize = false; bool stagePerspective = true; bool gameCompatibility = false;
     bool lowLatencyGlass = false;
     int iconSize = 46;               // Dock icon size in DIP (screen width limits the live size)
+    int bottomOffsetPercent = 0;  // percent of the Dock monitor height, 0..25
     int magnification = 126;         // hover magnification in percent added to the icon (0 = none, 150 = 2.5x); default 2.26x
     int downloadsCount = 6;          // files the Downloads fan shows (3..10)
     bool downloadsVertical = false;  // the fan rises straight up instead of curving
@@ -19,7 +20,7 @@ struct Dock { bool diagnostics = false; bool useMacIconMask = true; bool autoHid
     // The Dock's status items, in order. Whole-icon tiles of their own: combo (battery, Wi-Fi, volume; opens Control
     // Center), analog (Clock), date (Calendar). Half-size cells, together in one group tile: control wifi bluetooth
     // sound battery input clock tray, and ext:<extension id>. Empty = nothing in the Dock.
-    std::vector<std::wstring> statusCells{L"combo", L"analog", L"date", L"tray"};
+    std::vector<std::wstring> statusCells{L"system", L"tray"};
     int statusTileStyle = 0;  // the Clock and Calendar tiles: 0 light, 1 dark, 2 Liquid Glass
     bool statusBatteryPercent = false;  // the status group's combined cell shows the battery level as a number
     // Dock items the user can remove (drag out of the Dock, or Remove from Dock) and add back (Dock menu > Show in Dock).
@@ -42,7 +43,7 @@ bool ValidStatusCell(const std::wstring& id);
 struct MenuBar { int scalePercent=100; bool enabled=true; bool themeGradient=true; int gradientOpacity=90, gradientLength=100; bool captureNotifications=false; bool hideSystemNotifications=true; int notificationBlur=20, notificationBlurFade=100, notificationShade=30; /* defaults: the user's tuning, 2026-11-19 */ }; struct Launchpad { int densityPreset=0, iconSize=96, gapX=80, gapY=48; bool hideLabels=false;
  bool showWindows=false; /* false (macOS): only the live wallpaper behind Launchpad; true: the live screen with its windows */ };
 struct AudioOutputPreference { std::wstring id, name; std::string icon; bool hidden=false; };
-struct ControlCenter { std::vector<AudioOutputPreference> audioOutputs; bool mediaArtworkBackground=false; bool musicWallpaper=false; /* desktop background shows the playing music's artwork (docky-now-playing --wallpaper) */ bool wallpaperAvoidBars=true; /* that artwork is fitted between the menu bar and the Dock */ bool wallpaperLyrics=true; /* lyrics on that desktop artwork */ bool lyricsFullArtwork=true; /* lyrics keep the borderless artwork (else: artwork card) */ bool animatedArtwork=true; bool lyricsDoubleClickSeek=true; bool keepArtworkWhenPaused=false; /* paused music keeps the artwork and lyrics on screen (else they fade out after 2.5 s) */ bool localMusicTags=true; /* a track named like a file (song.mp3) is looked up on this PC: its tags, cover and .lrc */ bool hideDesktopIconsWithWidgets=true; /* the hide-DockOver-Desktop shortcut also hides Windows desktop icons */ bool lyricsAutoReturn=true; /* scrolled lyrics return to the sung line */ int musicSensitivity=50; int musicResponse=1; /* 0 Instant, 1 Balanced, 2 Smooth */ int musicFps=60; /* frame rate cap of the music views' animation: 30/60/120/240, 0 = unlimited */ bool lyricsBeat=true; /* lyrics pulse with the music (WASAPI loopback) */ int lyricsOffsetMs=300; /* lyrics shown this much earlier (-3000..3000) */ int shortcutLyrics=0x34C, shortcutArtwork=0x34D, shortcutDesktop=0x344, shortcutNowPlaying=0x34E; /* global shortcuts, (MOD_* << 8) | virtual key, 0 = none; defaults Ctrl+Alt+L / M / D / N: desktop lyrics, music wallpaper, hide DockOver Desktop, full-screen Now Playing */ int backdropBlur=60; /* 0..100 %: strength of the blur behind the whole Control Center */ }; struct Appearance { int mode=0, settingsScalePercent=90, applicationsScalePercent=80, applicationsSort=0; std::string language="en"; }; // 0 system, 1 light, 2 dark
+struct ControlCenter { std::vector<AudioOutputPreference> audioOutputs; bool mediaArtworkBackground=false; bool musicWallpaper=false; /* desktop background shows the playing music's artwork (docky-now-playing --wallpaper) */ bool wallpaperAvoidBars=true; /* that artwork is fitted between the menu bar and the Dock */ bool wallpaperLyrics=true; /* lyrics on that desktop artwork */ bool lyricsFullArtwork=true; /* lyrics keep the borderless artwork (else: artwork card) */ bool animatedArtwork=true; bool lyricsDoubleClickSeek=true; bool keepArtworkWhenPaused=false; /* paused music keeps the artwork and lyrics on screen (else they fade out after 2.5 s) */ bool localMusicTags=true; /* a track named like a file (song.mp3) is looked up on this PC: its tags, cover and .lrc */ bool hideDesktopIconsWithWidgets=true; /* the hide-DockOver-Desktop shortcut also hides Windows desktop icons */ bool lyricsAutoReturn=true; /* scrolled lyrics return to the sung line */ int musicSensitivity=50; int musicResponse=1; /* 0 Instant, 1 Balanced, 2 Smooth */ int musicFps=60; /* frame rate cap of the music views' animation: 30/60/120/240, 0 = unlimited */ bool lyricsBeat=true; /* lyrics pulse with the music (WASAPI loopback) */ int lyricsOffsetMs=300; /* lyrics shown this much earlier (-3000..3000) */ int shortcutLyrics=0x34C, shortcutArtwork=0x34D, shortcutDesktop=0x344, shortcutNowPlaying=0x34E; /* global shortcuts, (MOD_* << 8) | virtual key, 0 = none; defaults Ctrl+Alt+L / M / D / N: desktop lyrics, music wallpaper, hide DockOver Desktop, full-screen Now Playing */ int backdropBlur=60; /* 0..100 %: strength of the blur behind the whole Control Center */ }; struct Appearance { int mode=0, settingsScalePercent=90, applicationsScalePercent=80, applicationsSort=0; bool applicationsLaunchpadOnly=true; std::string language="en"; }; // 0 system, 1 light, 2 dark
 // Windows taskbar integration. hideOnStartup is a preference only; the current visibility is runtime state
 // owned by the Desktop Manager. hotkeyModifiers uses MOD_* bits (MOD_ALT=1, MOD_CONTROL=2, MOD_SHIFT=4);
 // hotkeyKey 0 means "no shortcut". Default suggestion: Ctrl + Alt + T.
@@ -50,7 +51,7 @@ struct ControlCenter { std::vector<AudioOutputPreference> audioOutputs; bool med
 struct Taskbar { bool hideOnStartup=false; bool hotkeyEnabled=true; int hotkeyModifiers=3; int hotkeyKey=0x54; bool freeWorkArea=false; };
 // Frame-rate caps (Settings > General > Frame rate). 0 = unlimited (the display's refresh rate); otherwise 30/60/120/240.
 // animationFps: every animated surface; captureFps: how often live glass backdrops take a new picture of the desktop.
-struct Performance { int animationFps = 0, captureFps = 0; };
+struct Performance { int animationFps = 0, captureFps = 0; bool useDiscreteGpu = true; };
 // Software update (Settings > About). autoCheck: the Manager looks for a new GitHub release once a day;
 // autoInstall: it also downloads, verifies and installs it (docky restarts). Off: Settings shows it, a notification tells.
 struct Updates { bool autoCheck = true; bool autoInstall = false; };

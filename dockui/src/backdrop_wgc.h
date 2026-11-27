@@ -73,6 +73,8 @@ private:
     bool CompareRoi(ID3D11Texture2D* source = nullptr, bool commit = true);
     void InitCompare();
     void SubmitCompare(UINT width, UINT height);
+    void DiscardCompare();
+    void PublishCandidate();
     void Fail(const wchar_t* reason);
     void StartOrWait(HMONITOR monitor, bool tryDuplication = true);
     bool Start(HMONITOR monitor, bool tryDuplication);
@@ -98,7 +100,7 @@ private:
     std::chrono::steady_clock::time_point consentWaitSince_{};
     Microsoft::WRL::ComPtr<ID3D11Device> device_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext> context_;
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_, candidate_;
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture_, candidate_, normalizationInput_;
     Microsoft::WRL::ComPtr<ID3D11DeviceContext4> context4_;
     Microsoft::WRL::ComPtr<ID3D11Fence> fence_;
     uint64_t fenceValue_ = 0;

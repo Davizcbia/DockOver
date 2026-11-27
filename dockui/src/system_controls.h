@@ -85,6 +85,7 @@ struct State {
 };
 
 State Query(bool includeNetworks, bool includeBluetoothDevices);
+Radio ReadBluetoothRadio();  // status icon, without requesting radio control access
 
 bool SetVolume(int percent);
 bool SetMute(bool muted);

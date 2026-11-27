@@ -1,4 +1,5 @@
 #include "glass_window.h"
+#include "display_adapter.h"
 #include "../capture_visible.h"
 #include "../glass_params.h"
 #include "../menu_surface.h"
@@ -18,7 +19,7 @@ ID3D11Device* SharedUiDevice() {
     static Microsoft::WRL::ComPtr<ID3D11Device> device = [] {
         Microsoft::WRL::ComPtr<ID3D11Device> d;
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0};
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d, nullptr, nullptr)))
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), &d, nullptr, nullptr)))
             DLOG(L"desk glass: shared UI device unavailable; each window creates its own");
         return d;
     }();

@@ -32,12 +32,14 @@ using docky::pairing::Ui;
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <optional>
 #include <cmath>
 #include <cstdio>
 #include <string>
 #include <vector>
 #include <functional>
 
+#include "../suite_install.h"
 #include "../desktop/duplication.h"
 #include "../vblank.h"
 #include "bubble_ps.h"
@@ -169,8 +171,24 @@ std::wstring g_receiveFolder, g_lastText, g_activePhone, g_targetPhone, g_shellS
 constexpr ULONG_PTR kShellSendFile = 0x44444631;
 constexpr UINT kShellSendReady = WM_APP + 42;
 constexpr UINT kWidgetDraftReady = WM_APP + 43;
+constexpr UINT kTrayCallback = WM_APP + 44;
+constexpr UINT kTrayIconId = 1;
+const UINT kTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+bool g_trayAdded = false, g_trayVersion4 = false;
 std::wstring g_receivePrompt;
 bool g_offerSending = false;
+bool g_phoneBall = false;
+HANDLE g_phoneDecision = nullptr;
+ULONGLONG g_decisionDeadline = 0;
+constexpr UINT_PTR kPhoneDecisionTimer = 65;
+constexpr DWORD kPhoneConfirmed = 42;
+void ClosePhoneDecision() {
+    if (!g_phoneDecision) return;
+    if (WaitForSingleObject(g_phoneDecision, 0) == WAIT_TIMEOUT) TerminateProcess(g_phoneDecision, 1);
+    CloseHandle(g_phoneDecision);
+    g_phoneDecision = nullptr;
+    KillTimer(g_wnd, kPhoneDecisionTimer);
+}
 constexpr UINT kPhoneOffer = WM_APP + 41;
 docky::pairing::IncomingFile g_incoming;
 docky::pairing::OutgoingTransfer g_outgoing;
@@ -374,6 +392,10 @@ int PcPeerAt(POINT point, double now) {
 void PollPcBall(double now) {
     auto& offer = *g_pcOffer;
     const auto tick = GetTickCount64();
+    if (g_phoneBall) {
+        if (tick >= g_decisionDeadline) g_quit = true;
+        return;
+    }
     docky::pairing::pc_receive::PollInput(g_wnd, offer, tick);
     if (offer.Terminal() && tick >= offer.closeAt) { g_quit = true; return; }
     if (offer.sending && offer.accepted && g_pcMotion.Connected() < 0 && !offer.failed)
@@ -440,6 +462,7 @@ void SetPcReceiveRegion(HWND window, int diameter) {
 
 void ConfirmPcBall() {
     auto& offer = *g_pcOffer;
+    if (g_phoneBall) { offer.accepted = true; g_quit = true; return; }
     if (offer.complete) {
         ShellExecuteW(g_wnd, L"open", offer.folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
         g_quit = true;
@@ -450,7 +473,7 @@ void ConfirmPcBall() {
 }
 
 void ClosePcBall() {
-    if (IsPcReceiveBall() && !g_pcOffer->accepted && !g_pcOffer->failed)
+    if (!g_phoneBall && IsPcReceiveBall() && !g_pcOffer->accepted && !g_pcOffer->failed)
         docky::pairing::pc_receive::Answer("decline\n", 8);
     g_quit = true;
 }
@@ -645,7 +668,7 @@ void ReplyPhone(const std::wstring& reply) {
 
 // The phone page is what the user sees (not hidden in the background, not the PC picker): only then does the phone host
 // keep a room open for the QR code. Remembered phones are listened for either way.
-bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && g_opt.pairPhone; }
+bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && !IsIconic(g_wnd) && g_opt.pairPhone; }
 bool g_qrListening = true;
 void SyncQrListening() {
     const bool shown = PhonePageShown();
@@ -784,6 +807,7 @@ void ReceivePhoneMessage(std::wstring_view message) {
             g_outgoing.Clear();
             SetReceiveStatus(message == L"out-done" ? Ui(L"已发送到手机") : Ui(L"发送未完成"));
         } else if (message == L"error") {
+            ClosePhoneDecision(); g_receivePrompt.clear();
             g_transferring = false;
             g_incoming.Cancel();
             if (g_finishedAt < 0) g_transferProgress = 0.0f;
@@ -806,7 +830,13 @@ void ReceivePhoneMessage(std::wstring_view message) {
         SetWindowTextW(g_status, Ui(std::wstring(message.substr(7)).c_str()));
     } else if ((message == L"paired" && g_opt.codeMode == 4) ||
                (message.starts_with(L"paired:") && docky::pairing::TrustHex(message.substr(7), 32))) {
-        if (message.starts_with(L"paired:")) g_activePhone.assign(message.substr(7));
+        if (message.starts_with(L"paired:")) {
+            g_activePhone.assign(message.substr(7));
+            if (!PhonePageShown()) {
+                g_connectedAt = Now();
+                return;  // The remembered phone asks for attention through its own offer ball.
+            }
+        }
         if (!g_opt.pairPhone && g_phoneReady) { EnterPhonePage(false); RevealPhoneControls(); }  // shown on the picker
         ShowFromBackground();
         g_opt.codeMode = 4;
@@ -959,7 +989,7 @@ void CreatePhoneControls(HWND window) {
     g_guide = create(L"STATIC", kScanLink, WS_VISIBLE | SS_OWNERDRAW, kGuide);
     g_fallbackButton = create(L"BUTTON", Ui(L"备用光纹"), WS_VISIBLE | WS_TABSTOP | WS_DISABLED | BS_OWNERDRAW, kFallbackToggle);
     g_close = create(L"BUTTON", Ui(L"关闭"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kClose);
-    g_back = create(L"BUTTON", Ui(L"返回"), WS_TABSTOP | BS_OWNERDRAW, kBack);
+    g_back = create(L"BUTTON", Ui(L"返回"), WS_TABSTOP | BS_OWNERDRAW | (g_unified ? WS_VISIBLE : 0), kBack);
     g_receiveSettings = create(L"BUTTON", Ui(L"接收设置"), WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, kReceiveSettings);
     g_copyText = create(L"BUTTON", Ui(L"复制文字"), WS_TABSTOP | BS_OWNERDRAW, kCopyText);
     g_openFolder = create(L"BUTTON", Ui(L"打开文件夹"), WS_TABSTOP | BS_OWNERDRAW, kOpenFolder);
@@ -1402,12 +1432,38 @@ void SamplePointer(Constants& constants, double now) {
 }
 #endif
 
+void WaitBubbleFrame() {
+#ifdef DOCKY_PHONE_PAIRING
+    static const auto path = g_opt.settingsPath.empty() ? liquid::settings::DefaultPath() : g_opt.settingsPath;
+    static double nextCheck = 0, lastFrame = 0;
+    static std::optional<decltype(liquid::settings::ReadRevision(path))> revision;
+    const double now = docky::vblank::Seconds();
+    if (now >= nextCheck) {
+        nextCheck = now + 1;
+        const auto current = liquid::settings::ReadRevision(path);
+        if (!revision || *revision != current) {
+            revision = current;
+            const auto caps = liquid::settings::Load(path).value.performance;
+            docky::vblank::SetCaps(caps.animationFps,caps.captureFps);
+        }
+    }
+    do { docky::vblank::WaitFrame(g_wnd); }
+    while (docky::vblank::Seconds() - lastFrame < docky::vblank::CapInterval(docky::vblank::AnimationCap()));
+    lastFrame = docky::vblank::Seconds();
+#else
+    docky::vblank::WaitFrame(g_wnd);
+#endif
+}
+
 class App {
 public:
     bool Init() {
         const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &dev_, nullptr, &ctx_))) return false;
-        ComPtr<IDXGIDevice> dxgi; dev_.As(&dxgi);
+        if (FAILED(docky::CreateRenderDevice(D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels),
+                                             &dev_, nullptr, &ctx_))) return false;
+        ComPtr<IDXGIDevice1> dxgi;
+        if (FAILED(dev_.As(&dxgi))) return false;
+        dxgi->SetMaximumFrameLatency(1);
         ComPtr<IDXGIAdapter> adapter; dxgi->GetAdapter(&adapter);
         adapter->GetParent(IID_PPV_ARGS(&factory_));
         if (FAILED(DCompositionCreateDevice(dxgi.Get(), IID_PPV_ARGS(&dcomp_)))) return false;
@@ -1619,11 +1675,11 @@ public:
 
         D3D11_MAPPED_SUBRESOURCE m{};
         if (SUCCEEDED(ctx_->Map(cb_.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) { memcpy(m.pData, &c, sizeof(c)); ctx_->Unmap(cb_.Get(), 0); }
-        ComPtr<ID3D11Texture2D> back; swap_->GetBuffer(0, IID_PPV_ARGS(&back));
-        ComPtr<ID3D11RenderTargetView> rtv; dev_->CreateRenderTargetView(back.Get(), nullptr, &rtv);
+        if (!backBuffer_ && FAILED(swap_->GetBuffer(0, IID_PPV_ARGS(&backBuffer_)))) return;
+        if (!backTarget_ && FAILED(dev_->CreateRenderTargetView(backBuffer_.Get(), nullptr, &backTarget_))) return;
         const float clear[4] = {0, 0, 0, 0};
-        ctx_->ClearRenderTargetView(rtv.Get(), clear);
-        ID3D11RenderTargetView* r = rtv.Get();
+        ctx_->ClearRenderTargetView(backTarget_.Get(), clear);
+        ID3D11RenderTargetView* r = backTarget_.Get();
         ctx_->OMSetRenderTargets(1, &r, nullptr);
         const D3D11_VIEWPORT vp{0, 0, static_cast<float>(w), static_cast<float>(h), 0, 1};
         ctx_->RSSetViewports(1, &vp);
@@ -1664,21 +1720,21 @@ public:
 #ifdef DOCKY_PHONE_PAIRING
         if (g_opt.devicePreviewCount) {
             ctx_->OMSetRenderTargets(0, nullptr, nullptr);
-            g_devicePreview.PaintText(back.Get());
+            g_devicePreview.PaintText(backBuffer_.Get());
         }
         if (g_pcOffer) {
             ctx_->OMSetRenderTargets(0, nullptr, nullptr);
-            PaintPcBallText(back.Get(), c);
+            PaintPcBallText(backBuffer_.Get(), c);
         }
 #endif
 
         if (snapshotting && (!g_opt.pcPreview || g_pcStarted > 0.0) &&
             now - start_ >= g_opt.seqAfter + seqIndex_ * g_opt.seqInterval) {
             wchar_t name[64]; swprintf_s(name, L"\\bubble_%04d.bmp", seqIndex_++);
-            SaveBmp(back.Get(), g_opt.seqDir + name);
+            SaveBmp(backBuffer_.Get(), g_opt.seqDir + name);
         }
 #ifdef DOCKY_PHONE_PAIRING
-        const bool snapshot = pendingSwitch_ && CaptureSnapshot(back.Get());
+        const bool snapshot = pendingSwitch_ && CaptureSnapshot(backBuffer_.Get());
 #endif
         if (FAILED(swap_->Present(0, 0))) return;
 #ifdef DOCKY_PHONE_PAIRING
@@ -1693,11 +1749,11 @@ public:
             if (snapshot) StartSnapshotAnimation(static_cast<float>(w), static_cast<float>(h));
         }
         if (snapVisual_ && now >= snapEnd_) {
-            root_->RemoveVisual(snapVisual_.Get());
+            root_->RemoveVisual(snapVisual_.Get()); compositionDirty_ = true;
             snapVisual_.Reset();
         }
 #endif
-        dcomp_->Commit();
+        if (compositionDirty_ && SUCCEEDED(dcomp_->Commit())) compositionDirty_ = false;
         const double t1 = Now();
 #ifdef DOCKY_PHONE_PAIRING
         if (g_opt.pcPreview && g_pcStarted == 0.0) {
@@ -1727,9 +1783,11 @@ private:
             if (FAILED(pcTextFactory_->CreateDxgiSurfaceRenderTarget(surface.Get(),
                     D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_DEFAULT, format, 96, 96), &pcInk_))) return;
             const auto make = [&](float size, DWRITE_FONT_WEIGHT weight, ComPtr<IDWriteTextFormat>& text,
-                                  bool keepExtension = false) {
-                if (FAILED(pcFontFactory_->CreateTextFormat(L"Segoe UI", nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
-                    DWRITE_FONT_STRETCH_NORMAL, size * uiScale, L"", &text))) return false;
+                                  bool keepExtension = false, bool button = false) {
+                const bool chinese = PRIMARYLANGID(docky::pairing::uiLanguage) == LANG_CHINESE;
+                const wchar_t* family = button && chinese ? L"Microsoft YaHei UI" : L"Segoe UI";
+                if (FAILED(pcFontFactory_->CreateTextFormat(family, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL, size * uiScale, chinese ? L"zh-CN" : L"", &text))) return false;
                 text->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
                 text->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
                 text->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
@@ -1741,7 +1799,8 @@ private:
             };
             if (!make(offer.sending ? 16.f : 18.f, DWRITE_FONT_WEIGHT_SEMI_BOLD, pcTitle_) ||
                 !make(offer.sending ? 13.f : 14.f, DWRITE_FONT_WEIGHT_MEDIUM, pcDetail_) ||
-                (!offer.sending && !make(14.f, DWRITE_FONT_WEIGHT_MEDIUM, pcFilename_, true)) ||
+                (!offer.sending && (!make(14.f, DWRITE_FONT_WEIGHT_MEDIUM, pcFilename_, true) ||
+                    !make(17.f, DWRITE_FONT_WEIGHT_BOLD, pcAction_, false, true))) ||
                 FAILED(pcInk_->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), &pcBrush_))) {
                 pcInk_.Reset(); return;
             }
@@ -1753,7 +1812,7 @@ private:
                               bool action = false, bool filename = false) {
             const auto rect = D2D1::RectF(x - width * 0.5f, cy - lineH * 0.5f, x + width * 0.5f, cy + lineH * 0.5f);
             const auto shadow = D2D1::RectF(rect.left, rect.top + uiScale, rect.right, rect.bottom + uiScale);
-            const auto font = filename ? pcFilename_.Get() : emph ? pcTitle_.Get() : pcDetail_.Get();
+            const auto font = filename ? pcFilename_.Get() : action ? pcAction_.Get() : emph ? pcTitle_.Get() : pcDetail_.Get();
             pcBrush_->SetColor(D2D1::ColorF(0.01f, 0.025f, 0.05f, 0.87f));
             pcInk_->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()), font, shadow, pcBrush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
             pcBrush_->SetColor(action ? D2D1::ColorF(0.78f, 0.91f, 1.f) :
@@ -1788,13 +1847,13 @@ private:
             g_pcReceiveCloseVisible = overWindow && std::hypot(pointer.x - x, pointer.y - y) <= radius * 1.03f;
             const auto hot = overWindow ? PcReceiveActionAt(g_wnd, pointer) : PcReceiveAction::None;
             line(offer.sender, y - radius * 0.45f, radius * 1.46f, true);
-            line(Ui(L"想给你发送文件"), y - radius * 0.24f, radius * 1.53f, false);
+            line(g_phoneBall ? Ui(g_offerSending ? L"请求接收文件或文字" : L"想发送文件或文字") : Ui(L"想给你发送文件"), y - radius * 0.24f, radius * 1.53f, false);
             line(offer.file, y - radius * 0.02f, radius * 1.60f, false, false, true);
             line(offer.bytes, y + radius * 0.18f, radius * 1.34f, false);
             const auto pill = PcReceiveControl(PcReceiveAction::Confirm, x, y, radius);
             pcBrush_->SetColor(D2D1::ColorF(0.03f, 0.10f, 0.18f, hot == PcReceiveAction::Confirm ? 0.84f : 0.66f));
             pcInk_->FillRoundedRectangle(D2D1::RoundedRect(pill, lineH, lineH), pcBrush_.Get());
-            line(Ui(L"确认接收"), (pill.top + pill.bottom) * 0.5f, pill.right - pill.left, true, true);
+            line(g_phoneBall && g_offerSending ? Ui(L"确认发送") : Ui(L"确认接收"), (pill.top + pill.bottom) * 0.5f, pill.right - pill.left, true, true);
             if (g_pcReceiveCloseVisible) {
                 const auto close = PcReceiveControl(PcReceiveAction::Close, x, y, radius);
                 const auto center = D2D1::Point2F((close.left + close.right) * 0.5f, (close.top + close.bottom) * 0.5f);
@@ -1834,10 +1893,14 @@ private:
     void UpdateDesktop() {
         if (!deskUser_) return;
         HMONITOR mon = MonitorFromWindow(g_wnd, MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{sizeof(mi)}; GetMonitorInfoW(mon, &mi);
+        MONITORINFO mi{sizeof(mi)};
+        if (!GetMonitorInfoW(mon, &mi)) return;
+        if (!EqualRect(&monitor_, &mi.rcMonitor)) {
+            deskSrv_.Reset(); desk_.Reset(); view_.Reset(); lastSerial_ = 0;
+        }
         monitor_ = mi.rcMonitor;
         auto& sd = docky::desk::SharedDesktop::Get();
-        sd.Want(monitor_);
+        if (!sd.Want(monitor_, 0)) return;
         if (sd.Owned()) sd.PumpOwned(0);
         if (!sd.Valid()) return;
         if (!view_ || viewGen_ != sd.Generation()) {
@@ -1879,11 +1942,13 @@ private:
         pcBrush_.Reset();
         pcInk_.Reset();
 #endif
+        backBuffer_.Reset(); backTarget_.Reset();
         if (swap_) { ctx_->ClearState(); ctx_->Flush(); if (SUCCEEDED(swap_->ResizeBuffers(2, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, 0))) { swapW_ = w; swapH_ = h; return true; } swap_.Reset(); }
         DXGI_SWAP_CHAIN_DESC1 d{}; d.Width = w; d.Height = h; d.Format = DXGI_FORMAT_B8G8R8A8_UNORM; d.SampleDesc.Count = 1;
         d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; d.BufferCount = 2; d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL; d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
         if (FAILED(factory_->CreateSwapChainForComposition(dev_.Get(), &d, nullptr, &swap_))) return false;
         visual_->SetContent(swap_.Get());
+        compositionDirty_ = true;
         swapW_ = w; swapH_ = h;
         return true;
     }
@@ -1912,7 +1977,7 @@ private:
     // The old page without its ball: the ball itself is not faded but carried over (MorphBall), so the snapshot gets a
     // soft-edged hole where the ball is and only the rest of the page fades away above the new one.
     bool CaptureSnapshot(ID3D11Texture2D* back) {
-        if (snapVisual_) { root_->RemoveVisual(snapVisual_.Get()); snapVisual_.Reset(); }
+        if (snapVisual_) { root_->RemoveVisual(snapVisual_.Get()); compositionDirty_ = true; snapVisual_.Reset(); }
         D3D11_TEXTURE2D_DESC d{};
         back->GetDesc(&d);
         D3D11_TEXTURE2D_DESC sd = d;
@@ -1951,6 +2016,7 @@ private:
         surface->EndDraw();
         if (FAILED(dcomp_->CreateVisual(&snapVisual_))) return false;
         snapVisual_->SetContent(surface.Get());
+        compositionDirty_ = true;
         root_->AddVisual(snapVisual_.Get(), FALSE, nullptr);  // above the page
         return true;
     }
@@ -2015,6 +2081,9 @@ private:
     bool switchForward_ = true, phoneGlassReady_ = false, pickerReady_ = false, morphing_ = false;
     double snapEnd_ = 0, morphStart_ = 0;
     float lastBall_[3]{}, morphFrom_[3]{};
+    bool compositionDirty_ = true;
+    ComPtr<ID3D11Texture2D> backBuffer_;
+    ComPtr<ID3D11RenderTargetView> backTarget_;
     ComPtr<IDXGISwapChain1> swap_; UINT swapW_ = 0, swapH_ = 0;
     ComPtr<ID3D11VertexShader> vs_; ComPtr<ID3D11PixelShader> ps_, psRays_, psPc_;
     ComPtr<ID3D11Texture2D> pass1_; ComPtr<ID3D11RenderTargetView> pass1Rtv_; ComPtr<ID3D11ShaderResourceView> pass1Srv_; UINT pass1W_ = 0, pass1H_ = 0;
@@ -2036,7 +2105,7 @@ private:
     ComPtr<IDWriteFactory> pcFontFactory_;
     ComPtr<ID2D1RenderTarget> pcInk_;
     ComPtr<ID2D1SolidColorBrush> pcBrush_;
-    ComPtr<IDWriteTextFormat> pcTitle_, pcDetail_, pcFilename_;
+    ComPtr<IDWriteTextFormat> pcTitle_, pcDetail_, pcFilename_, pcAction_;
 #endif
 };
 
@@ -2126,6 +2195,7 @@ void ShowBackConfirm(bool show, bool closing) {
 
 // Back: drop the current phone session (cancelling any transfer) and start over with a fresh code.
 void ResetPairing() {
+    ClosePhoneDecision();
     g_phoneHost.reset();
     g_incoming.Cancel();
     g_outgoing.Clear();
@@ -2169,6 +2239,31 @@ constexpr auto kRunValue = L"DockDrop";
 #else
 constexpr auto kRunValue = L"DockOver DockDrop";
 #endif
+void SyncTrayIcon(HWND window, bool show, bool rebuild = false) {
+    if (show == g_trayAdded && !rebuild) return;
+
+    NOTIFYICONDATAW icon{sizeof(icon)};
+    icon.hWnd = window;
+    icon.uID = kTrayIconId;
+    if (!show) {
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+        g_trayAdded = g_trayVersion4 = false;
+        return;
+    }
+
+    icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    icon.uCallbackMessage = kTrayCallback;
+    icon.hIcon = reinterpret_cast<HICON>(GetClassLongPtrW(window, GCLP_HICONSM));
+    wcscpy_s(icon.szTip, L"DockDrop");
+    g_trayAdded = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+    icon.uVersion = NOTIFYICON_VERSION_4;
+    g_trayVersion4 = g_trayAdded && Shell_NotifyIconW(NIM_SETVERSION, &icon);
+}
+
+bool NeedsTrayIcon(HWND window) {
+    return g_unified && (!IsWindowVisible(window) || IsIconic(window));
+}
+
 void SyncAutostart(bool on) {
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr,
@@ -2371,7 +2466,6 @@ bool EnterPhonePage(bool animate) {
             g_phoneReady = true;
             g_parkControls = true;  // created parked; revealed below
             CreatePhoneControls(g_wnd);
-            ShowWindow(g_back, SW_SHOW);
             DragAcceptFiles(g_wnd, TRUE);
             LoadWidgetDraft();
             g_phoneHost = docky::pairing::StartPhoneHost(g_wnd, ReceivePhoneMessage);
@@ -2424,8 +2518,36 @@ void ClosePicker() {
 #endif
 
 LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+#ifdef DOCKY_PHONE_PAIRING
+    if (kTaskbarCreated && msg == kTaskbarCreated) {
+        if (NeedsTrayIcon(h)) SyncTrayIcon(h, true, true);
+        return 0;
+    }
+#endif
+    static const UINT updateQuit = RegisterWindowMessageW(L"DockOver.Update.Quit");
+    if (updateQuit && msg == updateQuit) {
+#ifdef DOCKY_PHONE_PAIRING
+        // Leave active transfers running. The updater retries the request until its deadline.
+        if ((g_transferring && g_finishedAt < 0) ||
+            (g_pcOffer && g_pcOffer->accepted && !g_pcOffer->Terminal())) return 0;
+        if (g_pcOffer) { ClosePcBall(); return 0; }
+#endif
+        g_quit = true;
+        return 0;
+    }
     switch (msg) {
 #ifdef DOCKY_PHONE_PAIRING
+    case kTrayCallback: {
+        if (!g_trayAdded) return 0;
+        const UINT id = g_trayVersion4 ? HIWORD(lp) : static_cast<UINT>(wp);
+        const UINT event = g_trayVersion4 ? LOWORD(lp) : static_cast<UINT>(lp);
+        if (id == kTrayIconId && (g_trayVersion4 ? event == NIN_SELECT || event == NIN_KEYSELECT
+                                               : event == WM_LBUTTONUP)) {
+            ShowWindow(h, IsIconic(h) ? SW_RESTORE : SW_SHOW);
+            SetForegroundWindow(h);
+        }
+        return 0;
+    }
     case WM_COPYDATA: {
         const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lp);
         if (data && data->dwData == kShowPicker && g_unified) {  // a second "DockDrop" launch: show the picker here
@@ -2464,33 +2586,25 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case kPhoneOffer: {
-        if (!g_opt.pairPhone && g_phoneReady) { EnterPhonePage(false); RevealPhoneControls(); }
-        ShowFromBackground();
-        const auto host = g_phoneHost;
-        const auto id = std::exchange(g_receivePrompt, {});
-        const auto phones = docky::pairing::ReadTrustedPhones();
-        const auto peer = std::find_if(phones.begin(), phones.end(), [&id](const auto& phone) { return phone.id == id; });
-        bool accepted = false;
-        if (peer != phones.end() && id == g_activePhone && g_connectedAt > 0) {
-            const std::wstring text = std::wstring(Ui(g_offerSending ? L"将选中的文件或文字发送到这台手机？"
-                                                                    : L"允许这台手机发送文件或文字？"))
-                + L"\n\n" + peer->name;
-            TASKDIALOGCONFIG dialog{};
-            dialog.cbSize = sizeof(dialog);
-            dialog.hwndParent = h;
-            dialog.dwFlags = TDF_CALLBACK_TIMER | TDF_ALLOW_DIALOG_CANCELLATION;
-            dialog.dwCommonButtons = TDCBF_YES_BUTTON | TDCBF_NO_BUTTON;
-            dialog.pszWindowTitle = L"DockDrop";
-            dialog.pszMainInstruction = text.c_str();
-            dialog.nDefaultButton = IDNO;
-            dialog.pfCallback = [](HWND window, UINT event, WPARAM elapsed, LPARAM, LONG_PTR) -> HRESULT {
-                if (event == TDN_TIMER && elapsed >= 38000) SendMessageW(window, TDM_CLICK_BUTTON, IDNO, 0);
-                return S_OK;
-            };
-            int choice = IDNO;
-            accepted = SUCCEEDED(TaskDialogIndirect(&dialog, &choice, nullptr, nullptr)) && choice == IDYES;
+        if (g_receivePrompt.empty() || g_phoneDecision) return 0;
+        wchar_t exe[32768]{};
+        const DWORD length = GetModuleFileNameW(nullptr, exe, ARRAYSIZE(exe));
+        if (length && length < ARRAYSIZE(exe) && g_receivePrompt == g_activePhone &&
+            docky::pairing::TrustHex(g_receivePrompt, 32) && g_connectedAt > 0) {
+            std::wstring command = L"\"" + std::wstring(exe) + L"\" --phone-drop-confirm " +
+                g_receivePrompt + (g_offerSending ? L" send " : L" receive ") + std::to_wstring(docky::pairing::uiLanguage);
+            STARTUPINFOW startup{sizeof(startup)};
+            PROCESS_INFORMATION process{};
+            if (CreateProcessW(exe,command.data(),nullptr,nullptr,FALSE,0,nullptr,nullptr,&startup,&process)) {
+                CloseHandle(process.hThread);
+                g_phoneDecision = process.hProcess;
+                g_decisionDeadline = GetTickCount64() + 38000;
+                if (SetTimer(h,kPhoneDecisionTimer,50,nullptr)) return 0;
+                ClosePhoneDecision();
+            }
         }
-        docky::pairing::ReplyToPhoneHost(host, accepted ? L"ok" : L"error");
+        g_receivePrompt.clear();
+        ReplyPhone(L"error");
         return 0;
     }
     case WM_DROPFILES: {
@@ -2731,9 +2845,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
 #endif
         if (wp == VK_ESCAPE) g_quit = true;
         return 0;
-    case WM_ENTERSIZEMOVE: SetTimer(h, 1, 8, nullptr); return 0;
     case WM_EXITSIZEMOVE:
-        KillTimer(h, 1);
+        // Keep the last DirectComposition frame while Windows moves the window.
+        // The outer loop resumes rendering as soon as the native move loop exits.
 #ifdef DOCKY_PHONE_PAIRING
         if (g_opt.pairPhone) {
             RECT window{};
@@ -2743,6 +2857,23 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
 #ifdef DOCKY_PHONE_PAIRING
+        if (wp == kPhoneDecisionTimer && g_phoneDecision) {
+            DWORD result = 0;
+            if (GetExitCodeProcess(g_phoneDecision, &result) && result == STILL_ACTIVE &&
+                GetTickCount64() < g_decisionDeadline) return 0;
+            const auto phones = docky::pairing::ReadTrustedPhones();
+            const bool accepted = result == kPhoneConfirmed && GetTickCount64() < g_decisionDeadline &&
+                g_connectedAt > 0 && g_activePhone == g_receivePrompt &&
+                std::any_of(phones.begin(),phones.end(),[](const auto& p){return p.id == g_receivePrompt;});
+            ClosePhoneDecision();
+            g_receivePrompt.clear();
+            if (accepted) {
+                if (!g_opt.pairPhone && g_phoneReady) { EnterPhonePage(false); RevealPhoneControls(); }
+                ShowFromBackground();
+            }
+            ReplyPhone(accepted ? L"ok" : L"error");
+            return 0;
+        }
         if (wp == kSaveRadiusTimer) { SaveRadius(); return 0; }
         if (wp == kRevealPhoneTimer) { RevealPhoneControls(true); return 0; }
         if (wp == kPickerSwitchTimer) { SwitchToPicker(true); return 0; }
@@ -2757,7 +2888,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
 #endif
-        if (g_app) g_app->Frame();
         return 0;
     case WM_DPICHANGED: {
         const RECT* r = reinterpret_cast<const RECT*>(lp);
@@ -2866,7 +2996,7 @@ int RunPcBallSession(HINSTANCE instance, docky::pairing::pc_receive::Offer& offe
         if (!g_quit) {
             app.Frame();
             if (!g_quit && app.Presented() && !IsWindowVisible(g_wnd)) ShowWindow(g_wnd, SW_SHOWNOACTIVATE);
-            docky::vblank::WaitFrame();
+            WaitBubbleFrame();
         }
     }
     app.Shutdown();
@@ -2880,10 +3010,43 @@ int RunPcBallSession(HINSTANCE instance, docky::pairing::pc_receive::Offer& offe
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
+#ifdef DOCKDROP_STANDALONE
+    if (docky::suite::Active()) {
+        int count = 0;
+        auto args = CommandLineToArgvW(GetCommandLineW(), &count);
+        const std::wstring_view action = count > 1 ? args[1] : L"";
+        std::wstring forward;
+        if (action.empty() || action == L"--discover") forward = L"--discover";
+        else if (action == L"--pair-phone" || action == L"--background") forward = action;
+        else if (action == L"--send-file" && count == 3 && !wcschr(args[2], L'"'))
+            forward = L"--send-file \"" + std::wstring(args[2]) + L"\"";
+        const bool background = action == L"--background";
+        if (args) LocalFree(args);
+        if (!forward.empty() && !docky::suite::Launch(docky::suite::InstalledRoot(), L"docky-bubble.exe", forward) && !background)
+            MessageBoxW(nullptr, L"Open DockDrop from DockOver.\n请从 DockOver 打开 DockDrop。", L"DockOver", MB_OK | MB_ICONINFORMATION);
+        return 0;
+    }
+#endif
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     int argc = 0; wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
 #ifdef DOCKY_PHONE_PAIRING
+    if ((argc == 4 || argc == 5) && std::wstring_view(argv[1]) == L"--phone-drop-confirm") {
+        if (argc == 5) docky::pairing::uiLanguage = static_cast<LANGID>(_wtoi(argv[4]));
+        const std::wstring id = argv[2];
+        g_offerSending = std::wstring_view(argv[3]) == L"send";
+        LocalFree(argv);
+        const auto peers = docky::pairing::ReadTrustedPhones();
+        const auto peer = std::find_if(peers.begin(), peers.end(), [&](const auto& p){return p.id == id;});
+        if (peer == peers.end()) { CoUninitialize(); return 1; }
+        docky::pairing::pc_receive::Offer offer;
+        offer.sender = peer->name;
+        g_phoneBall = true;
+        g_decisionDeadline = GetTickCount64() + 38000;
+        const int code = RunPcBallSession(inst,offer);
+        CoUninitialize();
+        return !code && offer.accepted ? kPhoneConfirmed : 1;
+    }
     if (argc == 6 && (std::wstring_view(argv[1]) == L"--pc-receive-offer" ||
                      std::wstring_view(argv[1]) == L"--pc-send-progress")) {
         docky::pairing::pc_receive::Offer offer;
@@ -3095,7 +3258,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         }
     }
 #endif
+#ifdef DOCKDROP_STANDALONE
+    ULONGLONG lastSuiteCheck = 0;
+#endif
     while (!g_quit) {
+#ifdef DOCKDROP_STANDALONE
+        const ULONGLONG now = GetTickCount64();
+        if (now - lastSuiteCheck >= 3000 && (!g_transferring || g_finishedAt >= 0)) {
+            lastSuiteCheck = now;
+            if (docky::suite::Active()) break;
+        }
+#endif
         MSG m;
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
 #ifdef DOCKY_PHONE_PAIRING
@@ -3127,18 +3300,21 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         if (g_quit) break;
 #ifdef DOCKY_PHONE_PAIRING
         if (g_phoneReady || g_opt.pairPhone) SyncQrListening();
-        if ((g_opt.pairPhone || g_opt.devicePreviewCount) && !IsWindowVisible(g_wnd)) {
+        SyncTrayIcon(g_wnd, NeedsTrayIcon(g_wnd));
+        if ((g_opt.pairPhone || g_opt.devicePreviewCount) && (!IsWindowVisible(g_wnd) || IsIconic(g_wnd))) {
             MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             continue;
         }
 #endif
         app.Frame();
-        docky::vblank::WaitFrame();
+        WaitBubbleFrame();
     }
     app.Shutdown();
 #ifdef DOCKY_PHONE_PAIRING
+    SyncTrayIcon(g_wnd, false);
     if (g_opt.pairPhone || g_phoneReady) SaveRadius();
     g_incoming.Cancel();
+    ClosePhoneDecision();
     g_phoneHost.reset();
     if (singleInstance) CloseHandle(singleInstance);
 #endif

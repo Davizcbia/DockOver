@@ -56,6 +56,7 @@ namespace Gdiplus{using std::min;using std::max;}
 #include "user_sound_icons.h"
 #include "backdrop_wgc.h"
 #include "vblank.h"
+#include "fullscreen_window.h"
 #include <map>
 #include "menu_hit_region.h"
 #include "menubar_extras.h"
@@ -63,7 +64,7 @@ namespace Gdiplus{using std::min;using std::max;}
 #include "ext_protocol.h"
 
 namespace {
-constexpr wchar_t kClass[] = L"LiquidDesktopMenuBarV01";
+constexpr auto& kClass = docky::fullscreen::kMenuBarClass;
 std::wstring appName, clockText;
 liquid::settings::Revision settingsRevision;
 std::wstring themeSettingsPath;
@@ -187,7 +188,8 @@ void TraceState(){
  if(n<=0||static_cast<size_t>(n)>=sizeof(buf))return;std::string line(buf,static_cast<size_t>(n));if(line==devLast)return;devLast=line;
  DWORD written=0;WriteFile(devTrace,line.data(),static_cast<DWORD>(line.size()),&written,nullptr);FlushFileBuffers(devTrace);
 }
-constexpr UINT_PTR kHoverTimer=5;
+docky::vblank::Ticker hoverTicker;
+constexpr UINT kHoverFrame = WM_APP + 411;
 constexpr wchar_t kInputClass[]=L"dockyMenuBarInputV13";
 LRESULT CALLBACK InputProc(HWND h,UINT msg,WPARAM w,LPARAM l){
  if(msg==WM_MOUSEACTIVATE)return MA_NOACTIVATE;
@@ -387,7 +389,6 @@ void RemoveAppBar(HWND h){if(!appBarRegistered)return;APPBARDATA a{sizeof(a)};a.
 // Optionally (Settings > Dock) the Windows snap-layout bar that appears at the top during a drag is hidden.
 constexpr UINT_PTR kDragClipTimer=13,kReleaseCheckTimer=15,kUnsnapTimer=19;
 extern HWND fullscreenWindow;
-constexpr UINT kDockFullscreenMsg=WM_APP+79;  // to the Dock: wParam 1 = a full-screen app owns the monitor
 bool hideSnapLayouts=false,rawMouseRegistered=false;
 bool gameCompatibility=false,gameSuppressed=false;
 // Games list (game_compat.h): a listed program running counts as a detected full-screen game (bar hidden, popups closed,
@@ -477,7 +478,7 @@ void CalibrateDragClip(){
 void DragDwell(){
     DragClip& c=dragClip;if(!c.active||c.pending||(c.hasDock&&c.side>0))return;
     POINT pt{};if(!GetCursorPos(&pt))return;
-    const ULONGLONG now=GetTickCount64();
+    const ULONGLONG now=docky::vblank::AnimationMillis();
     if(pt.y<=c.topLimit+1){if(!c.dwellStart)c.dwellStart=now;else if(!c.dwellFill&&now-c.dwellStart>=kDragDwellMs){c.dwellFill=true;UpdateFill(L"rested at the top");}}
     else{c.dwellStart=0;if(c.dwellFill&&pt.y>c.topLimit+Px(8)){c.dwellFill=false;UpdateFill(L"moved away");}}
 }
@@ -602,8 +603,9 @@ struct FilledWindow{HWND w=nullptr;RECT normal{};};  // normal: the size to give
 std::vector<FilledWindow> filledWindows;
 bool fullscreenBusy=false;
 bool CoversMonitor(HWND w){
-    MONITORINFO mi{sizeof(mi)};RECT r{};if(!GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi)||!GetWindowRect(w,&r))return false;
-    return r.left<=mi.rcMonitor.left&&r.top<=mi.rcMonitor.top&&r.right>=mi.rcMonitor.right&&r.bottom>=mi.rcMonitor.bottom;
+    MONITORINFO mi{sizeof(mi)};
+    return GetMonitorInfoW(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST),&mi)&&
+        docky::fullscreen::CoversMonitor(w,mi.rcMonitor);
 }
 // Places the window's visible frame (without the invisible resize borders) on r, in screen coordinates.
 void PlaceVisible(HWND w,const RECT& r){
@@ -790,59 +792,11 @@ constexpr UINT_PTR kFullscreenTimer=14;
 // The full-screen window found last: while it stays (visible, not minimized, covering the monitor), opening another,
 // ordinary window on top keeps the bars hidden (macOS: the full-screen app keeps its Space).
 HWND fullscreenWindow=nullptr;
-bool FullscreenCandidate(HWND f){
-    if(!f||!IsWindow(f)||!IsWindowVisible(f)||IsIconic(f))return false;
-    DWORD pid=0,shellPid=0;GetWindowThreadProcessId(f,&pid);GetWindowThreadProcessId(GetShellWindow(),&shellPid);
-    if(pid==GetCurrentProcessId()||pid==shellPid)return false;  // Explorer: desktop, taskbar, the desktop-switch animation
-    wchar_t cls[64]{};GetClassNameW(f,cls,64);
-    if(!wcscmp(cls,L"Progman")||!wcscmp(cls,L"WorkerW")||!wcscmp(cls,L"Shell_TrayWnd")||!wcscmp(cls,L"Shell_SecondaryTrayWnd")||!wcscmp(cls,L"XamlWindow")||!wcscmp(cls,L"MultitaskingViewFrame"))return false;
-    if(GetWindowLongW(f,GWL_EXSTYLE)&WS_EX_TOOLWINDOW)return false;
-    BOOL cloaked=FALSE;DwmGetWindowAttribute(f,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));if(cloaked)return false;
-    if(MonitorFromWindow(f,MONITOR_DEFAULTTONULL)!=MonitorFromWindow(barWindow,MONITOR_DEFAULTTOPRIMARY))return false;
-    return (IsButtonFullscreen(f)&&IsZoomed(f))||CoversMonitor(f);
-}
-// The window actually in front on the bar's monitor, by Z order, when it covers the whole monitor. Used when the
-// foreground is missing, Explorer or DockOver: a game started from Steam can cover the monitor without ever getting
-// the foreground (PUBG, log of 2026-11-14: foreground stayed "explorer" while the shell reported full screen). The
-// bar and Dock then stayed up, the topmost Dock sat over the game, a click on it took the focus and the game minimized.
-// Passed over: hidden, minimized, cloaked, empty, tool, click-through and no-activate windows, DockOver's own windows,
-// and small always-on-top windows (game / GPU overlays). Any other window in front ends the search: not full screen.
-HWND FrontCoveringWindow(){
-    const HMONITOR bar=MonitorFromWindow(barWindow,MONITOR_DEFAULTTOPRIMARY);
-    int budget=48;  // windows on the monitor examined at most
-    for(HWND w=GetTopWindow(nullptr);w&&budget>0;w=GetWindow(w,GW_HWNDNEXT)){
-        if(!IsWindowVisible(w)||IsIconic(w))continue;
-        const LONG_PTR ex=GetWindowLongPtrW(w,GWL_EXSTYLE);
-        if(ex&(WS_EX_TOOLWINDOW|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE))continue;
-        RECT r{};if(!GetWindowRect(w,&r)||IsRectEmpty(&r))continue;
-        BOOL cloaked=FALSE;DwmGetWindowAttribute(w,DWMWA_CLOAKED,&cloaked,sizeof(cloaked));if(cloaked)continue;
-        if(MonitorFromWindow(w,MONITOR_DEFAULTTONULL)!=bar)continue;
-        --budget;
-        DWORD pid=0;GetWindowThreadProcessId(w,&pid);if(pid==GetCurrentProcessId())continue;
-        const bool candidate=FullscreenCandidate(w);
-        if(!candidate&&(ex&WS_EX_TOPMOST))continue;  // overlay
-        if(WindowProcessName(w)==L"DockOver")continue;  // Launchpad, docky Desktop, Settings
-        return candidate?w:nullptr;
-    }
-    return nullptr;
-}
 bool FullscreenForeground(){
-    if(!barWindow)return false;
-    // No foreground while windows change hands, or a docky window in front: the state follows the full-screen window itself.
-    // (It used to be kept as is, so closing a full-screen Chrome left the bar and Dock hidden until another window got
-    // focus, 3.5-5.5 s in the log of 2026-11-12.)
-    const auto keep=[]{if(!fullscreenApp)return false;if(fullscreenWindow&&FullscreenCandidate(fullscreenWindow))return true;fullscreenWindow=nullptr;return false;};
-    const auto front=[]{HWND z=FrontCoveringWindow();if(!z)return false;
-        if(z!=fullscreenWindow){wchar_t cls[64]{};GetClassNameW(z,cls,64);DLOG(L"menu: full-screen window in front without the foreground: %ls (%ls)",cls,WindowProcessName(z).c_str());}
-        fullscreenWindow=z;return true;};
-    HWND f=GetForegroundWindow();if(!f)return front()||keep();
-    {DWORD pid=0,shellPid=0;GetWindowThreadProcessId(f,&pid);GetWindowThreadProcessId(GetShellWindow(),&shellPid);wchar_t cls[64]{};GetClassNameW(f,cls,64);
-     if(pid==GetCurrentProcessId()||!wcscmp(cls,L"LiquidDockV01")||!wcscmp(cls,L"LiquidControlCenter")||!wcscmp(cls,L"LiquidUnifiedPopup98d2"))return front()||keep();
-     if(pid==shellPid&&front())return true;}
-    if(FullscreenCandidate(f)){fullscreenWindow=f;return true;}
-    if(fullscreenWindow&&FullscreenCandidate(fullscreenWindow))return true;  // another window opened over a full-screen app
-    fullscreenWindow=nullptr;
-    return false;
+    const HWND button = IsButtonFullscreen(fullscreenWindow) ? fullscreenWindow : nullptr;
+    fullscreenWindow = docky::fullscreen::Find(MonitorFromWindow(barWindow,MONITOR_DEFAULTTONULL),
+                                                fullscreenWindow,button);
+    return fullscreenWindow != nullptr;
 }
 // In full screen the bar is hidden; pushing into (or resting at) the top edge reveals it over the app (macOS) without
 // touching the work area or the app's size. It hides again once the pointer leaves it and no menu is open.
@@ -875,19 +829,12 @@ constexpr ULONGLONG kRevealPushMs=650,kRevealRestMs=1500;
 // A game owns the pointer: the cursor is hidden or clipped to less than the whole desktop. Looking up in a shooter then
 // pins the hidden cursor at the top edge while raw input keeps reporting upward motion, which revealed the bar; the
 // topmost bar over an exclusive full-screen game (PUBG, log of 2026-11-13) made it drop out of full screen and minimize.
-bool GameOwnsPointer(){
-    CURSORINFO ci{sizeof(ci)};if(GetCursorInfo(&ci)&&ci.flags==0)return true;  // hidden (CURSOR_SUPPRESSED is touch/pen)
-    RECT clip{};if(!GetClipCursor(&clip))return false;
-    const RECT desk{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),
-        GetSystemMetrics(SM_XVIRTUALSCREEN)+GetSystemMetrics(SM_CXVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN)+GetSystemMetrics(SM_CYVIRTUALSCREEN)};
-    return clip.left>desk.left||clip.top>desk.top||clip.right<desk.right||clip.bottom<desk.bottom;
-}
 void FullscreenEdge(HWND h,LONG dy){
     if(!fullscreenApp||barRevealed)return;
-    if(GameOwnsPointer()){topPush=0;topEdgeSince=topPushSince=topPushLast=0;return;}
+    if(docky::fullscreen::GameOwnsPointer()){topPush=0;topEdgeSince=topPushSince=topPushLast=0;return;}
     POINT pt{};MONITORINFO mi{sizeof(mi)};if(!GetCursorPos(&pt)||!GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi))return;
     if(pt.y>mi.rcMonitor.top+1||pt.x<mi.rcMonitor.left||pt.x>=mi.rcMonitor.right){topPush=0;topEdgeSince=topPushSince=topPushLast=0;return;}
-    const ULONGLONG now=GetTickCount64();
+    const ULONGLONG now=docky::vblank::AnimationMillis();
     if(!topEdgeSince)topEdgeSince=now;
     if(dy<0){
         if(!topPushSince||now-topPushLast>300){topPushSince=now;topPush=0;}  // a pause restarts the push
@@ -898,13 +845,19 @@ void FullscreenEdge(HWND h,LONG dy){
 void FullscreenRevealTick(HWND h){
     if(!fullscreenApp)return;
     POINT pt{};MONITORINFO mi{sizeof(mi)};if(!GetCursorPos(&pt)||!GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi))return;
-    if(!barRevealed){if(topEdgeSince&&!GameOwnsPointer()&&pt.y<=mi.rcMonitor.top+1&&GetTickCount64()-topEdgeSince>=kRevealRestMs)RevealBar(h,true);return;}
+    if(!barRevealed){if(topEdgeSince&&!docky::fullscreen::GameOwnsPointer()&&pt.y<=mi.rcMonitor.top+1&&GetTickCount64()-topEdgeSince>=kRevealRestMs)RevealBar(h,true);return;}
     static ULONGLONG awaySince=0;
     const bool busy=popup||liquid::cc::IsOpen()||activeMenu!=-1;
     if(busy||pt.y<=mi.rcMonitor.top+Px(30)+Px(6)){awaySince=0;return;}
     if(!awaySince)awaySince=GetTickCount64();else if(GetTickCount64()-awaySince>=400){awaySince=0;RevealBar(h,false);}
 }
 void SetFullscreenApp(HWND h,bool full){
+    if (full && IsButtonFullscreen(fullscreenWindow)) {
+        if (GetPropW(h,docky::fullscreen::kButtonWindowProperty) != fullscreenWindow)
+            SetPropW(h,docky::fullscreen::kButtonWindowProperty,fullscreenWindow);
+    } else if (GetPropW(h,docky::fullscreen::kButtonWindowProperty)) {
+        RemovePropW(h,docky::fullscreen::kButtonWindowProperty);
+    }
     if(full==fullscreenApp)return;
     fullscreenApp=full;barRevealed=false;topPush=0;topEdgeSince=topPushSince=topPushLast=0;ShowBarBlack(false,RECT{});
 
@@ -935,7 +888,7 @@ void SyncGameCompatibility(HWND h) {
     // cursor in their inventory or menus, which must not bring the Dock back over them.
     static HWND detectedGame=nullptr;
     if(!fullscreenApp||!gameCompatibility||detectedGame!=fullscreenWindow)detectedGame=nullptr;
-    if(gameCompatibility&&fullscreenApp&&fullscreenWindow&&(exclusive||GameOwnsPointer()))detectedGame=fullscreenWindow;
+    if(gameCompatibility&&fullscreenApp&&fullscreenWindow&&(exclusive||docky::fullscreen::GameOwnsPointer()))detectedGame=fullscreenWindow;
     const bool suppress=(gameCompatibility&&fullscreenApp&&detectedGame&&detectedGame==fullscreenWindow)||listedGameMenu;
     if(suppress!=gameSuppressed){
         gameSuppressed=suppress;
@@ -946,7 +899,7 @@ void SyncGameCompatibility(HWND h) {
     HWND dockWindow=FindWindowW(L"LiquidDockV01",nullptr);
     const WPARAM full=fullscreenApp?1:0;
     if(dockWindow&&(dockWindow!=sentWindow||sentFull!=full||sentSuppressed!=gameSuppressed)){
-        if(PostMessageW(dockWindow,kDockFullscreenMsg,full,gameSuppressed?1:0)){
+        if(PostMessageW(dockWindow,docky::fullscreen::kDockChanged,full,gameSuppressed?1:0)){
             sentWindow=dockWindow;sentFull=full;sentSuppressed=gameSuppressed;
         }
     } else if(!dockWindow) sentWindow=nullptr;
@@ -1247,7 +1200,7 @@ void Render(HWND h) {
     StatusIcons(dc);
     GdiFlush();
     // Animate only active pills; a quiet bar keeps no animation timer or full-width hit pixels.
-    const ULONGLONG now=GetTickCount64();
+    const ULONGLONG now=docky::vblank::AnimationMillis();
     const float step=hoverTime?std::clamp(static_cast<float>(now-hoverTime)/150.f,0.f,1.f):0.f;
     hoverTime=now; headingOpacity.resize(headings.size(),0.f); bool transitioning=false;
     auto advance=[&](float& value,bool on){const float goal=on?1.f:0.f;
@@ -1275,7 +1228,7 @@ void Render(HWND h) {
     {const int full=static_cast<int>(std::lround(42.f*static_cast<float>(Px(1000))/1000.0f))+2*Px(2);
      for(size_t i=0;i<extras.size();++i){const int c=(extras[i].rect.left+extras[i].rect.right)/2;const int w=(std::max)(full,extras[i].contentW+Px(20));extraPill[i]=RECT{c-w/2,0,c-w/2+w,height};}}
     const int activeExtra=activeMenu<=-100?-100-activeMenu:-1;
-    if(transitioning)SetTimer(h,kHoverTimer,16,nullptr);else KillTimer(h,kHoverTimer);
+    if(transitioning)hoverTicker.Start(h,kHoverFrame);else hoverTicker.Stop();
     auto pixels=static_cast<std::uint32_t*>(bits);size_t nonzero=0;
     const size_t pixelCount=static_cast<size_t>(width)*height;
     std::vector<unsigned char> glyph(pixelCount);
@@ -1387,7 +1340,7 @@ void Render(HWND h) {
     SelectObject(dc,oldBmp);DeleteObject(bmp);DeleteDC(dc);ReleaseDC(nullptr,screen);
 }
 void ClosePopup() {
-    liquid::popup::Close();popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();
+    liquid::popup::Close();popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();
     if(barWindow)Render(barWindow);
 }
 // Unified Quit: signal the Desktop Manager (named event it owns); Manager closes the components it launched.
@@ -1457,7 +1410,7 @@ std::vector<liquid::menu::MenuItem> CustomizeItems();bool HandleCustomize(UINT i
 void TogglePopup(HWND h,int selected) {
     if(popup){const bool same=activeMenu==selected;ClosePopup();if(same)return;}
     if(selected<0||static_cast<size_t>(selected)>=menus.menus.size()||static_cast<size_t>(selected)>=headings.size())return;
-    openMenu=menus.menus[selected];activeMenu=selected;hoverTime=GetTickCount64();RECT r{};GetWindowRect(h,&r);
+    openMenu=menus.menus[selected];activeMenu=selected;hoverTime=docky::vblank::AnimationMillis();RECT r{};GetWindowRect(h,&r);
     if(openMenu.source==liquid::menu::ProviderKind::Internal){  // right after Settings (above the power commands)
         using liquid::menu::ItemKind;auto at=openMenu.items.end();for(auto i=openMenu.items.begin();i!=openMenu.items.end();++i)if(i->commandId==0xF0F2){at=i+1;break;}
         std::vector<liquid::menu::MenuItem> extra;extra.push_back({L"Menu Bar Items",ItemKind::Submenu,true,false,CustomizeItems()});
@@ -1467,7 +1420,7 @@ void TogglePopup(HWND h,int selected) {
     popup=liquid::popup::Show(h,anchor,openMenu.items,[target](const liquid::menu::MenuItem& item){
         if(target.source==liquid::menu::ProviderKind::Internal){if(item.commandId==0xF0F1)RequestUnifiedQuit();else if(item.commandId==0xF0F2)RequestSettings();else if(!SystemPowerCommand(item.commandId))HandleCustomize(item.commandId);return;}
         const bool queued=liquid::menu::DispatchNativeCommand(target,item);DLOG(L"menu: native command queued=%d id=%u",queued,item.commandId);
-    },[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
+    },[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
 }
 void TogglePanel(HWND h,int selected){
@@ -1482,7 +1435,7 @@ void TogglePanel(HWND h,int selected){
         else if(selected==5)liquid::cc::ToggleBluetooth(anchor,h,kControlCenterChanged);
         else liquid::cc::Toggle(anchor,h,kControlCenterChanged);
     }
-    hoverTime=GetTickCount64();Render(h);
+    hoverTime=docky::vblank::AnimationMillis();Render(h);
 }
 void ToggleControlCenter(HWND h){TogglePanel(h,3);}
 // The clock opens the Notification Center (macOS). Other menus and panels close first; the clock gets the pill.
@@ -1529,14 +1482,14 @@ void ToggleStatusPopup(HWND h,int selected){
     auto items=BuildStatusItems(selected);
     const wchar_t* uri=selected==0?L"ms-settings:network-wifi":selected==1?L"ms-settings:sound":L"ms-settings:powersleep";
     RECT r{};GetWindowRect(h,&r);POINT anchor{r.left+statusRects[selected].right-Px(260),r.bottom};
-    activeMenu=-10-selected;hoverTime=GetTickCount64();
+    activeMenu=-10-selected;hoverTime=docky::vblank::AnimationMillis();
     DLOG(L"menu: opening status popup %d",selected);
     popup=liquid::popup::Show(h,anchor,std::move(items),[h,uri](const liquid::menu::MenuItem& item){
         if(item.commandId==0xE101)ToggleControlCenter(h);
         else if(item.commandId==0xE102)ShellExecuteW(nullptr,L"open",uri,nullptr,nullptr,SW_SHOWNORMAL);
         else if(item.commandId==0xE103)RequestStatus(); // reload OS-reported list asynchronously; reopen to view
 
-    },[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
+    },[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
 }
 // Input menu popup: the installed keyboard layouts (the current one ticked) and Windows' keyboard settings.
@@ -1545,8 +1498,8 @@ void ToggleInputPopup(HWND h){
     if(liquid::cc::IsOpen())TogglePanel(h,panelAnchor);
     inputLayout=ForegroundLayout();
     RECT r{};GetWindowRect(h,&r);POINT anchor{r.left+statusRects[6].right-Px(260),r.bottom};
-    activeMenu=-16;hoverTime=GetTickCount64();
-    popup=docky::statuspopup::ShowInputMenu(h,anchor,false,inputLayout,inputTarget,[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
+    activeMenu=-16;hoverTime=docky::vblank::AnimationMillis();
+    popup=docky::statuspopup::ShowInputMenu(h,anchor,false,inputLayout,inputTarget,[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
 }
 // ---- Extras interaction ------------------------------------------------------------------------------------
@@ -1606,11 +1559,11 @@ void ActivateExt(HWND h,size_t index,bool right,POINT anchor,int code){
     for(size_t k=0;k<item.menu.size();++k){const auto& e=item.menu[k];
         if(e.separator)rows.push_back({L"",ItemKind::Separator,false,false,{}});
         else rows.push_back({e.title,ItemKind::Command,e.enabled,e.checked,{},kRowExtMenu+static_cast<UINT>(k)});}
-    activeMenu=code;hoverTime=GetTickCount64();
+    activeMenu=code;hoverTime=docky::vblank::AnimationMillis();
     popup=liquid::popup::Show(h,anchor,std::move(rows),[item](const liquid::menu::MenuItem& row){
         if(row.commandId<kRowExtMenu||row.commandId>=kRowExtMenu+item.menu.size())return;const auto& e=item.menu[row.commandId-kRowExtMenu];
         if(!e.run.empty())RunExtension(e.run,e.args,item.folder);NotifyExtension(item,docky::extras::MenuEvent(item.id,e.id));
-    },[]{popup=nullptr;activeMenu=-1;hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
+    },[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
 }
 std::vector<std::uint64_t> popupTray;std::vector<size_t> popupExt;
@@ -1630,14 +1583,14 @@ void ToggleHiddenPopup(HWND h,size_t extraIndex){
     if(items.empty())items.push_back({L"No hidden icons",ItemKind::Command,false,false,{}});
     items.push_back({L"",ItemKind::Separator,false,false,{}});
     items.push_back({L"Menu Bar Items",ItemKind::Submenu,true,false,CustomizeItems()});
-    activeMenu=code;hoverTime=GetTickCount64();const POINT anchor=ExtraAnchor(h,extraIndex);
+    activeMenu=code;hoverTime=docky::vblank::AnimationMillis();const POINT anchor=ExtraAnchor(h,extraIndex);
     DLOG(L"menu: hidden icons popup (%zu tray, %zu extension)",popupTray.size(),popupExt.size());
     popup=liquid::popup::Show(h,anchor,std::move(items),[h,code](const liquid::menu::MenuItem& item){
         const bool right=liquid::popup::LastSelectionSecondary();
         if(item.commandId>=kRowTray&&item.commandId<kRowTray+popupTray.size()){POINT pt{};GetCursorPos(&pt);docky::tray::Get().Click(popupTray[item.commandId-kRowTray],right,pt);}
         else if(item.commandId>=kRowExt&&item.commandId<kRowExt+popupExt.size())PostMessageW(h,kExtOpenMenu,popupExt[item.commandId-kRowExt],MAKELPARAM(right?1:0,static_cast<WORD>(-code)));
         else HandleCustomize(item.commandId);
-    },[]{popup=nullptr;activeMenu=-1;popupAnchors.clear();hoverTime=GetTickCount64();if(barWindow)Render(barWindow);});
+    },[]{popup=nullptr;activeMenu=-1;popupAnchors.clear();hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup){activeMenu=-1;Render(h);return;}
     // Shell_NotifyIconGetRect answers with the row, so apps that place their own flyout next to "their icon" use the row.
     RECT pr{};GetWindowRect(popup,&pr);popupAnchors.clear();
@@ -1725,7 +1678,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
             SetFullscreenApp(h,FullscreenForeground()||listedGameMenu);SyncGameCompatibility(h);
             if(gameSuppressed){DropRawMouse();return 0;}
             if(fullscreenApp){POINT pt{};MONITORINFO mi{sizeof(mi)};
-                const bool top=!GameOwnsPointer()&&GetCursorPos(&pt)&&GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi)&&pt.y<=mi.rcMonitor.top+1&&pt.x>=mi.rcMonitor.left&&pt.x<mi.rcMonitor.right;
+                const bool top=!docky::fullscreen::GameOwnsPointer()&&GetCursorPos(&pt)&&GetMonitorInfoW(MonitorFromWindow(h,MONITOR_DEFAULTTOPRIMARY),&mi)&&pt.y<=mi.rcMonitor.top+1&&pt.x>=mi.rcMonitor.left&&pt.x<mi.rcMonitor.right;
                 if(top||barRevealed){EnsureRawMouse();if(top&&!topEdgeSince)topEdgeSince=GetTickCount64();}else{DropRawMouse();topEdgeSince=0;}}
             FullscreenRevealTick(h);return 0;}
         if((w==1||w==4)&&fullscreenApp&&!barRevealed)return 0;  // game mode: nothing of the bar is visible; no polling
@@ -1737,7 +1690,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
                 docky::notify::DebugBanner(L"Amazon",L"4+ star savings for you!",L"Get 21% off BONTEC Desk Keyboard Tray for Black Friday Week");}
             if(devNotificationCenter)ToggleNotificationCenter(h);return 0;}
         if(w==kReleaseCheckTimer){KillTimer(h,kReleaseCheckTimer);if(!dragClip.active)ClampBelowBar(GetForegroundWindow(),L"button released");return 0;}
-        if(w==1){Update(h);if(RefreshTheme())Render(h);const auto revision=liquid::settings::ReadRevision(themeSettingsPath);if(revision!=settingsRevision){settingsRevision=revision;const auto current=liquid::settings::Load(themeSettingsPath);docky::ui::SetLanguage(current.value.appearance.language);hideSnapLayouts=current.value.dock.hideSnapLayouts;gameCompatibility=current.value.dock.gameCompatibility;docky::notify::SetCapture(current.value.menuBar.captureNotifications);docky::notify::SetHideSystemBanners(current.value.menuBar.hideSystemNotifications);if(menuScalePercent!=current.value.menuBar.scalePercent){menuScalePercent=current.value.menuBar.scalePercent;ClosePopup();Place(h);Render(h);}docky::vblank::SetCaps(current.value.performance.animationFps,current.value.performance.captureFps);DLOG(L"shared settings changed; status=%d hideSnap=%d",static_cast<int>(current.status),hideSnapLayouts?1:0);}const auto wr=liquid::settings::ReadRevision(workshopRoot+L"\\active.txt");if(wr!=workshopRevision){workshopRevision=wr;RequestWorkshop();}}else if(w==2)DestroyWindow(h);else if(w==4){RequestStatus();RequestWorkshop();ReloadManifests(h,false);PruneExtensions(h);}else if(w==kHoverTimer)Render(h);else if(w==6&&devTrace!=INVALID_HANDLE_VALUE&&devInitialPopup>=0){KillTimer(h,6);const int selected=devInitialPopup;devInitialPopup=-1;if(selected==9){for(size_t i=0;i<extras.size();++i)if(extras[i].kind==ExtraKind::Chevron){ToggleHiddenPopup(h,i);break;}}else if(selected==3||selected==1||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==7&&devTrace!=INVALID_HANDLE_VALUE&&devInitialKey){
+        if(w==1){Update(h);if(RefreshTheme())Render(h);const auto revision=liquid::settings::ReadRevision(themeSettingsPath);if(revision!=settingsRevision){settingsRevision=revision;const auto current=liquid::settings::Load(themeSettingsPath);docky::ui::SetLanguage(current.value.appearance.language);hideSnapLayouts=current.value.dock.hideSnapLayouts;gameCompatibility=current.value.dock.gameCompatibility;docky::notify::SetCapture(current.value.menuBar.captureNotifications);docky::notify::SetHideSystemBanners(current.value.menuBar.hideSystemNotifications);if(menuScalePercent!=current.value.menuBar.scalePercent){menuScalePercent=current.value.menuBar.scalePercent;ClosePopup();Place(h);Render(h);}docky::vblank::SetCaps(current.value.performance.animationFps,current.value.performance.captureFps);DLOG(L"shared settings changed; status=%d hideSnap=%d",static_cast<int>(current.status),hideSnapLayouts?1:0);}const auto wr=liquid::settings::ReadRevision(workshopRoot+L"\\active.txt");if(wr!=workshopRevision){workshopRevision=wr;RequestWorkshop();}}else if(w==2)DestroyWindow(h);else if(w==4){RequestStatus();RequestWorkshop();ReloadManifests(h,false);PruneExtensions(h);}else if(w==6&&devTrace!=INVALID_HANDLE_VALUE&&devInitialPopup>=0){KillTimer(h,6);const int selected=devInitialPopup;devInitialPopup=-1;if(selected==9){for(size_t i=0;i<extras.size();++i)if(extras[i].kind==ExtraKind::Chevron){ToggleHiddenPopup(h,i);break;}}else if(selected==3||selected==1||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==7&&devTrace!=INVALID_HANDLE_VALUE&&devInitialKey){
         KillTimer(h,7);HWND target=popup;if(!target&&liquid::cc::IsOpen())target=FindWindowW(L"LiquidControlCenter",L"DockOver Control Center");DWORD pid=0;if(target)GetWindowThreadProcessId(target,&pid);
         bool sent=false;if(target&&pid==GetCurrentProcessId()){if(devInitialKey==0x10000){const UINT testDpi=GetDpiForWindow(target);const LPARAM pt=MAKELPARAM(MulDiv(120,testDpi,96),MulDiv(126,testDpi,96));sent=PostMessageW(target,WM_LBUTTONDOWN,MK_LBUTTON,pt)&&PostMessageW(target,WM_LBUTTONUP,0,pt);}else sent=PostMessageW(target,WM_KEYDOWN,static_cast<WPARAM>(devInitialKey),0)!=FALSE;}
         DLOG(L"dev: own-window key=%d sent=%d",devInitialKey,sent);devInitialKey=0;
@@ -1756,11 +1709,11 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         int next=-1,st=-1;POINT pt{GET_X_LPARAM(l),GET_Y_LPARAM(l)};for(size_t i=0;i<headings.size();++i)if(PtInRect(&headings[i],pt)){next=static_cast<int>(i);break;}
         for(int i=0;i<kStatusSlots;++i)if(PtInRect(&statusRects[i],pt)){st=i;break;}
         const bool app=PtInRect(&appRect,pt)!=FALSE;
-        if(next!=hoverIndex||st!=statusHover||app!=appHover){hoverIndex=next;statusHover=st;appHover=app;hoverTime=GetTickCount64();Render(h);}
+        if(next!=hoverIndex||st!=statusHover||app!=appHover){hoverIndex=next;statusHover=st;appHover=app;hoverTime=docky::vblank::AnimationMillis();Render(h);}
         if(!inputWindow&&!tracking){TRACKMOUSEEVENT e{sizeof(e),TME_LEAVE,h,0};TrackMouseEvent(&e);tracking=true;}
         return 0;
     }
-    case WM_MOUSELEAVE:tracking=false;if(hoverIndex!=-1||statusHover!=-1||appHover){hoverIndex=-1;statusHover=-1;appHover=false;hoverTime=GetTickCount64();Render(h);}return 0;
+    case WM_MOUSELEAVE:tracking=false;if(hoverIndex!=-1||statusHover!=-1||appHover){hoverIndex=-1;statusHover=-1;appHover=false;hoverTime=docky::vblank::AnimationMillis();Render(h);}return 0;
     case WM_RBUTTONUP:{POINT pt{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
         for(size_t i=0;i<extras.size();++i)if(PtInRect(&extras[i].rect,pt)){ClickExtra(h,i,true);return 0;}return 0;}
     case WM_LBUTTONUP:{POINT pt{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
@@ -1775,14 +1728,15 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         ActivateExt(h,index,right,anchor,code);return 0;}
     case kControlCenterChanged:
         if(w==1){panelAnchor=-1;const int next=pendingPanel;pendingPanel=-1;if(next>=0)TogglePanel(h,next);}
-        RequestStatus();hoverTime=GetTickCount64();Render(h);return 0;
+        RequestStatus();hoverTime=docky::vblank::AnimationMillis();Render(h);return 0;
     case WM_APP+91:if(w>=80&&w<=160&&menuScalePercent!=static_cast<int>(w)){menuScalePercent=static_cast<int>(w);ClosePopup();Place(h);Render(h);}return 0;
+    case kHoverFrame:hoverTicker.Ack();Render(h);return 0;
     case WM_APP+44:ToggleControlCenter(h);return 0;
     case kNotificationCenterChanged:if(w==2){HandleCustomize(kCmdWidgetsId);return 0;}  // the panel's "Edit Widgets"
         // The open panel blurs the desktop under the bar too: keep the bar's own glyphs out of that capture (else the
         // blur shows soft copies of them under the sharp ones). Restored when the panel closes.
         SetWindowDisplayAffinity(h,w==1?WDA_EXCLUDEFROMCAPTURE:WDA_NONE);
-        hoverTime=GetTickCount64();Render(h);return 0;
+        hoverTime=docky::vblank::AnimationMillis();Render(h);return 0;
     case kAppBarMsg:
         if(w==ABN_FULLSCREENAPP){DLOG(L"menu: shell reports full-screen %d",l!=0?1:0);SetFullscreenApp(h,FullscreenForeground());}
         else if(w==ABN_POSCHANGED){static ULONGLONG last=0;const ULONGLONG t=GetTickCount64();if(t-last>500){last=t;appBarRect={};Place(h);}}  // bounded: never a notify loop
@@ -1793,7 +1747,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
     case WM_ERASEBKGND:return 1;
     case WM_PAINT: { PAINTSTRUCT ps{};BeginPaint(h,&ps);EndPaint(h,&ps);return 0; }
     case WM_INPUT:OnDragRawInput(reinterpret_cast<HRAWINPUT>(l));return DefWindowProcW(h,m,w,l);
-    case WM_DESTROY:if(trayStarted){docky::tray::Get().Stop();trayStarted=false;}if(extHost){DestroyWindow(extHost);extHost=nullptr;}ReleaseDragClip();if(locationHook){UnhookWinEvent(locationHook);locationHook=nullptr;}if(fillPreview){DestroyWindow(fillPreview);fillPreview=nullptr;}if(barBlack){DestroyWindow(barBlack);barBlack=nullptr;}if(moveStartHook){UnhookWinEvent(moveStartHook);moveStartHook=nullptr;}if(moveHook){UnhookWinEvent(moveHook);moveHook=nullptr;}RemoveAppBar(h);if(inputWindow){HWND old=inputWindow;inputWindow=nullptr;DestroyWindow(old);}ClosePopup();liquid::cc::Shutdown();docky::notify::Shutdown();barWindow=nullptr;{std::lock_guard<std::mutex> lock(statusShared->mutex);statusShared->window=nullptr;}{std::lock_guard<std::mutex> lock(workshopShared->mutex);workshopShared->window=nullptr;}KillTimer(h,1);KillTimer(h,2);KillTimer(h,4);KillTimer(h,kHoverTimer);PostQuitMessage(0);return 0;
+    case WM_DESTROY:if(trayStarted){docky::tray::Get().Stop();trayStarted=false;}if(extHost){DestroyWindow(extHost);extHost=nullptr;}ReleaseDragClip();if(locationHook){UnhookWinEvent(locationHook);locationHook=nullptr;}if(fillPreview){DestroyWindow(fillPreview);fillPreview=nullptr;}if(barBlack){DestroyWindow(barBlack);barBlack=nullptr;}if(moveStartHook){UnhookWinEvent(moveStartHook);moveStartHook=nullptr;}if(moveHook){UnhookWinEvent(moveHook);moveHook=nullptr;}RemoveAppBar(h);if(inputWindow){HWND old=inputWindow;inputWindow=nullptr;DestroyWindow(old);}ClosePopup();liquid::cc::Shutdown();docky::notify::Shutdown();barWindow=nullptr;{std::lock_guard<std::mutex> lock(statusShared->mutex);statusShared->window=nullptr;}{std::lock_guard<std::mutex> lock(workshopShared->mutex);workshopShared->window=nullptr;}KillTimer(h,1);KillTimer(h,2);KillTimer(h,4);hoverTicker.Stop();PostQuitMessage(0);return 0;
     }return DefWindowProcW(h,m,w,l);
 }
 }
@@ -1855,7 +1809,7 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     hostsDev=(devPath.empty()||devTray)&&!visualCaptureTest;
     if(!StartHosts(h))SetTimer(h,kHostsRetryTimer,1000,nullptr);  // the Dock still hosts them (menu bar was off): take over when it lets go
     if(devHover==L"logo")hoverIndex=0;else if(devHover==L"app")appHover=true;else if(!devHover.empty())statusHover=statusIndex(devHover);
-    hoverTime=GetTickCount64();Render(h);ShowWindow(h,SW_SHOWNOACTIVATE);
+    hoverTime=docky::vblank::AnimationMillis();Render(h);ShowWindow(h,SW_SHOWNOACTIVATE);
     WNDCLASSW inputClass{};inputClass.hInstance=instance;inputClass.lpfnWndProc=InputProc;inputClass.lpszClassName=kInputClass;inputClass.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     if(RegisterClassW(&inputClass)||GetLastError()==ERROR_CLASS_ALREADY_EXISTS){
         inputWindow=CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,kInputClass,L"",WS_POPUP,0,0,1,1,h,nullptr,instance,nullptr);

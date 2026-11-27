@@ -16,6 +16,7 @@
 #include "taskbar_guardian.h"
 #include "taskbar_hotkey.h"
 #include "update_client.h"
+#include "suite_install.h"
 #include "json_lite.h"
 #include <shellapi.h>
 #include <thread>
@@ -122,9 +123,23 @@ void WallpaperLog(const char* text,unsigned long value=0){
     std::printf("manager: music wallpaper: %s %lu\n",text,value);std::fflush(stdout);
 }
 void SyncMusicWallpaper(bool on){
-    if(!on){if(HWND w=FindWindowExW(HWND_MESSAGE,nullptr,L"DockyNowPlayingWallpaperCtl",nullptr))PostMessageW(w,WM_CLOSE,0,0);return;}
-    if(HANDLE running=OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\DockyNowPlayingWallpaper")){CloseHandle(running);return;}
     const auto exe=AdjacentExe(L"docky-now-playing.exe");
+    if (!on) {
+        // The standalone Music Player uses the same control class and wallpaper mutex.
+        for (HWND w = nullptr; (w = FindWindowExW(HWND_MESSAGE, w, L"DockyNowPlayingWallpaperCtl", nullptr));) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(w, &pid);
+            HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+            if (!process) continue;
+            wchar_t image[32768]{};
+            DWORD length = ARRAYSIZE(image);
+            const bool ours = QueryFullProcessImageNameW(process, 0, image, &length) && _wcsicmp(image, exe.c_str()) == 0;
+            CloseHandle(process);
+            if (ours) PostMessageW(w, WM_CLOSE, 0, 0);
+        }
+        return;
+    }
+    if(HANDLE running=OpenMutexW(SYNCHRONIZE,FALSE,L"Local\\DockyNowPlayingWallpaper")){CloseHandle(running);return;}
     if(exe.empty()||GetFileAttributesW(exe.c_str())==INVALID_FILE_ATTRIBUTES){WallpaperLog("docky-now-playing.exe not found");return;}
     std::wstring cmd=L"\""+exe+L"\" --wallpaper";STARTUPINFOW si{};si.cb=sizeof(si);PROCESS_INFORMATION pi{};
     const auto dir=exe.substr(0,exe.find_last_of(L"\\/"));
@@ -413,6 +428,13 @@ int wmain(int argc,wchar_t** argv){
     bool musicWallpaper=normalSession&&liquid::settings::Load(settingsFile).value.controlCenter.musicWallpaper;
     auto wallpaperRevision=liquid::settings::ReadRevision(settingsFile);ULONGLONG wallpaperCheck=0;
     int shortcutsActive[4]{};
+    if (normalSession) {
+        const auto dir = docky::update::ProgramDir();
+        const auto separator = dir.find_last_of(L"\\/");
+        if (separator != std::wstring::npos && _wcsicmp(dir.c_str() + separator + 1, L"runtime") == 0)
+            docky::suite::Register(dir.substr(0, separator));
+        docky::suite::StopStandaloneWindows();
+    }
     if(normalSession)ApplyShortcuts(liquid::settings::Load(settingsFile).value.controlCenter,shortcutsActive);
     WallpaperLog(normalSession?(musicWallpaper?"session start, setting on":"session start, setting off"):"not a normal session");
     std::fflush(stdout);

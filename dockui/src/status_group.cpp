@@ -338,9 +338,9 @@ void ControlCenter(Painter& p, D2D1_POINT_2F c, float s) {  // two stacked switc
         p.Dot(D2D1::Point2F(i ? c.x + w / 2 - h / 2 : c.x - w / 2 + h / 2, y), h * 0.32f);
     }
 }
-void Bluetooth(Painter& p, D2D1_POINT_2F c, float s) {
+void Bluetooth(Painter& p, D2D1_POINT_2F c, float s, bool on) {
     const float x = c.x - 0.015f * s, half = 0.24f * s, wing = 0.12f * s;
-    p.White(1.f);
+    p.White(on ? 1.f : .35f);
     const D2D1_POINT_2F pts[6] = {{x - wing, c.y - half * 0.5f}, {x + wing, c.y + half * 0.5f}, {x, c.y + half}, {x, c.y - half}, {x + wing, c.y - half * 0.5f}, {x - wing, c.y + half * 0.5f}};
     // One open polyline with round caps and round joins (rounded corners at the arrow tips), slightly heavier.
     ComPtr<ID2D1PathGeometry> path; ComPtr<ID2D1GeometrySink> sink;
@@ -513,7 +513,8 @@ std::vector<Slot> Pack(const std::vector<std::wstring>& cells, int& columns) {
     for (const auto& id : cells) {
         if (FullCell(id)) {
             if (row != 0) { ++col; row = 0; }  // a half-filled column stays as it is
-            out.push_back({col, 0, 2, 2}); col += 2;
+            const int width = id == L"system" ? 6 : 2;
+            out.push_back({col, 0, width, 2}); col += width;
         } else {
             out.push_back({col, row, 1, 1});
             if (++row == 2) { row = 0; ++col; }
@@ -545,10 +546,11 @@ int CellAt(D2D1_RECT_F body, const std::vector<std::wstring>& cells, D2D1_POINT_
     return -1;
 }
 
-bool FullCell(const std::wstring& id) { return id == L"combo" || PlateCell(id); }
+bool FullCell(const std::wstring& id) { return id == L"system" || id == L"combo" || PlateCell(id); }
 bool PlateCell(const std::wstring& id) { return id == L"analog" || id == L"date" || id == L"digital" || id == L"tray"; }
 
 std::wstring CellLabel(const std::wstring& id) {
+    if (id == L"system") return L"Windows system status";
     if (id == L"combo") return L"Control Center";
     if (id == L"analog") return L"Clock";
     if (id == L"date") return L"Calendar";
@@ -570,6 +572,15 @@ std::wstring CellLabel(const std::wstring& id) {
     return id;
 }
 
+const wchar_t* SystemStatusPart(D2D1_RECT_F body, D2D1_POINT_2F point) {
+    const float x = (point.x - body.left) / (std::max)(1.f, body.right - body.left);
+    if (x < 0.155f) return L"wifi";
+    if (x < 0.30f) return L"sound";
+    if (x < 0.445f) return L"battery";
+    if (x < 0.59f) return L"bluetooth";
+    return L"digital";
+}
+
 void Draw(ID2D1DeviceContext* dc, IDWriteFactory* dwrite, D2D1_RECT_F body, const std::vector<std::wstring>& cells,
           const State& st, int hover, float opacity) {
     if (!dc || cells.empty()) return;
@@ -579,7 +590,7 @@ void Draw(ID2D1DeviceContext* dc, IDWriteFactory* dwrite, D2D1_RECT_F body, cons
     // No plate: each cell sits on a faint, soft halo that fades out from its centre (a blurred shadow on a dark Dock,
     // a soft light veil on a light one), so the glyphs read over any backdrop without a visible frame.
     for (size_t i = 0; i < cells.size(); ++i) {
-        if (PlateCell(cells[i])) continue;  // these carry their own plate
+        if (cells[i] == L"system" || PlateCell(cells[i])) continue;  // these carry their own plate
         const auto r = CellRect(body, cells, i);
         const D2D1_POINT_2F c = D2D1::Point2F((r.left + r.right) / 2, (r.top + r.bottom) / 2);
         const float rx = (r.right - r.left) * 0.62f, ry = (r.bottom - r.top) * 0.62f, a = (st.dark ? 0.30f : 0.42f) * opacity;
@@ -606,14 +617,30 @@ void Draw(ID2D1DeviceContext* dc, IDWriteFactory* dwrite, D2D1_RECT_F body, cons
         const auto snap = [&](float v) { return std::round(v / p.px) * p.px; };
         const float ts = snap(s), tl = snap(c.x - s / 2), tt = snap(c.y - s / 2);
         const D2D1_POINT_2F tc = D2D1::Point2F(tl + ts / 2, tt + ts / 2);
-        if (id == L"combo") Combo(p, c, s * 1.28f, st);  // the ring reaches the icon edge, as large as an app icon
+        if (id == L"system") {
+            const float w = r.right - r.left;
+            const float glyph = s * .56f;
+            const auto place = [&](float x) { return D2D1::Point2F(r.left + w * x, c.y); };
+            const auto wifi = place(.085f);
+            p.Wifi(D2D1::Point2F(wifi.x, wifi.y + .16f * glyph), .36f * glyph, .06f * glyph, st.wifi == 2, st.wifi != 0);
+            Sound(p, place(.225f), glyph, st);
+            if (st.batteryPresent) Battery(p, place(.37f), glyph, st);
+            else ControlCenter(p, place(.37f), glyph);
+            Bluetooth(p, place(.51f), glyph, st.bluetoothOn);
+            p.White(.25f);
+            p.Line({r.left + w * .59f, c.y - s * .21f}, {r.left + w * .59f, c.y + s * .21f}, (std::max)(p.px, .6f));
+            p.White(1.f);
+            const float left = r.left + w * .62f, right = r.right - w * .025f;
+            p.Text(st.time, {left, c.y - s * .36f, right, c.y}, s * .27f, true);
+            p.Text(st.shortDate, {left, c.y, right, c.y + s * .36f}, s * .22f, false);
+        } else if (id == L"combo") Combo(p, c, s * 1.28f, st);  // the ring reaches the icon edge, as large as an app icon
         else if (id == L"analog") AnalogClock(p, tc, ts, st);
         else if (id == L"date") CalendarDate(p, tc, ts, st);
         else if (id == L"digital") DigitalClock(p, tc, ts, st);
         else if (id == L"tray") HiddenFolder(p, tc, ts, st);
         else if (id == L"control") ControlCenter(p, c, s);
         else if (id == L"wifi") p.Wifi(D2D1::Point2F(c.x, c.y + 0.16f * s), 0.36f * s, 0.06f * s, st.wifi == 2, st.wifi != 0);
-        else if (id == L"bluetooth") Bluetooth(p, c, s);
+        else if (id == L"bluetooth") Bluetooth(p, c, s, st.bluetoothOn);
         else if (id == L"sound") Sound(p, c, s, st);
         else if (id == L"battery") Battery(p, c, s, st);
         else if (id == L"input") Input(p, c, s, st);

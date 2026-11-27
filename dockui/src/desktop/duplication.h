@@ -35,6 +35,7 @@
 
 #include "../backdrop.h"
 #include "../capture_visible.h"
+#include "../display_adapter.h"
 #include "../log.h"
 #include "../vblank.h"
 
@@ -54,7 +55,7 @@ public:
     }
 
     // Consumers: the monitor they need and whether duplication is available for it (started on the background thread).
-    bool Want(const RECT& area) {
+    bool Want(const RECT& area, UINT waitMs = 150) {
         std::unique_lock<std::mutex> lock(mutex_);
         wanted_ = area;
         const POINT c{(area.left + area.right) / 2, (area.top + area.bottom) / 2};
@@ -65,10 +66,10 @@ public:
             RevertOwnerLocked();  // continues below with the background thread
         }
         if (!owner_ && !thread_.joinable()) thread_ = std::thread([this] { Run(); });
-        if (!dup_) wake_.notify_all();
         if (dup_ && PtInRect(&outputRect_, c)) return true;
-        if (failed_) return false;  // unavailable: never block the caller (GDI fallback); the thread retries every 5 s
-        changed_.wait_for(lock, std::chrono::milliseconds(150), [&] { return (dup_ && PtInRect(&outputRect_, c)) || failed_.load(); });
+        wake_.notify_all();
+        if (failed_ || !waitMs) return false;
+        changed_.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return (dup_ && PtInRect(&outputRect_, c)) || failed_.load(); });
         return dup_ && PtInRect(&outputRect_, c);
     }
     // Waits up to `ms` for the first image.
@@ -156,18 +157,27 @@ private:
         if (failed_ && GetTickCount64() - failedAt_ < 5000) return false;  // retry later (a mode change can fix it)
         Stop();
         using Microsoft::WRL::ComPtr;
+        const HMONITOR monitor = MonitorFromPoint(c, MONITOR_DEFAULTTONULL);
+        if (!owner_ && device_ && (monitor != deviceMonitor_ || FAILED(device_->GetDeviceRemovedReason()))) {
+            image_.Reset(); rtv_.Reset(); shared_ = nullptr; vs_.Reset(); ps_.Reset(); cb_.Reset(); scissor_.Reset();
+            ctx_.Reset(); device_.Reset();
+        }
         if (!device_) {
             if (owner_) return Fail(E_FAIL);
+            const auto adapter = docky::DisplayAdapter(monitor);
+            if (!adapter) return Fail(DXGI_ERROR_NOT_FOUND);
             const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1};
-            if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION, &device_, nullptr, &ctx_)))
-                return Fail(E_FAIL);
+            const HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &device_, nullptr, &ctx_);
+            if (FAILED(hr)) return Fail(hr);
+            deviceMonitor_ = monitor;
         }
         ComPtr<IDXGIDevice> dxgi; ComPtr<IDXGIAdapter> adapter;
         if (FAILED(device_.As(&dxgi)) || FAILED(dxgi->GetAdapter(&adapter))) return Fail(E_NOINTERFACE);
         ComPtr<IDXGIOutput> output;
-        for (UINT i = 0; adapter->EnumOutputs(i, &output) != DXGI_ERROR_NOT_FOUND; ++i, output.Reset()) {
-            DXGI_OUTPUT_DESC od{}; output->GetDesc(&od);
-            if (!PtInRect(&od.DesktopCoordinates, c)) continue;
+        for (UINT i = 0; SUCCEEDED(adapter->EnumOutputs(i, &output)); ++i, output.Reset()) {
+            DXGI_OUTPUT_DESC od{};
+            if (FAILED(output->GetDesc(&od)) || od.Monitor != monitor) continue;
             if (od.Rotation != DXGI_MODE_ROTATION_IDENTITY && od.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) return Fail(E_NOTIMPL);
             HRESULT hr = E_NOINTERFACE;
             ComPtr<IDXGIOutput5> o5; ComPtr<IDXGIOutput1> o1;
@@ -214,7 +224,8 @@ private:
                 idleSince_ = 0; wake_.wait(lock); continue;
             }
             idleSince_ = 0;
-            if (!dup_) {
+            const POINT center{(wanted_.left + wanted_.right) / 2, (wanted_.top + wanted_.bottom) / 2};
+            if (!dup_ || !PtInRect(&outputRect_, center)) {
                 if (failed_ && GetTickCount64() - failedAt_ < 5000) { retry_ = true; wake_.wait_for(lock, std::chrono::milliseconds(500)); continue; }
                 const RECT want = wanted_;
                 const bool ok = Ensure(want);
@@ -578,6 +589,7 @@ private:
     std::vector<BYTE> meta_;
     std::vector<Change> history_;
     RECT outputRect_{};
+    HMONITOR deviceMonitor_ = nullptr;
     float sdrWhite_ = 2.5f;
     std::wstring outputName_;
     ULONGLONG nextWhiteCheck_ = 0;
