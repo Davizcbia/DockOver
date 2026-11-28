@@ -89,7 +89,10 @@ int selected=0, dockKeyboardRow=-2, densityKeyboardControl=0, workshopKeyboardCo
 dock::LocalGlassOverlay* drawingLocalGlass=nullptr;
 float switchPointerX=0.f,switchPointerY=0.f;
 struct SwitchMotion {bool initialized=false,on=false;float from=0,to=0;ULONGLONG start=0;};
-SwitchMotion switchMotion[64];  // indexed by switch id (Control Center uses up to 33; sliders 40+)
+SwitchMotion switchMotion[64];  // indexed by switch id (Control Center uses up to 33)
+// Slider thumbs press through the same visualSwitch, offset far past every switch id: with 40+ the gradient-opacity
+// slider (6) shared 46 with the "Menu bar gradient" switch and both enlarged together.
+constexpr int kSliderPress=1000;
 int visualSwitch=-1;float pressFrom=0,pressTo=0;ULONGLONG pressStart=0;
 bool switchDragging=false;float switchDragStartX=0,switchDragStartPosition=0,switchDragPosition=0;
 float localGlassWhite=0.f;
@@ -309,12 +312,15 @@ void DrawFormText(const FormRow& row,const wchar_t* title,const wchar_t* detail,
 constexpr int kStagePerspectiveSwitch=53;
 constexpr int kStagePerspectiveRow=5;
 constexpr int kGpuSwitch=54;
-constexpr int kGpuRow=kStagePerspectiveRow+1;
+constexpr int kLockIconsSwitch=60,kNetSpeedSwitch=61,kTemperatureSwitch=62;  // 2026-11-27: Dock icon lock, menu bar sensors
+constexpr int kLockIconsRow=kStagePerspectiveRow+1;
+constexpr int kGpuRow=kLockIconsRow+1;
 constexpr int kDownloadsRow=kGpuRow+1;
 constexpr int kBottomOffsetSlider=10;
 constexpr float kDockOffsetTop=liquid::design::settings::CardTop+158;
 int dockBottomOffset=0;
 bool stagePerspective=true;
+bool lockIcons=false,showNetSpeed=false,showTemperature=false;
 struct DockRowSpec{const wchar_t* title;const wchar_t* detail;int id;};
 const DockRowSpec dockRows[]={
  {L"macOS icon mask",L"Use rounded-square tiles for app icons.",0},
@@ -323,6 +329,7 @@ const DockRowSpec dockRows[]={
  {L"Hide snap layouts while dragging windows",L"Hide Windows snap layouts while dragging a window.",8},
  {L"Genie minimize animation",L"Animate windows into and out of the Dock when minimizing or restoring.",10},
  {L"Stage Manager perspective",L"Tilt window previews in the Stage Manager sidebar.",kStagePerspectiveSwitch},
+ {L"Lock icon dragging",L"Keep Dock icons in place: they cannot be dragged to reorder or out of the Dock to remove.",kLockIconsSwitch},
  {L"Use discrete GPU",L"Prefer the discrete GPU when on, or integrated graphics when off. Restart DockOver and its running components to apply.",kGpuSwitch},
  {L"Files shown",L"Show 3–10 recent files. Open Downloads to see everything.",-1},
  {L"Straight fan",L"Arrange the Downloads fan in a straight line.",11},
@@ -348,6 +355,8 @@ FormSpec SpecFor(int id){switch(id){
  case 18:return {L"Game compatibility",L"Hide the Dock and Menu Bar and stop desktop capture while a full-screen game, or a program from the games list, is running."};
  case 26:return {L"Low latency glass",L"The Dock's glass shows the desktop one display frame sooner (DXGI capture). Uses a little more CPU while the background moves. Off by default."};
  case 27:return {L"Games list",L"Programs that pause DockOver while they run, one .exe name per line. Applies within 2 seconds."};
+ case kNetSpeedSwitch:return {L"Network speed",L"Show upload and download speed in the menu bar. Right-click it to remove it."};
+ case kTemperatureSwitch:return {L"Temperature",L"Show CPU (top) and GPU (bottom) temperature without administrator rights. \u201C--\u201D means Windows does not report that sensor on this PC."};
  case 46:return {L"Menu bar gradient",L"Use a black or white gradient and match icon colour to Appearance. Turn off to follow the wallpaper."};
  case 25:return {L"Hide Windows notification banners",L"While Capture notifications is on, only DockOver's banners appear. Notifications still go to the Windows notification list."};
  case 24:return {L"Capture notifications",L"Show Windows notifications in Notification Center (click the clock in the menu bar) and as banners at the top right. Windows may ask you to allow notification access."};
@@ -398,7 +407,9 @@ FormRow FormFor(int id,float left,float right){float top=80;switch(id){
  case 27:top=FormFor(18,left,right).bottom;break;
  case 20:top=FormFor(27,left,right).bottom+12;break;
  case 26:top=FormFor(17,left,right).bottom+12;break;
- case 24:top=FormFor(20,left,right).bottom+12;break;
+ case kNetSpeedSwitch:top=FormFor(20,left,right).bottom+12;break;
+ case kTemperatureSwitch:top=FormFor(kNetSpeedSwitch,left,right).bottom;break;
+ case 24:top=FormFor(kTemperatureSwitch,left,right).bottom+12;break;
  case 25:top=FormFor(24,left,right).bottom;break;
  case 19:top=CcBlurRow(left,right).bottom+12;break;
  case 44:top=80;break;
@@ -649,7 +660,7 @@ bool RefreshTaskbarStatus(){docky::taskbar::Status next;const bool read=docky::t
  const bool changed=live!=tbLive||next.state!=tbStatus.state||next.guardian!=tbStatus.guardian||next.hotkey!=tbStatus.hotkey||next.hotkeyText!=tbStatus.hotkeyText||next.message!=tbStatus.message;
  tbStatus=next;tbLive=live;return changed;}
 bool LoginItemEnabled();
-void Refresh(){const auto r=liquid::settings::Load(settingsPath);docky::ui::SetLanguage(r.value.appearance.language);gameCompatibility=r.value.dock.gameCompatibility;stagePerspective=r.value.dock.stagePerspective;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging||activeSizeSlider!=8)dockMagnification=r.value.dock.magnification;if(!menuSliderDragging||activeSizeSlider!=kBottomOffsetSlider)dockBottomOffset=r.value.dock.bottomOffsetPercent;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;musicResponse=r.value.controlCenter.musicResponse;if(!menuSliderDragging||activeSizeSlider!=9)musicSensitivity=r.value.controlCenter.musicSensitivity;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;docky::vblank::SetCaps(perf.animationFps,perf.captureFps);updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;launchpadOnly=r.value.appearance.applicationsLaunchpadOnly;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
+void Refresh(){const auto r=liquid::settings::Load(settingsPath);docky::ui::SetLanguage(r.value.appearance.language);gameCompatibility=r.value.dock.gameCompatibility;stagePerspective=r.value.dock.stagePerspective;lockIcons=r.value.dock.lockIcons;showNetSpeed=r.value.menuBar.showNetSpeed;showTemperature=r.value.menuBar.showTemperature;lowLatencyGlass=r.value.dock.lowLatencyGlass;menuBarOn=r.value.menuBar.enabled;menuBarThemeGradient=r.value.menuBar.themeGradient;diagnostics=r.value.dock.diagnostics;iconMask=r.value.dock.useMacIconMask;autoHide=r.value.dock.autoHide;hideSnap=r.value.dock.hideSnapLayouts;genie=r.value.dock.genieMinimize;dlCount=r.value.dock.downloadsCount;if(!menuSliderDragging||activeSizeSlider!=8)dockMagnification=r.value.dock.magnification;if(!menuSliderDragging||activeSizeSlider!=kBottomOffsetSlider)dockBottomOffset=r.value.dock.bottomOffsetPercent;dlVertical=r.value.dock.downloadsVertical;dlPreview=r.value.dock.downloadsPreview;launchDesktop=r.value.dock.launchDesktop;loginItem=LoginItemEnabled();density=r.value.launchpad;ccBlur=r.value.controlCenter.backdropBlur;mediaArtworkBackground=r.value.controlCenter.mediaArtworkBackground;musicWallpaper=r.value.controlCenter.musicWallpaper;wallpaperAvoidBars=r.value.controlCenter.wallpaperAvoidBars;wallpaperLyrics=r.value.controlCenter.wallpaperLyrics;lyricsFullArtwork=r.value.controlCenter.lyricsFullArtwork;lyricsAutoReturn=r.value.controlCenter.lyricsAutoReturn;animatedArtwork=r.value.controlCenter.animatedArtwork;lyricsDoubleClickSeek=r.value.controlCenter.lyricsDoubleClickSeek;keepArtworkWhenPaused=r.value.controlCenter.keepArtworkWhenPaused;localMusicTags=r.value.controlCenter.localMusicTags;hideIconsWithWidgets=r.value.controlCenter.hideDesktopIconsWithWidgets;lyricsBeat=r.value.controlCenter.lyricsBeat;musicFps=r.value.controlCenter.musicFps;musicResponse=r.value.controlCenter.musicResponse;if(!menuSliderDragging||activeSizeSlider!=9)musicSensitivity=r.value.controlCenter.musicSensitivity;lyricsOffsetMs=r.value.controlCenter.lyricsOffsetMs;shortcutValues[0]=r.value.controlCenter.shortcutLyrics;shortcutValues[1]=r.value.controlCenter.shortcutArtwork;shortcutValues[2]=r.value.controlCenter.shortcutDesktop;shortcutValues[3]=r.value.controlCenter.shortcutNowPlaying;shortcutsLoaded=true;captureNotifications=r.value.menuBar.captureNotifications;hideSystemNotifications=r.value.menuBar.hideSystemNotifications;ncBlur=r.value.menuBar.notificationBlur;ncFade=r.value.menuBar.notificationBlurFade;ncShade=r.value.menuBar.notificationShade;if(!menuSliderDragging){gradientOpacity=r.value.menuBar.gradientOpacity;gradientLength=r.value.menuBar.gradientLength;menuScalePercent=r.value.menuBar.scalePercent;settingsUiPercent=r.value.appearance.settingsScalePercent;applicationsUiPercent=r.value.appearance.applicationsScalePercent;}perf=r.value.performance;docky::vblank::SetCaps(perf.animationFps,perf.captureFps);updatePref=r.value.updates;appearanceMode=r.value.appearance.mode;applicationsSort=r.value.appearance.applicationsSort;launchpadOnly=r.value.appearance.applicationsLaunchpadOnly;taskbarPref=r.value.taskbar;revision=liquid::settings::ReadRevision(settingsPath);}
 void OpenWindowsTaskbarSettings(HWND h){
  const auto result=reinterpret_cast<INT_PTR>(ShellExecuteW(h,L"open",L"ms-settings:taskbar",nullptr,nullptr,SW_SHOWNORMAL));
  if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Taskbar Settings could not be opened. Open Personalization > Taskbar in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
@@ -659,7 +670,7 @@ void OpenVisualEffects(HWND h){
  if(result<=32)MessageBoxW(h,docky::ui::Text(L"Windows Settings could not be opened. Open Accessibility > Visual effects in Windows Settings."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);
 }
 void ToggleDockSetting(HWND h,int row){
- if(row<0||row>=kDownloadsRow)return;const char* keys[]={"useMacIconMask","autoHide","diagnostics","hideSnapLayouts","genieMinimize","stagePerspective"};const bool now[]={iconMask,autoHide,diagnostics,hideSnap,genie,stagePerspective};
+ if(row<0||row>=kDownloadsRow)return;const char* keys[]={"useMacIconMask","autoHide","diagnostics","hideSnapLayouts","genieMinimize","stagePerspective","lockIcons"};const bool now[]={iconMask,autoHide,diagnostics,hideSnap,genie,stagePerspective,lockIcons};
  const auto status=row==kGpuRow?liquid::settings::WriteBool(settingsPath,"performance","useDiscreteGpu",!perf.useDiscreteGpu)
   :liquid::settings::WriteBool(settingsPath,"dock",keys[row],!now[row]);
  if(status!=liquid::settings::SaveStatus::Saved){Refresh();MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);}else Refresh();
@@ -803,7 +814,7 @@ bool CreateResources(HWND h){
  target=fallbackTarget.Get();
  if(!brush && FAILED(target->CreateSolidColorBrush(C(0xffffff),&brush))){fallbackTarget.Reset();target=nullptr;return false;}return true;
 }
-bool SettingsSwitchValue(int index){switch(index){case kLaunchpadOnlySwitch:return launchpadOnly;case kGpuSwitch:return perf.useDiscreteGpu;case kStagePerspectiveSwitch:return stagePerspective;case 0:return iconMask;case 1:return autoHide;case 2:return diagnostics;
+bool SettingsSwitchValue(int index){switch(index){case kLaunchpadOnlySwitch:return launchpadOnly;case kLockIconsSwitch:return lockIcons;case kNetSpeedSwitch:return showNetSpeed;case kTemperatureSwitch:return showTemperature;case kGpuSwitch:return perf.useDiscreteGpu;case kStagePerspectiveSwitch:return stagePerspective;case 0:return iconMask;case 1:return autoHide;case 2:return diagnostics;
  case 3:return taskbarPref.hideOnStartup;case 4:return taskbarPref.freeWorkArea;case 5:return taskbarPref.hotkeyEnabled&&taskbarPref.hotkeyKey!=0;case 8:return hideSnap;case 9:return density.hideLabels;case 10:return genie;case 11:return dlVertical;case 12:return dlPreview;case 13:return density.showWindows;case 14:return updatePref.autoCheck;case 15:return updatePref.autoInstall;case 16:return launchDesktop;case 17:return loginItem;case 18:return gameCompatibility;case 26:return lowLatencyGlass;case 20:return menuBarOn;case 46:return menuBarThemeGradient;case 24:return captureNotifications;case 25:return hideSystemNotifications;case 19:return mediaArtworkBackground;case 28:return musicWallpaper;case 29:return wallpaperAvoidBars;case 31:return wallpaperLyrics;case 32:return lyricsFullArtwork;case 33:return lyricsAutoReturn;case 38:return lyricsBeat;case 44:return animatedArtwork;case 45:return lyricsDoubleClickSeek;case 50:return keepArtworkWhenPaused;case 51:return localMusicTags;case 52:return hideIconsWithWidgets;default:return false;}}
 // General page: "Start DockOver Desktop with DockOver" (index 16), in its own card below the frame-rate card.
 float DesktopLaunchCardTop(){return CurrentForm(16).top;}
@@ -857,7 +868,7 @@ int SettingsSwitchAt(HWND h,float x,float y){
  if(selected==2){const auto form=MeasureDock(left,right);for(int i=0;i<std::ssize(dockRows);++i){if(i==kDownloadsRow)continue;auto r=form.rows[i].control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return dockRows[i].id;}}
  if(selected==1){auto r=FormFor(kLaunchpadOnlySwitch,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return kLaunchpadOnlySwitch;}
  if(selected==5||selected==10){for(int id:{19,44,28,29,31,50,51,32,33,45,38,52}){if((id==19)!=(selected==5))continue;auto r=FormFor(id,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return id;}}
- if(selected==3){for(int id:{46,18,20,24,25}){auto r=FormFor(id,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return id;}}
+ if(selected==3){for(int id:{46,18,20,kNetSpeedSwitch,kTemperatureSwitch,24,25}){auto r=FormFor(id,left,right).control;r.left-=8;r.right+=8;r.top-=8;r.bottom+=8;if(Contains(r,x,y))return id;}}
  if(selected==0){const auto r=DesktopLaunchSwitch(right);if(x>=r.left-8&&x<r.right+8&&y>=r.top-8&&y<r.bottom+8)return 16;
   const auto g=LoginItemSwitch(right);if(x>=g.left-8&&x<g.right+8&&y>=g.top-8&&y<g.bottom+8)return 17;
   {auto l=FormFor(26,left,right).control;l.left-=8;l.right+=8;l.top-=8;l.bottom+=8;if(Contains(l,x,y))return 26;}}
@@ -915,7 +926,7 @@ float NcSliderTop(int index){const auto [left,right]=CurrentContentEdges();retur
 SizeSliderSpec SizeSpec(int index){switch(index){
  case 6:case 7:{const auto [left,right]=CurrentContentEdges();const float top=FormFor(46,left,right).bottom+12+(index-6)*158.f;
   return index==6?SizeSliderSpec{0,100,top,L"Gradient opacity",L"Set how strong the black or white shade is at the top edge."}
-                 :SizeSliderSpec{40,100,top,L"Gradient length",L"Set how far down the menu bar the gradient reaches before becoming transparent."};}
+                 :SizeSliderSpec{40,300,top,L"Gradient length",L"Set where the gradient ends. 100% is the bottom of the menu bar; higher values continue the fade below it."};}
 case 9:{const auto [left,right]=CurrentContentEdges();
  return {0,100,FormFor(53,left,right).bottom+12,L"Detection sensitivity",L"Higher values pick up softer rhythmic hits. Lower values filter out more weak hits."};}
 case kBottomOffsetSlider:return {0,25,kDockOffsetTop,L"Dock bottom offset",L"Distance from the screen edge as a percentage of the screen height. 0% places the Dock flush with the bottom."};
@@ -965,8 +976,8 @@ void DrawSizeSlider(HWND h,int index,float left,float right,const liquid::design
  Text((std::to_wstring(SizeValue(index))+spec.unit).c_str(),trailingSmall.Get(),D2D1::RectF(right-64,top+(index==0?21:14),right-16,top+(index==0?50:39)),colors.secondary);
  Text(spec.detail,fontSmall.Get(),D2D1::RectF(left+16,top+(index==0?36:45),right-(index==0?202:16),top+(index==0?71:83)),colors.secondary);
  const auto track=SizeSliderTrack(index,left,right);const auto now=docky::vblank::AnimationMillis();
- const float press=ReducedMotion()?0.f:(visualSwitch==40+index?PressAmount(now):0.f);
- if(visualSwitch==40+index&&now-pressStart<150&&!ReducedMotion())switchTicker.Start(h,docky::vblank::kMsgVBlank);
+ const float press=ReducedMotion()?0.f:(visualSwitch==kSliderPress+index?PressAmount(now):0.f);
+ if(visualSwitch==kSliderPress+index&&now-pressStart<150&&!ReducedMotion())switchTicker.Start(h,docky::vblank::kMsgVBlank);
  const auto shape=dock::LabSlider(track.left,track.right,(track.top+track.bottom)*.5f,(SizeValue(index)-spec.lo)/float(spec.hi-spec.lo),.8f,press);
  const bool gpu=allowTransparency&&drawingChromeGlass;
  dock::DrawLabSlider(target,brush.Get(),shape,liquid::theme::IsDark(appearanceMode,systemDark),gpu);
@@ -1288,6 +1299,9 @@ void DrawContent(HWND h){
    brush->SetColor(C(colors.secondary,.14f));target->DrawLine(D2D1::Point2F(left+12,row.top),D2D1::Point2F(right-12,row.top),brush.Get(),1);const auto spec=SpecFor(27);DrawFormText(row,spec.title,spec.detail,colors);
    const auto b=GamesListButton(left,right);Round(b,ds::radius::Button,colors.background);Text(L"Edit list...",centerSmall.Get(),b,colors.primary);}
   DrawSwitchRow(h,20,left,right,colors);
+  {const auto a=FormFor(kNetSpeedSwitch,left,right),b=FormFor(kTemperatureSwitch,left,right);Round(D2D1::RectF(left,a.top,right,b.bottom),SettingsCardRadius,colors.surface);
+   DrawSwitchRow(h,kNetSpeedSwitch,left,right,colors,false);DrawSwitchRow(h,kTemperatureSwitch,left,right,colors,false);
+   brush->SetColor(C(colors.secondary,.14f));target->DrawLine(D2D1::Point2F(left+16,b.top),D2D1::Point2F(right-16,b.top),brush.Get(),1);}
   {const auto a=FormFor(24,left,right),b=FormFor(25,left,right);Round(D2D1::RectF(left,a.top,right,b.bottom),SettingsCardRadius,colors.surface);
    DrawSwitchRow(h,24,left,right,colors,false);DrawSwitchRow(h,25,left,right,colors,false);
    brush->SetColor(C(colors.secondary,.14f));target->DrawLine(D2D1::Point2F(left+16,b.top),D2D1::Point2F(right-16,b.top),brush.Get(),1);}
@@ -1450,10 +1464,10 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    if(x>=b.left&&x<b.right&&by>=b.top&&by<b.bottom){if(ApplicationsWindowResized()&&!DeleteFileW(ApplicationsWindowSizePath().c_str()))MessageBoxW(h,docky::ui::Text(L"Could not reset the Applications window size."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);InvalidateRect(h,nullptr,FALSE);return 0;}}
   if(selected==3||selected==1||selected==2||selected==10){const auto [left,right]=CurrentContentEdges();const float by=y-BodyShift();
    for(int index:selected==10?std::vector<int>{9}:selected==2?std::vector<int>{8,kBottomOffsetSlider}:selected==3?(menuBarThemeGradient?std::vector<int>{0,6,7,3,4,5}:std::vector<int>{0,3,4,5}):std::vector<int>{1,2}){const auto track=SizeSliderTrack(index,left,right);const auto spec=SizeSpec(index);const float cx=track.left+(track.right-track.left)*(SizeValue(index)-spec.lo)/float(spec.hi-spec.lo);
-    if(x>=track.left-22&&x<=track.right+22&&by>=track.top-18&&by<=track.bottom+18){SetFocus(h);activeSizeSlider=index;if(index==0)menuKeyboardControl=0;else if(index<=2)appearanceKeyboard=index+2;else if(index==8||index==kBottomOffsetSlider)dockKeyboardRow=index==8?-2:-1;menuDragStart=SizeValue(index);menuSliderDragging=true;BeginSwitchPress(h,40+index,true);menuSliderGrab=std::fabs(x-cx)<=20?x-cx:0;SetCapture(h);UpdateMenuSlider(h,x);InvalidateRect(h,nullptr,FALSE);return 0;}}}
+    if(x>=track.left-22&&x<=track.right+22&&by>=track.top-18&&by<=track.bottom+18){SetFocus(h);activeSizeSlider=index;if(index==0)menuKeyboardControl=0;else if(index<=2)appearanceKeyboard=index+2;else if(index==8||index==kBottomOffsetSlider)dockKeyboardRow=index==8?-2:-1;menuDragStart=SizeValue(index);menuSliderDragging=true;BeginSwitchPress(h,kSliderPress+index,true);menuSliderGrab=std::fabs(x-cx)<=20?x-cx:0;SetCapture(h);UpdateMenuSlider(h,x);InvalidateRect(h,nullptr,FALSE);return 0;}}}
 
   const int sw=SettingsSwitchAt(h,x,y);if(sw>=0){SetFocus(h);if(sw==46)menuKeyboardControl=1;else if(sw==18)menuKeyboardControl=2;switchPressed=sw;switchDragging=false;switchDragStartX=x;switchDragStartPosition=SettingsSwitchValue(sw)?1.f:0.f;switchDragPosition=switchDragStartPosition;BeginSwitchPress(h,sw,true);SetCapture(h);InvalidateRect(h,nullptr,FALSE);return 0;}break;}
- case WM_CAPTURECHANGED:if(menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();InvalidateRect(h,nullptr,FALSE);}if(chromePressed>=0||switchPressed>=0){if(switchPressed>=0){if(switchDragging){auto& anim=switchMotion[switchPressed];const bool value=SettingsSwitchValue(switchPressed);anim.initialized=true;anim.on=value;anim.from=switchDragPosition;anim.to=value?1.f:0.f;anim.start=docky::vblank::AnimationMillis();}BeginSwitchPress(h,switchPressed,false);}chromePressed=-1;switchPressed=-1;switchDragging=false;InvalidateRect(h,nullptr,FALSE);}break;
+ case WM_CAPTURECHANGED:if(menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,kSliderPress+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();InvalidateRect(h,nullptr,FALSE);}if(chromePressed>=0||switchPressed>=0){if(switchPressed>=0){if(switchDragging){auto& anim=switchMotion[switchPressed];const bool value=SettingsSwitchValue(switchPressed);anim.initialized=true;anim.on=value;anim.from=switchDragPosition;anim.to=value?1.f:0.f;anim.start=docky::vblank::AnimationMillis();}BeginSwitchPress(h,switchPressed,false);}chromePressed=-1;switchPressed=-1;switchDragging=false;InvalidateRect(h,nullptr,FALSE);}break;
  case WM_CREATE: settingsWindowHandle=h;Refresh();scale=GetDpiForWindow(h)/96.f*settingsUiPercent/100.f;RefreshWorkshop();RefreshTaskbarState();RefreshTaskbarStatus();
   try {systemUi=winrt::Windows::UI::ViewManagement::UISettings();} catch(...) {systemUi=nullptr;} RefreshAccessibility();RefreshSystemAppearance();
   {WNDCLASSW host{};host.hInstance=GetModuleHandleW(nullptr);host.lpfnWndProc=SearchHostProc;host.lpszClassName=L"DockOverSettingsSearchHost";host.hCursor=LoadCursorW(nullptr,IDC_IBEAM);RegisterClassW(&host);
@@ -1482,7 +1496,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   if(((selected==2&&dockKeyboardRow<0)||selected==10||(selected==3&&menuKeyboardControl==0)||(selected==1&&appearanceKeyboard>=3&&appearanceKeyboard<=4))&&(w==VK_LEFT||w==VK_RIGHT||w==VK_HOME||w==VK_END)){
    activeSizeSlider=selected==2?(dockKeyboardRow==-2?8:kBottomOffsetSlider):selected==10?9:selected==3?0:appearanceKeyboard-2;const auto spec=SizeSpec(activeSizeSlider);auto& value=SizeValue(activeSizeSlider);value=w==VK_HOME?spec.lo:w==VK_END?spec.hi:std::clamp(value+(w==VK_LEFT?-1:1)*((GetKeyState(VK_SHIFT)&0x8000)?10:1),spec.lo,spec.hi);PreviewMenuScale();SaveMenuScale(h);return 0;}
 
-  if(w==VK_ESCAPE&&menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();ReleaseCapture();InvalidateRect(h,nullptr,FALSE);return 0;}
+  if(w==VK_ESCAPE&&menuSliderDragging){menuSliderDragging=false;BeginSwitchPress(h,kSliderPress+activeSizeSlider,false);SizeValue(activeSizeSlider)=menuDragStart;PreviewMenuScale();ReleaseCapture();InvalidateRect(h,nullptr,FALSE);return 0;}
   if(w==VK_TAB&&selected==3){const bool back=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((back&&menuKeyboardControl==0)||(!back&&menuKeyboardControl==2)){if(searchBox)FocusSearch();}else menuKeyboardControl+=back?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
   if((w==VK_SPACE||w==VK_RETURN)&&selected==3&&menuKeyboardControl>0){const bool gradient=menuKeyboardControl==1;if(liquid::settings::WriteBool(settingsPath,gradient?"menuBar":"dock",gradient?"themeGradient":"gameCompatibility",gradient?!menuBarThemeGradient:!gameCompatibility)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();InvalidateRect(h,nullptr,FALSE);return 0;}
   if(w==VK_TAB&&selected==1){const bool back=(GetKeyState(VK_SHIFT)&0x8000)!=0;if((back&&appearanceKeyboard==0)||(!back&&appearanceKeyboard==10)){if(searchBox)FocusSearch();}else appearanceKeyboard+=back?-1:1;InvalidateRect(h,nullptr,FALSE);return 0;}
@@ -1573,7 +1587,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
   UpdateScrollBounds(h);const float distance=-GET_WHEEL_DELTA_WPARAM(w)/120.f*72.f;
   if(point.x/scale<liquid::design::settings::SidebarWidth)sidebarScroll.By(distance);else contentScroll[selected].By(distance);
   StartScroll(h);return 0;}
- case WM_LBUTTONUP:{if(menuSliderDragging){UpdateMenuSlider(h,GET_X_LPARAM(l)/scale);menuSliderDragging=false;BeginSwitchPress(h,40+activeSizeSlider,false);ReleaseCapture();SaveMenuScale(h);return 0;}namespace ds=liquid::design;namespace lay=liquid::design::settings;namespace sp=liquid::design::space;
+ case WM_LBUTTONUP:{if(menuSliderDragging){UpdateMenuSlider(h,GET_X_LPARAM(l)/scale);menuSliderDragging=false;BeginSwitchPress(h,kSliderPress+activeSizeSlider,false);ReleaseCapture();SaveMenuScale(h);return 0;}namespace ds=liquid::design;namespace lay=liquid::design::settings;namespace sp=liquid::design::space;
   float x=GET_X_LPARAM(l)/scale,y=GET_Y_LPARAM(l)/scale;RECT rc{};GetClientRect(h,&rc);const float contentLeft=ContentLeftForWidth(rc.right/scale),right=ContentRightForWidth(rc.right/scale,contentLeft);
   if(switchPressed>=0){const int pressed=switchPressed;const bool oldValue=SettingsSwitchValue(pressed);const bool change=!switchDragging||((switchDragPosition>=.5f)!=oldValue);if(switchDragging){auto& anim=switchMotion[pressed];anim.initialized=true;anim.on=oldValue;anim.from=switchDragPosition;anim.to=oldValue?1.f:0.f;anim.start=docky::vblank::AnimationMillis();}switchPressed=-1;BeginSwitchPress(h,pressed,false);switchDragging=false;if(GetCapture()==h)ReleaseCapture();
    if(change&&SettingsSwitchAt(h,x,y)==pressed&&pressed==20){if(liquid::settings::WriteBool(settingsPath,"menuBar","enabled",!menuBarOn)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
@@ -1601,6 +1615,9 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l){
    else if(pressed==kLaunchpadOnlySwitch){appearanceKeyboard=10;ToggleLaunchpadOnly(h);}
    else if(pressed==kGpuSwitch){dockKeyboardRow=kGpuRow;ToggleDockSetting(h,dockKeyboardRow);}
    else if(pressed==kStagePerspectiveSwitch){dockKeyboardRow=kStagePerspectiveRow;ToggleDockSetting(h,dockKeyboardRow);}
+   else if(pressed==kLockIconsSwitch){dockKeyboardRow=kLockIconsRow;ToggleDockSetting(h,dockKeyboardRow);}
+   else if(pressed==kNetSpeedSwitch||pressed==kTemperatureSwitch){const bool now=pressed==kNetSpeedSwitch?showNetSpeed:showTemperature;
+    if(liquid::settings::WriteBool(settingsPath,"menuBar",pressed==kNetSpeedSwitch?"showNetSpeed":"showTemperature",!now)!=liquid::settings::SaveStatus::Saved)MessageBoxW(h,docky::ui::Text(L"Could not save settings. Your previous settings were preserved."),docky::ui::Text(L"DockOver Settings"),MB_OK|MB_ICONWARNING);Refresh();}
    else if(pressed<3||pressed==8||pressed==10){const int row=pressed==8?3:pressed==10?4:pressed;dockKeyboardRow=row;ToggleDockSetting(h,row);}else{taskbarKeyboardControl=pressed;ActivateTaskbarControl(h,pressed);}}InvalidateRect(h,nullptr,FALSE);return 0;}
   if(chromePressed>=0){const int pressed=chromePressed;chromePressed=-1;if(GetCapture()==h)ReleaseCapture();if(ChromeButtonAt(x,y)==pressed){if(pressed==0)PostMessageW(h,WM_CLOSE,0,0);else if(pressed==1)ShowWindow(h,SW_MINIMIZE);else ShowWindow(h,IsZoomed(h)?SW_RESTORE:SW_MAXIMIZE);}InvalidateRect(h,nullptr,FALSE);return 0;}
   const float nav=lay::SidebarWidth+10.f;if(x>=nav&&x<nav+88&&y>=10&&y<52){StepHistory(h,x<nav+44?-1:1);return 0;}

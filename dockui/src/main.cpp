@@ -59,6 +59,7 @@ static volatile const char liquidBuildMarker[] = LIQUID_BUILD_MARKER;
 #include "stage_manager.h"
 #include "display_adapter.h"
 #include "desktop_settings.h"
+#include "taskbar_guardian.h"
 #include "theme_state.h"
 #include "status_group.h"
 #include "status_popups.h"
@@ -108,6 +109,15 @@ static const wchar_t* const kStatusMenuIds[] = {L"combo", L"analog", L"date", L"
 static constexpr UINT kStatusTileCount = 5;
 constexpr UINT kMenuNewFinder = 70, kMenuNewWindow = 71, kMenuDockySettings = 72, kMenuQuitApp = 73, kMenuJumpBase = 700;
 constexpr size_t kJumpMax = 12;
+// MyDockFinder's Dock menu items (user request 2026-11-27): lock dragging, taskbar, add app / system shortcut, Workshop.
+constexpr UINT kMenuLockIcons = 84, kMenuShowTaskbar = 85, kMenuHideTaskbar = 86, kMenuAddApp = 87, kMenuWorkshop = 88, kMenuShortcutBase = 1200;
+struct SystemShortcut { const wchar_t* label; const wchar_t* target; };
+static const SystemShortcut kSystemShortcuts[] = {
+    {L"This PC", L"shell:MyComputerFolder"}, {L"Control Panel", L"shell:ControlPanelFolder"},
+    {L"Settings", L"shell:AppsFolder\\windows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel"},
+    {L"Documents", L"shell:Personal"}, {L"Downloads Folder", L"shell:Downloads"}, {L"Pictures", L"shell:My Pictures"},
+    {L"Music", L"shell:My Music"}, {L"Videos", L"shell:My Video"}, {L"Network", L"shell:NetworkPlacesFolder"},
+    {L"Command Prompt", L"%SystemRoot%\\System32\\cmd.exe"}, {L"Windows Terminal", L"shell:AppsFolder\\Microsoft.WindowsTerminal_8wekyb3d8bbwe!App"}};
 enum MenuId : UINT { kMenuRename = 63, kMenuEditIcon = 62, kMenuInsertSep = 60, kMenuRemoveSep = 61, kMenuKeep = 50, kMenuOpen = 1, kMenuUnpin, kMenuLocation, kMenuReload, kMenuEditConfig, kMenuQuit, kMenuGlass, kMenuChangeIcon, kMenuResetIcon, kMenuSnapshot };
 
 double Now() {
@@ -312,6 +322,7 @@ private:
     bool UpdateDragGhost();                                    // true while the dragged icon is drawn by dragGhost_
     std::vector<uint32_t> DockIconPixels(size_t index, UINT& w, UINT& h);  // CPU copy of the icon as the Dock shows it
     void OnRButtonUp(float x, float y);
+    void OpenSettingsPage(const wchar_t* page);
     void UpdateDockAppBar();  // reserve / release the Dock band as a bottom AppBar (MyDockFinder "window boundary")
     void ToggleStageManager();
     static constexpr UINT kDockAppBarMsg = WM_APP + 78;
@@ -433,6 +444,7 @@ private:
     std::vector<PinnedItem> MakeStatusItems() const;
     // Removable Dock items (dock.showDownloads / showTrash / showDivider) and the order of the right-hand items.
     bool showDownloads_ = true, showTrash_ = true, showDivider_ = true;
+    bool lockIcons_ = false;  // Dock menu > Lock Icon Dragging (dock.lockIcons)
     std::vector<std::wstring> tailOrder_;
     bool removeOnDrop_ = false;   // the dragged item is held well above the Dock: letting go removes it
     dock::DragGhost dragGhost_;   // the dragged icon outside the Dock's canvas
@@ -772,7 +784,7 @@ int App::Run(HINSTANCE instance, const Options& options) {
     dockPackRevision_=liquid::settings::ReadRevision(dockPackRoot_+L"\\active.txt");
     LoadDockWorkshop();
     { const auto initial = liquid::settings::Load(opt_.desktopSettingsPath).value; statusCells_ = initial.dock.statusCells; menuBarEnabled_ = initial.menuBar.enabled; statusPercent_ = initial.dock.statusBatteryPercent; statusTileStyle_ = initial.dock.statusTileStyle;
-      showDownloads_ = initial.dock.showDownloads; showTrash_ = initial.dock.showTrash; showDivider_ = initial.dock.showDivider; tailOrder_ = initial.dock.tailOrder;
+      showDownloads_ = initial.dock.showDownloads; showTrash_ = initial.dock.showTrash; showDivider_ = initial.dock.showDivider; lockIcons_ = initial.dock.lockIcons; tailOrder_ = initial.dock.tailOrder;
       if (!menuBarEnabled_ && statusCells_.empty()) statusCells_ = liquid::settings::Dock{}.statusCells; }  // the menu bar is off: status items need a home
     LoadItems();
     if (!statusCells_.empty()) RefreshStatus(true);  // time, input layout now; Wi-Fi / battery / volume when the first query returns
@@ -1128,6 +1140,7 @@ LRESULT App::Handle(UINT msg, WPARAM wp, LPARAM lp) {
                 if(current.value.dock.statusBatteryPercent!=statusPercent_){statusPercent_=current.value.dock.statusBatteryPercent;RefreshStatus(false);}
                 if(current.value.dock.statusTileStyle!=statusTileStyle_){statusTileStyle_=current.value.dock.statusTileStyle;RefreshStatus(false);}
                 if(current.value.dock.statusCells!=statusCells_||current.value.menuBar.enabled!=menuBarEnabled_)ApplyStatusCells(current.value.dock.statusCells,current.value.menuBar.enabled);
+                lockIcons_=current.value.dock.lockIcons;
                 if(current.value.dock.showDownloads!=showDownloads_||current.value.dock.showTrash!=showTrash_||current.value.dock.showDivider!=showDivider_||current.value.dock.tailOrder!=tailOrder_){
                     showDownloads_=current.value.dock.showDownloads;showTrash_=current.value.dock.showTrash;showDivider_=current.value.dock.showDivider;tailOrder_=current.value.dock.tailOrder;
                     if(!dragging_)RebuildTail(L"settings");}
@@ -1422,6 +1435,39 @@ static std::wstring PickIconImage(HWND owner) {
     if (SUCCEEDED(dialog->GetResult(&selected)) && SUCCEEDED(selected->GetDisplayName(SIGDN_FILESYSPATH, &raw)) && raw) path = raw;
     if (raw) CoTaskMemFree(raw);
     return path;
+}
+// Dock menu > Add App…: an .exe or a shortcut (.lnk). Shortcuts are kept as chosen (not dereferenced) so their
+// arguments and icon stay, as when one is dropped on the Dock.
+static std::wstring PickApplication(HWND owner) {
+    ComPtr<IFileOpenDialog> dialog;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog)))) return {};
+    const COMDLG_FILTERSPEC filters[] = {{L"Apps (*.exe;*.lnk)", L"*.exe;*.lnk"}};
+    FILEOPENDIALOGOPTIONS opts{};
+    if (FAILED(dialog->GetOptions(&opts))) return {};
+    dialog->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR | FOS_NODEREFERENCELINKS);
+    dialog->SetFileTypes(ARRAYSIZE(filters), filters);
+    dialog->SetTitle(docky::ui::Text(L"Add App"));
+    PWSTR start = nullptr;  // start in the Start menu's Programs folder
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_CommonPrograms, 0, nullptr, &start)) && start) {
+        ComPtr<IShellItem> folder; if (SUCCEEDED(SHCreateItemFromParsingName(start, nullptr, IID_PPV_ARGS(&folder)))) dialog->SetFolder(folder.Get());
+    }
+    if (start) CoTaskMemFree(start);
+    if (FAILED(dialog->Show(owner))) return {};
+    ComPtr<IShellItem> selected; PWSTR raw = nullptr; std::wstring path;
+    if (SUCCEEDED(dialog->GetResult(&selected)) && SUCCEEDED(selected->GetDisplayName(SIGDN_FILESYSPATH, &raw)) && raw) path = raw;
+    if (raw) CoTaskMemFree(raw);
+    return path;
+}
+// Settings opened on one page (Dock menu > Workshop…). The Settings window takes --page; same folder as the Dock.
+void App::OpenSettingsPage(const wchar_t* page) {
+    wchar_t module[32768]{};const DWORD n=GetModuleFileNameW(nullptr,module,ARRAYSIZE(module));
+    std::wstring dir(module,n);dir=dir.substr(0,dir.find_last_of(L"\\/"));
+    const std::wstring exe=dir+L"\\LiquidDesktopSettings.exe";
+    std::wstring args=L"--page "+std::wstring(page);
+    if(!opt_.desktopSettingsPath.empty()&&_wcsicmp(opt_.desktopSettingsPath.c_str(),liquid::settings::DefaultPath().c_str())!=0)args+=L" --settings-path \""+opt_.desktopSettingsPath+L"\"";
+    const auto r=reinterpret_cast<INT_PTR>(ShellExecuteW(hwnd_,L"open",exe.c_str(),args.c_str(),dir.c_str(),SW_SHOWNORMAL));
+    DLOG(L"menu: settings page %ls (%lld)",page,static_cast<long long>(r));
+    if(r<=32)MessageBoxW(hwnd_,docky::ui::Text(L"Could not open DockOver Settings."),L"DockOver",MB_OK|MB_ICONWARNING);
 }
 void App::OpenIconEditor(int index) {
     if(index<0 || static_cast<size_t>(index)>=items_.size() || items_[index].isSeparator || items_[index].isDownloads || items_[index].isRecycleBin || items_[index].isLaunchpad || items_[index].isStatusGroup)return;
@@ -2750,7 +2796,7 @@ void App::OnMouseMove(float x, float y) {
     if(pressed_>=0 && !dragging_){
         const float dx=x-pressX_,dy=y-pressY_;
         const float threshold=static_cast<float>(std::max(GetSystemMetricsForDpi(SM_CXDRAG,static_cast<UINT>(dpi_)),GetSystemMetricsForDpi(SM_CYDRAG,static_cast<UINT>(dpi_))))/scale_;
-        if(dx*dx+dy*dy>=threshold*threshold && static_cast<size_t>(pressed_)<items_.size() && !DragKey(static_cast<size_t>(pressed_)).empty()){
+        if(!lockIcons_ && dx*dx+dy*dy>=threshold*threshold && static_cast<size_t>(pressed_)<items_.size() && !DragKey(static_cast<size_t>(pressed_)).empty()){
             // Every Dock item moves within its own section: the pinned apps with Launchpad and the user's separators,
             // the running apps, or the right-hand items (status tiles, Downloads, Recycle Bin; minimized windows stay put).
             auto section=[&](size_t i){const auto& it=items_[i];if(it.isSystemSeparator)return -1;if(IsTailItem(it))return 2;return it.isTransient?1:0;};
@@ -3153,6 +3199,17 @@ void App::OnRButtonUp(float x, float y) {
         AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(show), docky::ui::Text(L"Show in Dock"));
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
+    {   // Adding to the Dock (MyDockFinder: Add App Icon / Add System Shortcut). New items go to the end of the pinned apps.
+        AppendMenuW(menu, MF_STRING, kMenuAddApp, docky::ui::Text(L"Add App\u2026"));
+        HMENU shortcuts = CreatePopupMenu();
+        for (UINT i = 0; i < ARRAYSIZE(kSystemShortcuts); ++i) AppendMenuW(shortcuts, MF_STRING, kMenuShortcutBase + i, docky::ui::Text(kSystemShortcuts[i].label));
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(shortcuts), docky::ui::Text(L"Add System Shortcut"));
+        AppendMenuW(menu, MF_STRING | (lockIcons_ ? MF_CHECKED : 0), kMenuLockIcons, docky::ui::Text(L"Lock Icon Dragging"));
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(menu, MF_STRING, kMenuShowTaskbar, docky::ui::Text(L"Show Taskbar"));
+    AppendMenuW(menu, MF_STRING, kMenuHideTaskbar, docky::ui::Text(L"Hide Taskbar"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, kMenuApplications, docky::ui::Text(L"Applications…"));
 #ifdef DOCKY_PHONE_PAIRING
     AppendMenuW(menu, MF_STRING, kMenuPairPhone, L"DockDrop…");
@@ -3160,12 +3217,17 @@ void App::OnRButtonUp(float x, float y) {
     AppendMenuW(menu, MF_STRING | (stageManager_.Enabled() ? MF_CHECKED : 0), kMenuStageManager,
                 docky::ui::chinese ? L"台前调度" : L"Stage Manager");
     AppendMenuW(menu, MF_STRING, kMenuTaskManager, docky::ui::Text(L"Task Manager"));
-    AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, kMenuSnapshot, docky::ui::Text(L"Export Dock PNG (F5)"));
-    AppendMenuW(menu, MF_STRING, kMenuGlass, docky::ui::Text(L"Glass Settings…"));
-    AppendMenuW(menu, MF_STRING, kMenuEditConfig, docky::ui::Text(L"Edit pinned items…"));
-    AppendMenuW(menu, MF_STRING, kMenuReload, docky::ui::Text(L"Reload (F3)"));
+    AppendMenuW(menu, MF_STRING, kMenuWorkshop, docky::ui::Text(L"Workshop\u2026"));
+    AppendMenuW(menu, MF_STRING, kMenuDockySettings, docky::ui::Text(L"DockOver Settings…"));
+    {   // Tools for tuning and troubleshooting, kept out of the main list.
+        HMENU dev = CreatePopupMenu();
+        AppendMenuW(dev, MF_STRING, kMenuSnapshot, docky::ui::Text(L"Export Dock PNG (F5)"));
+        AppendMenuW(dev, MF_STRING, kMenuGlass, docky::ui::Text(L"Glass Settings…"));
+        AppendMenuW(dev, MF_STRING, kMenuEditConfig, docky::ui::Text(L"Edit pinned items…"));
+        AppendMenuW(dev, MF_STRING, kMenuReload, docky::ui::Text(L"Reload (F3)"));
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(dev), docky::ui::Text(L"Developer"));
+    }
     AppendMenuW(menu, MF_STRING, kMenuQuit, docky::ui::Text(L"Quit Dock (Esc)"));
     POINT pt;
     GetCursorPos(&pt);
@@ -3220,6 +3282,20 @@ void App::OnRButtonUp(float x, float y) {
         if(k==1&&!value)dock::downloads::Close();
         RebuildTail(value?L"shown":L"hidden");return;}
     if(cmd>=kMenuShowBase+10&&cmd<kMenuShowBase+10+ARRAYSIZE(kStatusMenuIds)){ToggleStatusCell(kStatusMenuIds[cmd-kMenuShowBase-10]);return;}
+    if(cmd==kMenuLockIcons){const bool value=!lockIcons_;
+        if(liquid::settings::WriteBool(opt_.desktopSettingsPath,"dock","lockIcons",value)!=liquid::settings::SaveStatus::Saved){MessageBoxW(hwnd_,L"Could not save settings.",L"DockOver",MB_OK|MB_ICONWARNING);return;}
+        lockIcons_=value;settingsRevision_=liquid::settings::ReadRevision(opt_.desktopSettingsPath);DLOG(L"menu: icon dragging %ls",value?L"locked":L"unlocked");return;}
+    if(cmd==kMenuShowTaskbar||cmd==kMenuHideTaskbar){  // the Desktop Manager owns the taskbar state (same events as its hotkey)
+        HANDLE ev=OpenEventW(EVENT_MODIFY_STATE,FALSE,cmd==kMenuShowTaskbar?docky::taskbar::kShowEvent:docky::taskbar::kHideEvent);
+        if(ev){SetEvent(ev);CloseHandle(ev);DLOG(L"menu: %ls taskbar requested",cmd==kMenuShowTaskbar?L"show":L"hide");}
+        else MessageBoxW(hwnd_,docky::ui::Text(L"Start DockOver to change the taskbar."),L"DockOver",MB_OK|MB_ICONINFORMATION);
+        return;}
+    if(cmd==kMenuAddApp){const auto path=PickApplication(hwnd_);if(!path.empty())PinPaths({path},static_cast<int>(PinnedEnd()));return;}
+    if(cmd>=kMenuShortcutBase&&cmd<kMenuShortcutBase+ARRAYSIZE(kSystemShortcuts)){
+        const auto& sc=kSystemShortcuts[cmd-kMenuShortcutBase];std::wstring target=sc.target;
+        if(target.find(L'%')!=std::wstring::npos){wchar_t expanded[MAX_PATH]{};if(ExpandEnvironmentStringsW(target.c_str(),expanded,MAX_PATH))target=expanded;}
+        PinPaths({target},static_cast<int>(PinnedEnd()));return;}
+    if(cmd==kMenuWorkshop){OpenSettingsPage(L"workshop");return;}
     if(cmd==kMenuDockySettings){  // the Desktop Manager owns the Settings window (single instance), like the menu bar's docky menu
         HANDLE ev=OpenEventW(EVENT_MODIFY_STATE,FALSE,L"Local\\LiquidDesktopSettingsOpenV1");
         if(ev){SetEvent(ev);CloseHandle(ev);DLOG(L"menu: docky Settings requested");}
@@ -3541,7 +3617,7 @@ void App::PinPaths(const std::vector<std::wstring>& paths, int insert) {
     for (const auto& pathString : paths) {
         const wchar_t* path = pathString.c_str();
         const DWORD attributes=GetFileAttributesW(path);
-        if (!pathString.starts_with(L"shell:AppsFolder\\") &&
+        if (!pathString.starts_with(L"shell:") &&  // shell: names (apps, This PC, known folders) have no file attributes
             (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))) {
             DLOG(L"pin: ignored missing item or directory '%ls'",path);continue;
         }

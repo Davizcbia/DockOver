@@ -10,14 +10,58 @@ namespace dock {
 // icon cache (cache.gpuico, dark appearance, iconmask=1, 2026-11-10): the backing is the alpha-weighted
 // average colour of the icon artwork scaled to ~37% (e.g. 166,183,178 -> 60,66,65; 168 -> 62; 179,189,218 ->
 // 68,72,84). Light appearance was not observable there; it mirrors the rule toward white (an estimate).
+// Used as the plate's fallback colour; the plate itself varies across the icon (MaskBacking below).
+inline constexpr double kMaskBackingScale=0.37;
 inline std::uint32_t MaskBackingColor(const std::vector<std::uint32_t>& src,bool dark){
  double r=0,g=0,b=0,a=0;
  for(auto p:src){const double pa=p>>24;if(pa<8)continue;r+=(p>>16)&255;g+=(p>>8)&255;b+=p&255;a+=pa;}
  if(a<=0)return dark?0x3e3e3eu:0xdededeu;
  // Premultiplied input: straight average = sum(premultiplied) / sum(alpha) * 255.
- const double ar=r/a*255.0,ag=g/a*255.0,ab=b/a*255.0;constexpr double k=0.37;
+ const double ar=r/a*255.0,ag=g/a*255.0,ab=b/a*255.0;constexpr double k=kMaskBackingScale;
  auto ch=[&](double v){return static_cast<std::uint32_t>(std::clamp(dark?v*k:255.0-(255.0-v)*k,0.0,255.0)+0.5);};
  return (ch(ar)<<16)|(ch(ag)<<8)|ch(ab);
+}
+// The plate is not one colour. Re-measured from the same cache (2026-11-27, row profiles of the plate strips left
+// and right of the artwork): it is a heavily blurred copy of the icon itself darkened to ~37% (WinRAR's plate is
+// reddish at the top and greenish at the bottom like its bands; a white llama gives a lighter bottom), plus a faint
+// sheen: about 5.5% toward white at the top edge fading linearly to nothing at the bottom (icons with even
+// artwork, e.g. a mouse or a wheel, lose ~10-14 levels from top to bottom). Only measured values are used here.
+// Built on a coarse grid with a normalised Gaussian (weights from the artwork's alpha), so transparent parts take
+// the colour of the nearest artwork and a one-colour icon gives one colour (plus the sheen).
+struct MaskBacking{
+ static constexpr int G=12;          // grid cells per side over the output plate
+ static constexpr float kSigma=3.f;  // blur radius in cells (1/4 of the plate: diagonal colours mix like MyDockFinder's Git plate)
+ static constexpr float kSheen=0.055f;
+ static constexpr double kLocal=0.5;  // share of the local blur; the rest is the whole icon's average (MyDockFinder's plates are muted:
+                                     // WinRAR's green bottom is 30,42,33, Chrome's plate reads as near-neutral grey)
+ float rgb[G*G][3]{};unsigned side=0;bool dark=true;
+ // Straight (not premultiplied) plate colour at output pixel centre (x+.5, y+.5).
+ void At(float x,float y,float out[3])const{
+  const float gx=std::clamp(x*G/static_cast<float>(side)-.5f,0.f,static_cast<float>(G-1)),gy=std::clamp(y*G/static_cast<float>(side)-.5f,0.f,static_cast<float>(G-1));
+  const int x0=(std::min)(G-2,static_cast<int>(gx)),y0=(std::min)(G-2,static_cast<int>(gy));const float tx=gx-x0,ty=gy-y0;
+  const float sheen=kSheen*(1.f-std::clamp(y/static_cast<float>(side),0.f,1.f));
+  for(int c=0;c<3;++c){
+   const float top=rgb[y0*G+x0][c]*(1-tx)+rgb[y0*G+x0+1][c]*tx,bot=rgb[(y0+1)*G+x0][c]*(1-tx)+rgb[(y0+1)*G+x0+1][c]*tx;
+   const float v=top*(1-ty)+bot*ty;out[c]=v+sheen*(255.f-v);}
+ }
+};
+// offX/offY/scale place the source on the side x side plate exactly as MakeMacStyleIcon draws it.
+inline MaskBacking MakeMaskBacking(const std::vector<std::uint32_t>& src,unsigned w,unsigned h,float offX,float offY,float scale,unsigned side,bool dark){
+ constexpr int G=MaskBacking::G;MaskBacking out;out.side=side;out.dark=dark;
+ double acc[G*G][4]{};
+ for(unsigned y=0;y<h;++y)for(unsigned x=0;x<w;++x){const std::uint32_t p=src[static_cast<size_t>(y)*w+x];const double pa=p>>24;if(pa<8)continue;
+  const int cx=std::clamp(static_cast<int>((offX+(x+.5f)*scale)*G/side),0,G-1),cy=std::clamp(static_cast<int>((offY+(y+.5f)*scale)*G/side),0,G-1);
+  auto& a=acc[cy*G+cx];a[0]+=(p>>16)&255;a[1]+=(p>>8)&255;a[2]+=p&255;a[3]+=pa;}
+ double total[4]{};for(const auto& a:acc)for(int c=0;c<4;++c)total[c]+=a[c];
+ const std::uint32_t avg=MaskBackingColor(src,dark);
+ const float fallback[3]={static_cast<float>((avg>>16)&255),static_cast<float>((avg>>8)&255),static_cast<float>(avg&255)};
+ float kernel[G];for(int d=0;d<G;++d)kernel[d]=std::exp(-0.5f*d*d/(MaskBacking::kSigma*MaskBacking::kSigma));
+ for(int gy=0;gy<G;++gy)for(int gx=0;gx<G;++gx){double s[4]{};
+  for(int y=0;y<G;++y)for(int x=0;x<G;++x){const double k=kernel[std::abs(x-gx)]*kernel[std::abs(y-gy)];const auto& a=acc[y*G+x];for(int c=0;c<4;++c)s[c]+=k*a[c];}
+  float* o=out.rgb[gy*G+gx];
+  if(s[3]<1.0){for(int c=0;c<3;++c)o[c]=fallback[c];continue;}
+  for(int c=0;c<3;++c){const double v=(MaskBacking::kLocal*s[c]/s[3]+(1.0-MaskBacking::kLocal)*total[c]/total[3])*255.0;o[c]=static_cast<float>(std::clamp(dark?v*kMaskBackingScale:255.0-(255.0-v)*kMaskBackingScale,0.0,255.0));}}
+ return out;
 }
 // Native macOS icon outline. Measured from the official macOS 27 design-resource exports Finder@4x.png and
 // Apps@4x.png (identical outlines, 288 px, shape fills the canvas): half-width of the shape at normalised
@@ -70,11 +114,10 @@ inline std::vector<std::uint32_t> MakeMacStyleIcon(const std::vector<std::uint32
     out4[0]+=k*static_cast<float>(q>>24);out4[1]+=k*static_cast<float>((q>>16)&255);out4[2]+=k*static_cast<float>((q>>8)&255);out4[3]+=k*static_cast<float>(q&255);}}
   out4[0]=std::clamp(out4[0],0.f,255.f);for(int c=1;c<4;++c)out4[c]=std::clamp(out4[c],0.f,out4[0]);  // stay premultiplied (colour <= alpha)
  };
- const std::uint32_t backing=tile?0u:MaskBackingColor(src,dark);
- const float br=static_cast<float>((backing>>16)&255),bg=static_cast<float>((backing>>8)&255),bb=static_cast<float>(backing&255);
  const float output=static_cast<float>(side),fit=tile?1.f:0.86f;
  const float scale=output*fit/static_cast<float>((std::max)(w,h));
  const float offX=(output-w*scale)*0.5f,offY=(output-h*scale)*0.5f;
+ MaskBacking backing;if(!tile)backing=MakeMaskBacking(src,w,h,offX,offY,scale,side,dark);
  for(unsigned y=0;y<side;++y)for(unsigned x=0;x<side;++x){
   int inside=0;for(int sy=0;sy<4;++sy)for(int sx=0;sx<4;++sx){
    float nx=std::fabs((x+(sx+0.5f)/4.f)*2.f/output-1.f),ny=std::fabs((y+(sy+0.5f)/4.f)*2.f/output-1.f);
@@ -83,7 +126,7 @@ inline std::vector<std::uint32_t> MakeMacStyleIcon(const std::vector<std::uint32
   if(!inside)continue;const float coverage=inside/16.f;
   float sx=(x+0.5f-offX)/scale-0.5f,sy=(y+0.5f-offY)/scale-0.5f;
   float v4[4];sample4(sx,sy,v4);float a=v4[0],r=v4[1],g=v4[2],b=v4[3];
-  if(!tile){const float inv=1.f-a/255.f;r+=br*inv;g+=bg*inv;b+=bb*inv;a=255.f;}
+  if(!tile){float plate[3];backing.At(x+.5f,y+.5f,plate);const float inv=1.f-a/255.f;r+=plate[0]*inv;g+=plate[1]*inv;b+=plate[2]*inv;a=255.f;}
   auto c=[&](float v){return static_cast<std::uint32_t>(std::clamp(v*coverage,0.f,255.f)+0.5f);};
   out[static_cast<size_t>(y)*side+x]=(c(a)<<24)|(c(r)<<16)|(c(g)<<8)|c(b);
  }

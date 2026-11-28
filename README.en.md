@@ -4,7 +4,7 @@
 
 DockOver brings a macOS-style Dock, menu bar, Control Center, Launchpad, and desktop widgets to Windows 11. Its Liquid Glass surfaces sample the desktop in real time.
 
-[Download for Windows 11](https://github.com/Davizcbia/DockOver/releases/latest) · [1.3.0 release notes](docs/releases/1.3.0.md#english) · [DockDrop](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player](https://github.com/Davizcbia/DockOver-Music-Player)
+[Download for Windows 11](https://github.com/Davizcbia/DockOver/releases/latest) · [1.4.1 release notes](docs/releases/1.4.1.md#english) · [DockDrop](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player](https://github.com/Davizcbia/DockOver-Music-Player)
 
 ![DockOver on Windows 11](docs/screenshots/overview.jpg)
 
@@ -12,7 +12,7 @@ Screenshots use Windows wallpaper, built-in apps, and sample data.
 
 ## Dock
 
-The Dock samples the desktop behind it. The GPU renders refraction, blur, and highlights as windows move. The Dock also supports adjustable pointer magnification, auto-hide, drag-to-pin, reordering, separators, Downloads stacks, the Recycle Bin, icon masks, and custom icons.
+The Dock samples the desktop behind it. The GPU renders refraction, blur, and highlights as windows move. The Dock also supports adjustable pointer magnification, auto-hide, a bottom offset, drag-to-pin, reordering (which can be locked), separators, Downloads stacks, the Recycle Bin, icon masks with a backing gradient taken from each icon, and custom icons. Its context menu adds apps and system shortcuts and shows or hides the Windows taskbar. A Windows status block shows the time, date, battery, Wi-Fi, volume, and Bluetooth, and Stage Manager switches window groups from the left edge.
 
 | Liquid Glass | Magnification |
 | --- | --- |
@@ -30,7 +30,7 @@ Search a full-screen app grid, reorder apps by dragging, and group them into fol
 
 ## Menu bar and Control Center
 
-The menu bar shows the active app, tray icons, battery, Wi-Fi, Bluetooth, sound, and time. Control Center brings together network, display, sound, Do Not Disturb, and Now Playing controls. Notification Center and banners are also available.
+The menu bar shows the active app, tray icons, battery, Wi-Fi, Bluetooth, sound, and time, and can also show network speed and CPU and GPU temperatures. Right-click an app in the hidden icons list to show it in the menu bar, and right-click a menu bar icon to remove it. The length of the gradient behind the menu bar is adjustable. Control Center brings together network, display, sound, Do Not Disturb, and Now Playing controls. Notification Center and banners are also available.
 
 | Control Center | Menu bar |
 | --- | --- |
@@ -52,7 +52,9 @@ Show the current album cover and synchronized lyrics on the desktop or open full
 
 ## DockDrop
 
-Open DockDrop from the Dock context menu. On a phone, scan the pairing bubble or backup QR code in a browser to transfer files and text in either direction. After the first pairing, you can remember the phone for later reconnects. The DockOver Desktop staging widget accepts dragged files and pasted text. [Standalone DockDrop and screenshots](https://github.com/Davizcbia/DockDrop)
+Transfer files and text between your PC and a phone. The phone only needs a browser. Open DockDrop from the Dock context menu and scan the water ball or the backup QR code once to pair. Later, click the paired phone in the DockDrop window and open the scanner on the phone. It connects by itself. Your PC asks before it receives anything. Nearby PCs can exchange files too. The DockOver Desktop staging widget accepts dragged files and pasted text. [Standalone DockDrop](https://github.com/Davizcbia/DockDrop)
+
+![DockDrop pairing and transfer steps](docs/screenshots/dockdrop-flow-en.jpg)
 
 ## Settings
 
