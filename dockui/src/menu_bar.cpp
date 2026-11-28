@@ -62,6 +62,7 @@ namespace Gdiplus{using std::min;using std::max;}
 #include "menubar_extras.h"
 #include "tray_host.h"
 #include "ext_protocol.h"
+#include "system_sensors.h"
 
 namespace {
 constexpr auto& kClass = docky::fullscreen::kMenuBarClass;
@@ -76,7 +77,7 @@ winrt::Windows::UI::ViewManagement::UISettings themeUi{nullptr};
 int themeMode=0;bool themeDark=true,themeContrast=false;COLORREF themeInk=RGB(255,255,255);
 // Adaptive bar ink (macOS): over a light backdrop the bar's text and icons turn black (same shapes, no halo or shadow) and
 // the selection pill turns grey. Only the bar itself; Control Center and the popups keep the appearance setting.
-bool barLight=false, themeGradient=true;int gradientOpacity=90, gradientLength=100;int barStyleForce=-1;  // dev: --dev-bar-style light|dark
+bool barLight=false, themeGradient=true;int gradientOpacity=90, gradientLength=100;bool showNetSpeed=false,showTemperature=false;int barStyleForce=-1;  // dev: --dev-bar-style light|dark
 constexpr UINT_PTR kBackdropTimer=17;
 bool UseThemeGradient(){return themeGradient && !themeContrast;}
 bool LightBar(){
@@ -120,12 +121,14 @@ bool RefreshTheme(){
  gradientOpacity=settings.menuBar.gradientOpacity;
  gradientLength=settings.menuBar.gradientLength;
  themeGradient=settings.menuBar.themeGradient;
+ const bool sensorsChanged=showNetSpeed!=settings.menuBar.showNetSpeed||showTemperature!=settings.menuBar.showTemperature;
+ showNetSpeed=settings.menuBar.showNetSpeed;showTemperature=settings.menuBar.showTemperature;
  bool systemDark=true;try{if(themeUi){auto c=themeUi.GetColorValue(winrt::Windows::UI::ViewManagement::UIColorType::Background);systemDark=(int(c.R)*299+int(c.G)*587+int(c.B)*114)<128000;}}catch(...){}
  HIGHCONTRASTW hc{sizeof(hc)};const bool contrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0)&&(hc.dwFlags&HCF_HIGHCONTRASTON);
  const bool dark=liquid::theme::IsDark(mode,systemDark);const auto palette=liquid::theme::Palette(mode,systemDark,contrast);
  const COLORREF ink=liquid::theme::ColorRef(palette.primary);const bool changed=themeMode!=mode||themeDark!=dark||themeContrast!=contrast||themeInk!=ink;
  themeMode=mode;themeDark=dark;themeContrast=contrast;themeInk=ink;
- if(changed)liquid::popup::SetTheme(contrast||!dark,liquid::theme::ColorRef(palette.surface),ink);return changed||gradientChanged;
+ if(changed)liquid::popup::SetTheme(contrast||!dark,liquid::theme::ColorRef(palette.surface),ink);return changed||gradientChanged||sensorsChanged;
 }
 UINT dpi=96;
 int menuScalePercent=100;
@@ -138,7 +141,7 @@ std::vector<RECT> headings;
 // Status slots: 0 Wi-Fi, 1 sound, 2 battery, 3 Control Center, 4 clock, 5 Bluetooth, 6 input menu (keyboard layout).
 constexpr int kStatusSlots=7;
 RECT statusRects[kStatusSlots]{}, appRect{};int statusHover=-1;
-enum class ExtraKind{Chevron,Tray,Ext};
+enum class ExtraKind{Chevron,Tray,Ext,Net,Temp};  // Net/Temp: the opt-in sensors (Settings > Menu Bar)
 struct Extra{ExtraKind kind=ExtraKind::Chevron;std::wstring id,title;std::uint64_t serial=0;size_t ext=0;RECT rect{};int contentW=0;bool templ=false;bool hasIcon=false;};
 std::vector<Extra> extras;
 bool appHover=false;
@@ -295,7 +298,7 @@ docky::extras::Config extrasConfig;std::wstring extrasConfigPath;
 std::vector<docky::extras::StatusItem> extItems;     // pushed (protocol) and manifest items
 std::vector<docky::tray::Icon> trayIcons;            // latest snapshot from the tray host
 HWND extHost=nullptr;bool trayStarted=false;
-constexpr UINT kTrayChanged=WM_APP+63,kExtOpenMenu=WM_APP+64;constexpr UINT_PTR kTrayTimer=16;
+constexpr UINT kTrayChanged=WM_APP+63,kExtOpenMenu=WM_APP+64,kItemContext=WM_APP+65;constexpr UINT_PTR kTrayTimer=16;
 std::vector<std::pair<std::uint64_t,RECT>> popupAnchors;  // tray rows of the open Hidden Icons popup (screen px)
 std::map<std::wstring,WorkshopImage> extraImages;   // keyed by full id (tray keys may repeat: serial appended)
 std::wstring ExtraImageKey(const Extra& e){return e.kind==ExtraKind::Tray?e.id+L"@"+std::to_wstring(e.serial):e.id;}
@@ -928,6 +931,7 @@ struct TextKit {
     Microsoft::WRL::ComPtr<ID2D1DCRenderTarget> rt;
     Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> white;
     Microsoft::WRL::ComPtr<IDWriteTextFormat> regular, semibold;
+    Microsoft::WRL::ComPtr<IDWriteTextFormat> sensorFont;  // two-line sensor values (network speed, temperatures)
     std::wstring family;
     float size = 0;
 };
@@ -959,6 +963,12 @@ bool EnsureKit(float px) {
             (*outs[i])->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
             (*outs[i])->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);  // one shared vertical centre / baseline
         }
+        // Sensors stack two lines in the bar height (reference: MyDockFinder's 2-line network speed): ~0.7 x the text size.
+        k.sensorFont.Reset();
+        if (FAILED(k.dw->CreateTextFormat(k.family.c_str(), nullptr, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, px * 0.7f, L"", k.sensorFont.GetAddressOf()))) return false;
+        k.sensorFont->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        k.sensorFont->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        k.sensorFont->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
     }
     return true;
 }
@@ -1077,6 +1087,78 @@ void DrawBatteryPill(std::uint32_t* pixels,int width,int height){
  docky::battery::DrawSmooth(pixels,width,height,cx,cy,k,systemStatus.batteryPercent,BatteryBolt(),LightBar());
 }
 // GDI rasterizes text into a black DIB; luminance becomes premultiplied white alpha.
+// ---- Gradient below the bar (Settings > Menu Bar > Gradient length above 100 %) --------------------------------------
+// The bar window is only as tall as the bar, so a longer fade continues in a click-through layered strip right under it,
+// with the same curve (shade = opacity x (1 - t^2)^1.25 over the whole fade) so there is no seam. Hidden whenever the bar
+// is hidden (full screen) or the gradient is off; at 100 % or less it is not needed at all.
+HWND shadeWindow=nullptr;struct ShadeKey{RECT bar{};int length=0,opacity=0;bool light=false;bool operator==(const ShadeKey&)const=default;};ShadeKey shadeKey{};
+LRESULT CALLBACK ShadeProc(HWND h,UINT m,WPARAM w,LPARAM l){
+    if(m==WM_NCHITTEST)return HTTRANSPARENT;if(m==WM_MOUSEACTIVATE)return MA_NOACTIVATE;return DefWindowProcW(h,m,w,l);}
+void HideShade(){if(shadeWindow&&IsWindowVisible(shadeWindow))ShowWindow(shadeWindow,SW_HIDE);shadeKey=ShadeKey{};}
+void SyncShade(HWND bar){
+    RECT br{};
+    if(!bar||fullscreenApp||!IsWindowVisible(bar)||!GetWindowRect(bar,&br)||!UseThemeGradient()||gradientOpacity<=0||gradientLength<=100||!inputWindow||
+       !(GetWindowLongPtrW(bar,GWL_EXSTYLE)&WS_EX_TRANSPARENT)){HideShade();return;}
+    const int height=br.bottom-br.top,width=br.right-br.left;if(height<=0||width<=0){HideShade();return;}
+    const ShadeKey key{br,gradientLength,gradientOpacity,LightBar()};
+    if(key==shadeKey&&shadeWindow&&IsWindowVisible(shadeWindow))return;
+    const float fade=static_cast<float>((std::max)(1,height-1))*(gradientLength/100.f);
+    const int extra=static_cast<int>(std::ceil(fade))-height;if(extra<=0){HideShade();return;}
+    if(!shadeWindow){WNDCLASSW wc{};wc.lpfnWndProc=ShadeProc;wc.hInstance=GetModuleHandleW(nullptr);wc.lpszClassName=L"DockyMenuBarShade";RegisterClassW(&wc);
+        shadeWindow=CreateWindowExW(WS_EX_LAYERED|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TOPMOST,wc.lpszClassName,L"",WS_POPUP,0,0,1,1,nullptr,nullptr,wc.hInstance,nullptr);
+        if(!shadeWindow)return;}
+    HDC screen=GetDC(nullptr);HDC dc=screen?CreateCompatibleDC(screen):nullptr;
+    BITMAPINFO bi{};bi.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);bi.bmiHeader.biWidth=width;bi.bmiHeader.biHeight=-extra;bi.bmiHeader.biPlanes=1;bi.bmiHeader.biBitCount=32;bi.bmiHeader.biCompression=BI_RGB;
+    void* bits=nullptr;HBITMAP bmp=dc?CreateDIBSection(dc,&bi,DIB_RGB_COLORS,&bits,nullptr,0):nullptr;
+    if(bmp&&bits){HGDIOBJ old=SelectObject(dc,bmp);auto* px=static_cast<std::uint32_t*>(bits);
+        for(int j=0;j<extra;++j){const float t=(std::min)(1.f,static_cast<float>(height+j)/fade);const float shade=(gradientOpacity/100.f)*std::pow(1.f-t*t,1.25f);
+            for(int x=0;x<width;++x){const unsigned a=docky::color::Quantize8(255.f*shade,static_cast<unsigned>(x),static_cast<unsigned>(height+j));
+                px[static_cast<size_t>(j)*width+x]=(a<<24)|(key.light?a*0x010101u:0u);}}
+        POINT dst{br.left,br.bottom},src{0,0};SIZE size{width,extra};BLENDFUNCTION blend{AC_SRC_OVER,0,255,AC_SRC_ALPHA};
+        // Directly under the bar in the z-order (both topmost), shown without activation.
+        SetWindowPos(shadeWindow,bar,br.left,br.bottom,width,extra,SWP_NOACTIVATE|SWP_SHOWWINDOW);
+        UpdateLayeredWindow(shadeWindow,screen,&dst,&size,dc,&src,0,&blend,ULW_ALPHA);
+        SelectObject(dc,old);shadeKey=key;}
+    if(bmp)DeleteObject(bmp);if(dc)DeleteDC(dc);if(screen)ReleaseDC(nullptr,screen);
+}
+// ---- Sensors (Settings > Menu Bar, both opt-in) ---------------------------------------------------------------
+// Network: upload over download, each with a small arrow (reference: MyDockFinder's "422.9KB/s / 13.5KB/s").
+// Temperature: a thermometer, CPU (ACPI thermal zone) over GPU; "--" when Windows does not report one (system_sensors.h).
+docky::sensors::NetSpeed netSpeed;docky::sensors::Temperatures temps;std::wstring sensorText;
+std::wstring SensorText(){std::wstring t;if(showNetSpeed)t+=docky::sensors::FormatRate(netSpeed.Up())+L"|"+docky::sensors::FormatRate(netSpeed.Down());
+    if(showTemperature)t+=L"|"+docky::sensors::FormatCelsius(temps.Cpu())+L"|"+docky::sensors::FormatCelsius(temps.Gpu());return t;}
+// Once a second (timer 1): true when the shown text changed.
+bool SampleSensors(){
+    if(showNetSpeed)netSpeed.Sample();else netSpeed.Reset();
+    if(showTemperature)temps.Sample();else temps.Close();
+    auto next=SensorText();if(next==sensorText)return false;sensorText=std::move(next);return true;
+}
+void DrawSensors(TextKit& tk,int height){
+    if(!tk.sensorFont||!tk.white)return;
+    for(const auto& e:extras){if(e.kind!=ExtraKind::Net&&e.kind!=ExtraKind::Temp)continue;
+        const bool net=e.kind==ExtraKind::Net;
+        const float left=static_cast<float>(e.rect.left)+(static_cast<float>(e.rect.right-e.rect.left)-static_cast<float>(e.contentW))*.5f,right=left+static_cast<float>(e.contentW);
+        const float mid=static_cast<float>(height)*.5f,line=tk.sensorFont->GetFontSize()*1.1f,iconW=static_cast<float>(net?Px(6):Px(7)),textLeft=left+iconW+static_cast<float>(Px(3));
+        const std::wstring top=net?docky::sensors::FormatRate(netSpeed.Up()):docky::sensors::FormatCelsius(temps.Cpu());
+        const std::wstring bottom=net?docky::sensors::FormatRate(netSpeed.Down()):docky::sensors::FormatCelsius(temps.Gpu());
+        tk.rt->DrawTextW(top.c_str(),static_cast<UINT32>(top.size()),tk.sensorFont.Get(),D2D1::RectF(textLeft,mid-line,right,mid+.5f),tk.white.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        tk.rt->DrawTextW(bottom.c_str(),static_cast<UINT32>(bottom.size()),tk.sensorFont.Get(),D2D1::RectF(textLeft,mid-.5f,right,mid+line),tk.white.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        const float cx=left+iconW*.5f;
+        if(net){  // filled arrowheads, one per line
+            auto arrow=[&](float cy,bool up){Microsoft::WRL::ComPtr<ID2D1PathGeometry> g;Microsoft::WRL::ComPtr<ID2D1GeometrySink> k;
+                if(FAILED(tk.d2d->CreatePathGeometry(g.GetAddressOf()))||FAILED(g->Open(k.GetAddressOf())))return;
+                const float hw=iconW*.5f,hh=iconW*.33f,tip=up?cy-hh:cy+hh,base=up?cy+hh:cy-hh;
+                k->BeginFigure(D2D1::Point2F(cx,tip),D2D1_FIGURE_BEGIN_FILLED);k->AddLine(D2D1::Point2F(cx+hw,base));k->AddLine(D2D1::Point2F(cx-hw,base));
+                k->EndFigure(D2D1_FIGURE_END_CLOSED);k->Close();tk.rt->FillGeometry(g.Get(),tk.white.Get());};
+            arrow(mid-line*.5f,true);arrow(mid+line*.5f,false);
+        }else{    // thermometer: outlined stem, filled bulb and mercury
+            const float stroke=(std::max)(1.f,static_cast<float>(Px(100))/100.f),r=iconW*.42f,stemW=iconW*.46f,topY=mid-line+stroke,bulbY=mid+line-r-stroke*.5f;
+            tk.rt->DrawRoundedRectangle(D2D1::RoundedRect(D2D1::RectF(cx-stemW*.5f,topY,cx+stemW*.5f,bulbY),stemW*.5f,stemW*.5f),tk.white.Get(),stroke);
+            tk.rt->FillEllipse(D2D1::Ellipse(D2D1::Point2F(cx,bulbY),r,r),tk.white.Get());
+            tk.rt->FillRectangle(D2D1::RectF(cx-stroke*.5f,mid-line*.25f,cx+stroke*.5f,bulbY),tk.white.Get());
+        }
+    }
+}
 // Empty pixels are exactly zero and the normal layered-window hit testing stays enabled.
 void Render(HWND h) {
     RECT r{};GetClientRect(h,&r);const int width=r.right, height=r.bottom;const int widthPx=width;
@@ -1155,6 +1237,10 @@ void Render(HWND h) {
     // a titled item grows to its text plus 8 DIP padding per side so its pill hugs the content.
     {
         extras.clear();const int step=pt(35.25f),iconSide=Px(16),gap=Px(4);
+        // Sensors: fixed widths from template strings so the bar does not shift as the values change.
+        auto smallW=[&](const wchar_t* t){return kit&&tk.sensorFont?static_cast<int>(std::ceil(TextWidth(t,tk.sensorFont.Get()))):static_cast<int>(std::wcslen(t))*Px(5);};
+        if(showNetSpeed){Extra e;e.kind=ExtraKind::Net;e.id=L"sensor:network";e.contentW=Px(6)+Px(3)+smallW(L"000.0KB/s");extras.push_back(std::move(e));}
+        if(showTemperature){Extra e;e.kind=ExtraKind::Temp;e.id=L"sensor:temperature";e.contentW=Px(7)+Px(3)+smallW(L"000°");extras.push_back(std::move(e));}
         for(size_t i=0;i<extItems.size();++i){if(!ExtShown(i))continue;Extra e;e.kind=ExtraKind::Ext;e.id=L"ext:"+extItems[i].id;e.ext=i;e.title=extItems[i].title;
             e.hasIcon=extItems[i].icon!=nullptr;e.templ=extItems[i].templateIcon;e.contentW=(e.hasIcon?iconSide:0)+(e.title.empty()?0:textW(e.title,false)+(e.hasIcon?gap:0));extras.push_back(std::move(e));}
         for(const auto& shownId:extrasConfig.shown)for(const auto& t:trayIcons){if(t.key!=shownId||t.hidden)continue;
@@ -1192,6 +1278,7 @@ void Render(HWND h) {
                 f->SetTextAlignment(lb.alignRight?DWRITE_TEXT_ALIGNMENT_TRAILING:DWRITE_TEXT_ALIGNMENT_LEADING);
                 tk.rt->DrawTextW(lb.text.c_str(),static_cast<UINT32>(lb.text.size()),f,D2D1::RectF(static_cast<float>(lb.r.left),static_cast<float>(lb.r.top),static_cast<float>(lb.r.right),static_cast<float>(lb.r.bottom)),tk.white.Get(),D2D1_DRAW_TEXT_OPTIONS_CLIP);}
             tk.regular->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+            DrawSensors(tk,height);
             if(tk.rt->EndDraw()==D2DERR_RECREATE_TARGET)tk.rt.Reset();}}
     {   // Logo: drawn after the text so it is part of the same luminance -> alpha mask.
         Logo().Init();Gdiplus::Graphics g(dc);g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
@@ -1320,6 +1407,7 @@ void Render(HWND h) {
             }
         }
     }
+    SyncShade(h);
     if(devSnapshotRequested){devSnapshotRequested=false;const bool saved=SaveDevPng(pixels,static_cast<UINT>(width),static_cast<UINT>(height),devPngPath);DLOG(L"dev: menu PNG saved=%d",saved);}
     if(liquid::cc::IsOpen() && panelAnchor>=0 && panelAnchor<kStatusSlots && panelAnchor!=4){RECT bar{};GetWindowRect(h,&bar);RECT anchor=statusRects[panelAnchor];OffsetRect(&anchor,bar.left,bar.top);liquid::cc::UpdateAnchor(anchor);}
     // Asynchronous status discovery can change slot widths after a popup opens (for
@@ -1566,6 +1654,53 @@ void ActivateExt(HWND h,size_t index,bool right,POINT anchor,int code){
     },[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
     if(!popup)activeMenu=-1;Render(h);
 }
+// Right-click on a menu bar item or a Hidden Icons row (user request 2026-11-27): DockOver's own short menu to add the
+// item to the bar or remove it, plus "<App> Options…" that opens what a right-click opened before (the app's menu).
+struct ContextTarget{enum Kind{Builtin,Tray,Ext,Net,Temp} kind=Builtin;std::wstring id,name;std::uint64_t serial=0;size_t ext=0;UINT builtin=0;int code=0;bool inBar=false;POINT pt{};};
+ContextTarget pendingContext;
+void QueueContext(HWND h,const ContextTarget& c){pendingContext=c;PostMessageW(h,kItemContext,0,0);}  // after the open popup has closed
+bool ContextShown(const ContextTarget& c){
+    switch(c.kind){case ContextTarget::Net:return showNetSpeed;case ContextTarget::Temp:return showTemperature;
+    default:return docky::extras::IsShown(extrasConfig,c.id);}
+}
+void ShowItemContext(HWND h){
+    const ContextTarget c=pendingContext;if(popup)ClosePopup();
+    using liquid::menu::ItemKind;std::vector<liquid::menu::MenuItem> rows;const bool shown=ContextShown(c);
+    rows.push_back({shown?L"Remove from Menu Bar":L"Show in Menu Bar",ItemKind::Command,true,false,{},1});
+    if(c.kind==ContextTarget::Tray||c.kind==ContextTarget::Ext){
+        rows.push_back({L"",ItemKind::Separator,false,false,{}});
+        rows.push_back({docky::ui::chinese?c.name+L" 选项…":c.name+L" Options…",ItemKind::Command,true,false,{},2});}
+    RECT bar{};GetWindowRect(h,&bar);const POINT anchor{c.pt.x,(std::max)(c.pt.y,bar.bottom)};
+    activeMenu=-200;hoverTime=docky::vblank::AnimationMillis();
+    popup=liquid::popup::Show(h,anchor,std::move(rows),[h,c,shown](const liquid::menu::MenuItem& row){
+        if(row.commandId==1){
+            if(c.kind==ContextTarget::Builtin){HandleCustomize(kCmdBuiltin+c.builtin);return;}
+            if(c.kind==ContextTarget::Net||c.kind==ContextTarget::Temp){
+                const char* key=c.kind==ContextTarget::Net?"showNetSpeed":"showTemperature";
+                if(liquid::settings::WriteBool(themeSettingsPath,"menuBar",key,!shown)!=liquid::settings::SaveStatus::Saved){DLOG(L"menu: sensor setting not saved");return;}
+                RefreshTheme();SampleSensors();Render(h);return;}
+            docky::extras::SetShown(extrasConfig,c.id,!shown);DLOG(L"menu extras: %ls %ls (right-click)",c.id.c_str(),shown?L"hidden":L"shown");
+            SaveExtrasConfig();extraImages.clear();Render(h);return;}
+        if(row.commandId==2){  // the app's own menu, as a plain right-click did before
+            if(c.kind==ContextTarget::Tray)docky::tray::Get().Click(c.serial,true,c.pt);
+            else if(c.kind==ContextTarget::Ext)PostMessageW(h,kExtOpenMenu,c.ext,MAKELPARAM(1,static_cast<WORD>(-c.code)));}
+    },[]{popup=nullptr;activeMenu=-1;hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
+    if(!popup)activeMenu=-1;Render(h);
+}
+// Right-click in the bar itself: built-in status items, promoted tray/extension items and sensors.
+bool RightClickBar(HWND h,POINT pt){
+    ContextTarget c;c.inBar=true;GetCursorPos(&c.pt);
+    for(size_t i=0;i<extras.size();++i){if(!PtInRect(&extras[i].rect,pt))continue;const auto& e=extras[i];
+        if(e.kind==ExtraKind::Chevron)return false;c.code=-100-static_cast<int>(i);
+        if(e.kind==ExtraKind::Net)c.kind=ContextTarget::Net;else if(e.kind==ExtraKind::Temp)c.kind=ContextTarget::Temp;
+        else if(e.kind==ExtraKind::Tray){c.kind=ContextTarget::Tray;c.id=e.id;c.serial=e.serial;for(const auto& t:trayIcons)if(t.serial==e.serial){c.name=docky::tray::DisplayName(t);break;}
+            RECT r{};GetWindowRect(h,&r);c.pt={r.left+(e.rect.left+e.rect.right)/2,r.bottom};QueueContext(h,c);return true;}
+        else{c.kind=ContextTarget::Ext;c.id=e.id;c.ext=e.ext;if(e.ext<extItems.size())c.name=ExtLabel(extItems[e.ext]);}
+        RECT r{};GetWindowRect(h,&r);c.pt={r.left+extras[i].rect.left,r.bottom};QueueContext(h,c);return true;}
+    for(UINT b=0;b<kBuiltinCount;++b){const int slot=kBuiltinSlot[b];if(statusRects[slot].right<=statusRects[slot].left||!PtInRect(&statusRects[slot],pt))continue;
+        c.kind=ContextTarget::Builtin;c.builtin=b;c.id=kBuiltinIds[b];RECT r{};GetWindowRect(h,&r);c.pt={r.left+statusRects[slot].left,r.bottom};QueueContext(h,c);return true;}
+    return false;
+}
 std::vector<std::uint64_t> popupTray;std::vector<size_t> popupExt;
 POINT ExtraAnchor(HWND h,size_t i){RECT r{};GetWindowRect(h,&r);return POINT{r.left+extras[i].rect.left,r.bottom};}
 void ToggleHiddenPopup(HWND h,size_t extraIndex){
@@ -1587,7 +1722,12 @@ void ToggleHiddenPopup(HWND h,size_t extraIndex){
     DLOG(L"menu: hidden icons popup (%zu tray, %zu extension)",popupTray.size(),popupExt.size());
     popup=liquid::popup::Show(h,anchor,std::move(items),[h,code](const liquid::menu::MenuItem& item){
         const bool right=liquid::popup::LastSelectionSecondary();
-        if(item.commandId>=kRowTray&&item.commandId<kRowTray+popupTray.size()){POINT pt{};GetCursorPos(&pt);docky::tray::Get().Click(popupTray[item.commandId-kRowTray],right,pt);}
+        // Right-click: DockOver's own menu (Show in Menu Bar, then the app's own menu as "<App> Options…").
+        if(right&&item.commandId>=kRowTray&&item.commandId<kRowTray+popupTray.size()){
+            for(const auto& t:trayIcons)if(t.serial==popupTray[item.commandId-kRowTray]){ContextTarget c;c.kind=ContextTarget::Tray;c.id=t.key;c.serial=t.serial;c.name=docky::tray::DisplayName(t);c.code=code;GetCursorPos(&c.pt);QueueContext(h,c);break;}}
+        else if(right&&item.commandId>=kRowExt&&item.commandId<kRowExt+popupExt.size()){const size_t ext=popupExt[item.commandId-kRowExt];
+            ContextTarget c;c.kind=ContextTarget::Ext;c.id=L"ext:"+extItems[ext].id;c.ext=ext;c.name=ExtLabel(extItems[ext]);c.code=code;GetCursorPos(&c.pt);QueueContext(h,c);}
+        else if(item.commandId>=kRowTray&&item.commandId<kRowTray+popupTray.size()){POINT pt{};GetCursorPos(&pt);docky::tray::Get().Click(popupTray[item.commandId-kRowTray],right,pt);}
         else if(item.commandId>=kRowExt&&item.commandId<kRowExt+popupExt.size())PostMessageW(h,kExtOpenMenu,popupExt[item.commandId-kRowExt],MAKELPARAM(right?1:0,static_cast<WORD>(-code)));
         else HandleCustomize(item.commandId);
     },[]{popup=nullptr;activeMenu=-1;popupAnchors.clear();hoverTime=docky::vblank::AnimationMillis();if(barWindow)Render(barWindow);});
@@ -1600,6 +1740,7 @@ void ToggleHiddenPopup(HWND h,size_t extraIndex){
 void ClickExtra(HWND h,size_t i,bool right){
     if(i>=extras.size())return;const Extra e=extras[i];
     if(e.kind==ExtraKind::Chevron){ToggleHiddenPopup(h,i);return;}
+    if(e.kind==ExtraKind::Net||e.kind==ExtraKind::Temp){if(!right){const auto r=reinterpret_cast<INT_PTR>(ShellExecuteW(nullptr,L"open",L"taskmgr.exe",nullptr,nullptr,SW_SHOWNORMAL));DLOG(L"menu: sensor click, Task Manager (%lld)",static_cast<long long>(r));}return;}
     const int code=-100-static_cast<int>(i);
     if(popup){const bool same=activeMenu==code;ClosePopup();if(same)return;}
     if(e.kind==ExtraKind::Tray){RECT r{};GetWindowRect(h,&r);docky::tray::Get().Click(e.serial,right,POINT{r.left+(e.rect.left+e.rect.right)/2,r.bottom});return;}
@@ -1660,7 +1801,7 @@ bool StartHosts(HWND h){
 }
 LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
     switch(m) {
-    case WM_CREATE: barWindow=h;{std::lock_guard<std::mutex> lock(statusShared->mutex);statusShared->window=h;}{std::lock_guard<std::mutex> lock(workshopShared->mutex);workshopShared->window=h;}Place(h);Update(h);RequestStatus();RequestWorkshop();SetTimer(h,1,1000,nullptr);SetTimer(h,4,5000,nullptr);SetTimer(h,kFullscreenTimer,250,nullptr);SetTimer(h,kBackdropTimer,500,nullptr);inputLayout=ForegroundLayout();SetTimer(h,kInputTimer,300,nullptr);return 0;
+    case WM_CREATE: barWindow=h;{std::lock_guard<std::mutex> lock(statusShared->mutex);statusShared->window=h;}{std::lock_guard<std::mutex> lock(workshopShared->mutex);workshopShared->window=h;}Place(h);Update(h);RequestStatus();RequestWorkshop();SampleSensors();/* baseline: speeds after the first 1 s tick */SetTimer(h,1,1000,nullptr);SetTimer(h,4,5000,nullptr);SetTimer(h,kFullscreenTimer,250,nullptr);SetTimer(h,kBackdropTimer,500,nullptr);inputLayout=ForegroundLayout();SetTimer(h,kInputTimer,300,nullptr);return 0;
     case WM_TIMER: if(w==kDragClipTimer){  // safety: never leave the cursor confined; re-assert if the move loop reset it
             // Button up: OnMoveSizeEnd normally follows at once (and needs the fill state); only clean up if it does not come.
             static ULONGLONG upSince=0;const bool down=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0;
@@ -1673,7 +1814,7 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
         if(w==kInputTimer){const HKL now=ForegroundLayout();if(now!=inputLayout){inputLayout=now;if(extrasConfig.input)Render(h);}return 0;}
         if(w==kTrayTimer){KillTimer(h,kTrayTimer);trayIcons=docky::tray::Get().Snapshot();extraImages.clear();Render(h);return 0;}
         if(w==kUnsnapTimer){KillTimer(h,kUnsnapTimer);UnsnapPending();return 0;}
-        if(w==kFullscreenTimer){MaintainButtonFullscreen();if(fullscreenApp)GrowFullscreen();
+        if(w==kFullscreenTimer){MaintainButtonFullscreen();if(fullscreenApp)GrowFullscreen();SyncShade(h);
             {const bool listed=!menuGameWatch.Poll(themeSettingsPath,gameCompatibility).empty();if(listed!=listedGameMenu){listedGameMenu=listed;DLOG(L"menu: games list %ls",listed?L"program running: bar hidden":L"no listed program running");}}
             SetFullscreenApp(h,FullscreenForeground()||listedGameMenu);SyncGameCompatibility(h);
             if(gameSuppressed){DropRawMouse();return 0;}
@@ -1690,11 +1831,11 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
                 docky::notify::DebugBanner(L"Amazon",L"4+ star savings for you!",L"Get 21% off BONTEC Desk Keyboard Tray for Black Friday Week");}
             if(devNotificationCenter)ToggleNotificationCenter(h);return 0;}
         if(w==kReleaseCheckTimer){KillTimer(h,kReleaseCheckTimer);if(!dragClip.active)ClampBelowBar(GetForegroundWindow(),L"button released");return 0;}
-        if(w==1){Update(h);if(RefreshTheme())Render(h);const auto revision=liquid::settings::ReadRevision(themeSettingsPath);if(revision!=settingsRevision){settingsRevision=revision;const auto current=liquid::settings::Load(themeSettingsPath);docky::ui::SetLanguage(current.value.appearance.language);hideSnapLayouts=current.value.dock.hideSnapLayouts;gameCompatibility=current.value.dock.gameCompatibility;docky::notify::SetCapture(current.value.menuBar.captureNotifications);docky::notify::SetHideSystemBanners(current.value.menuBar.hideSystemNotifications);if(menuScalePercent!=current.value.menuBar.scalePercent){menuScalePercent=current.value.menuBar.scalePercent;ClosePopup();Place(h);Render(h);}docky::vblank::SetCaps(current.value.performance.animationFps,current.value.performance.captureFps);DLOG(L"shared settings changed; status=%d hideSnap=%d",static_cast<int>(current.status),hideSnapLayouts?1:0);}const auto wr=liquid::settings::ReadRevision(workshopRoot+L"\\active.txt");if(wr!=workshopRevision){workshopRevision=wr;RequestWorkshop();}}else if(w==2)DestroyWindow(h);else if(w==4){RequestStatus();RequestWorkshop();ReloadManifests(h,false);PruneExtensions(h);}else if(w==6&&devTrace!=INVALID_HANDLE_VALUE&&devInitialPopup>=0){KillTimer(h,6);const int selected=devInitialPopup;devInitialPopup=-1;if(selected==9){for(size_t i=0;i<extras.size();++i)if(extras[i].kind==ExtraKind::Chevron){ToggleHiddenPopup(h,i);break;}}else if(selected==3||selected==1||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==7&&devTrace!=INVALID_HANDLE_VALUE&&devInitialKey){
+        if(w==1){Update(h);const bool themeChanged=RefreshTheme();const bool sensorsChanged=SampleSensors();if(themeChanged||sensorsChanged)Render(h);SyncShade(h);const auto revision=liquid::settings::ReadRevision(themeSettingsPath);if(revision!=settingsRevision){settingsRevision=revision;const auto current=liquid::settings::Load(themeSettingsPath);docky::ui::SetLanguage(current.value.appearance.language);hideSnapLayouts=current.value.dock.hideSnapLayouts;gameCompatibility=current.value.dock.gameCompatibility;docky::notify::SetCapture(current.value.menuBar.captureNotifications);docky::notify::SetHideSystemBanners(current.value.menuBar.hideSystemNotifications);if(menuScalePercent!=current.value.menuBar.scalePercent){menuScalePercent=current.value.menuBar.scalePercent;ClosePopup();Place(h);Render(h);}docky::vblank::SetCaps(current.value.performance.animationFps,current.value.performance.captureFps);DLOG(L"shared settings changed; status=%d hideSnap=%d",static_cast<int>(current.status),hideSnapLayouts?1:0);}const auto wr=liquid::settings::ReadRevision(workshopRoot+L"\\active.txt");if(wr!=workshopRevision){workshopRevision=wr;RequestWorkshop();}}else if(w==2)DestroyWindow(h);else if(w==4){RequestStatus();RequestWorkshop();ReloadManifests(h,false);PruneExtensions(h);}else if(w==6&&devTrace!=INVALID_HANDLE_VALUE&&devInitialPopup>=0){KillTimer(h,6);const int selected=devInitialPopup;devInitialPopup=-1;if(selected==9){for(size_t i=0;i<extras.size();++i)if(extras[i].kind==ExtraKind::Chevron){ToggleHiddenPopup(h,i);break;}}else if(selected==3||selected==1||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==7&&devTrace!=INVALID_HANDLE_VALUE&&devInitialKey){
         KillTimer(h,7);HWND target=popup;if(!target&&liquid::cc::IsOpen())target=FindWindowW(L"LiquidControlCenter",L"DockOver Control Center");DWORD pid=0;if(target)GetWindowThreadProcessId(target,&pid);
         bool sent=false;if(target&&pid==GetCurrentProcessId()){if(devInitialKey==0x10000){const UINT testDpi=GetDpiForWindow(target);const LPARAM pt=MAKELPARAM(MulDiv(120,testDpi,96),MulDiv(126,testDpi,96));sent=PostMessageW(target,WM_LBUTTONDOWN,MK_LBUTTON,pt)&&PostMessageW(target,WM_LBUTTONUP,0,pt);}else sent=PostMessageW(target,WM_KEYDOWN,static_cast<WPARAM>(devInitialKey),0)!=FALSE;}
         DLOG(L"dev: own-window key=%d sent=%d",devInitialKey,sent);devInitialKey=0;
-    }else if(w==8&&devTrace!=INVALID_HANDLE_VALUE)TraceState();else if(w==9&&devTrace!=INVALID_HANDLE_VALUE){KillTimer(h,9);devSnapshotRequested=true;Render(h);}else if(w==10&&devTrace!=INVALID_HANDLE_VALUE&&devNextPopup>=0){KillTimer(h,10);const int selected=devNextPopup;devNextPopup=-1;if(selected==1||selected==3||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==11&&devTrace!=INVALID_HANDLE_VALUE){KillTimer(h,11);const bool accepted=liquid::popup::RequestDiagnosticSnapshot(popup,devPopupBmpPath);DLOG(L"dev: popup snapshot requested=%d",accepted);}else if(w==12&&devTrace!=INVALID_HANDLE_VALUE&&devRoute>=0){
+    }else if(w==8&&devTrace!=INVALID_HANDLE_VALUE)TraceState();else if(w==43&&devTrace!=INVALID_HANDLE_VALUE){KillTimer(h,43);RECT target=statusRects[0];for(const auto& e:extras)if(e.kind==ExtraKind::Net||e.kind==ExtraKind::Temp){target=e.rect;break;}const bool shown=RightClickBar(h,POINT{(target.left+target.right)/2,(target.top+target.bottom)/2});DLOG(L"dev: right-click context queued=%d",shown?1:0);}else if(w==9&&devTrace!=INVALID_HANDLE_VALUE){KillTimer(h,9);devSnapshotRequested=true;Render(h);}else if(w==10&&devTrace!=INVALID_HANDLE_VALUE&&devNextPopup>=0){KillTimer(h,10);const int selected=devNextPopup;devNextPopup=-1;if(selected==1||selected==3||selected==0||selected==5)TogglePanel(h,selected);else ToggleStatusPopup(h,selected);}else if(w==11&&devTrace!=INVALID_HANDLE_VALUE){KillTimer(h,11);const bool accepted=liquid::popup::RequestDiagnosticSnapshot(popup,devPopupBmpPath);DLOG(L"dev: popup snapshot requested=%d",accepted);}else if(w==12&&devTrace!=INVALID_HANDLE_VALUE&&devRoute>=0){
         KillTimer(h,12);const int index=devRoute;devRoute=-1;
         if(inputWindow&&statusRects[index].right>statusRects[index].left){const RECT r=statusRects[index];const int x=r.left+Px(3),y=(r.top+r.bottom)/2;
           SendMessageW(inputWindow,WM_MOUSEMOVE,0,MAKELPARAM(x,y));SendMessageW(inputWindow,WM_LBUTTONDOWN,MK_LBUTTON,MAKELPARAM(x,y));SendMessageW(inputWindow,WM_LBUTTONUP,0,MAKELPARAM(x,y));DLOG(L"dev: routed own-window input status=%d",index);}
@@ -1715,7 +1856,9 @@ LRESULT CALLBACK Proc(HWND h,UINT m,WPARAM w,LPARAM l) {
     }
     case WM_MOUSELEAVE:tracking=false;if(hoverIndex!=-1||statusHover!=-1||appHover){hoverIndex=-1;statusHover=-1;appHover=false;hoverTime=docky::vblank::AnimationMillis();Render(h);}return 0;
     case WM_RBUTTONUP:{POINT pt{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
+        if(RightClickBar(h,pt))return 0;
         for(size_t i=0;i<extras.size();++i)if(PtInRect(&extras[i].rect,pt)){ClickExtra(h,i,true);return 0;}return 0;}
+    case kItemContext:ShowItemContext(h);return 0;
     case WM_LBUTTONUP:{POINT pt{GET_X_LPARAM(l),GET_Y_LPARAM(l)};
         for(size_t i=0;i<extras.size();++i)if(PtInRect(&extras[i].rect,pt)){ClickExtra(h,i,false);return 0;}
         if(PtInRect(&statusRects[4],pt)){ToggleNotificationCenter(h);return 0;}
@@ -1776,12 +1919,12 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
     liquid::cc::SetSettingsPath(themeSettingsPath);liquid::cc::SetWorkshopRoot(workshopRoot);settingsRevision=liquid::settings::ReadRevision(themeSettingsPath);{const auto current=liquid::settings::Load(themeSettingsPath);gameCompatibility=current.value.dock.gameCompatibility;hideSnapLayouts=current.value.dock.hideSnapLayouts;menuScalePercent=current.value.menuBar.scalePercent;docky::notify::Start(themeSettingsPath);docky::notify::SetCapture(current.value.menuBar.captureNotifications);docky::notify::SetHideSystemBanners(current.value.menuBar.hideSystemNotifications);}RefreshTheme();
     if((!devHover.empty()||!devPopup.empty()||!devKey.empty()||!devPngPath.empty()||!devNext.empty()||!devPopupBmpPath.empty()||!devRouteName.empty())&&devPath.empty()){CloseHandle(single);return 2;}
     auto statusIndex=[](const std::wstring& s)->int {if(s==L"wifi")return 0;if(s==L"sound")return 1;if(s==L"battery")return 2;if(s==L"control")return 3;if(s==L"clock")return 4;if(s==L"bluetooth")return 5;if(s==L"input")return 6;if(s==L"hidden")return 9;return -1;};
-    if((!devHover.empty()&&devHover!=L"logo"&&devHover!=L"app"&&statusIndex(devHover)<0)||(!devPopup.empty()&&(statusIndex(devPopup)<0||statusIndex(devPopup)==4))){CloseHandle(single);return 2;}
+    if((!devHover.empty()&&devHover!=L"logo"&&devHover!=L"app"&&statusIndex(devHover)<0)||(!devPopup.empty()&&devPopup!=L"context"&&(statusIndex(devPopup)<0||statusIndex(devPopup)==4))){CloseHandle(single);return 2;}
     if(!devRouteName.empty()){
         if(!devPopup.empty()||statusIndex(devRouteName)<0||statusIndex(devRouteName)>3){CloseHandle(single);return 2;}
         devRoute=statusIndex(devRouteName);
     }
-    if(!devPopupBmpPath.empty()&&(devPopup!=L"wifi"&&devPopup!=L"battery"&&devPopup!=L"hidden")){CloseHandle(single);return 2;}
+    if(!devPopupBmpPath.empty()&&(devPopup!=L"wifi"&&devPopup!=L"battery"&&devPopup!=L"hidden"&&devPopup!=L"context")){CloseHandle(single);return 2;}
     if(!devNext.empty()){
         if((devPopup.empty()&&devRouteName.empty())||statusIndex(devNext)<0||statusIndex(devNext)>3){CloseHandle(single);return 2;}
         devNextPopup=statusIndex(devNext);
@@ -1818,7 +1961,9 @@ int WINAPI wWinMain(HINSTANCE instance,HINSTANCE,PWSTR,int) {
         else DLOG(L"menu input: create failed; retaining layered hit testing");
     }else DLOG(L"menu input: class registration failed; retaining layered hit testing");
     if(devTrace!=INVALID_HANDLE_VALUE)SetTimer(h,8,100,nullptr);if(!devPngPath.empty())SetTimer(h,9,1500,nullptr);if(devRoute>=0){SetTimer(h,12,1500,nullptr);if(devInitialKey)SetTimer(h,7,3000,nullptr);if(devNextPopup>=0)SetTimer(h,10,3500,nullptr);}if(exitAfter)SetTimer(h,2,exitAfter*1000,nullptr);if(openControlCenter)PostMessageW(h,WM_APP+44,0,0);if(devNotification||devNotificationCenter)SetTimer(h,kDevNotifyTimer,1200,nullptr);
-    if(!devPopup.empty()&&statusIndex(devPopup)==9){devInitialPopup=9;SetTimer(h,6,3000,nullptr);if(!devPopupBmpPath.empty())SetTimer(h,11,4500,nullptr);}
+    // dev: "context" right-clicks the first sensor (else Wi-Fi) after 2.5 s, like a user right-click on the bar.
+    if(devPopup==L"context"){SetTimer(h,43,2500,nullptr);if(!devPopupBmpPath.empty())SetTimer(h,11,4000,nullptr);}
+    else if(!devPopup.empty()&&statusIndex(devPopup)==9){devInitialPopup=9;SetTimer(h,6,3000,nullptr);if(!devPopupBmpPath.empty())SetTimer(h,11,4500,nullptr);}
     else if(!devPopup.empty()){devInitialPopup=statusIndex(devPopup);SetTimer(h,6,20,nullptr);if(devInitialKey)SetTimer(h,7,2000,nullptr);if(devNextPopup>=0)SetTimer(h,10,3000,nullptr);if(!devPopupBmpPath.empty())SetTimer(h,11,1500,nullptr);}
     DLOG(L"menu: visible hwnd=%p dpi=%u",h,dpi);
     MSG msg{};while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}DLOG(L"menu: exit");if(devTrace!=INVALID_HANDLE_VALUE)CloseHandle(devTrace);CloseHandle(single);return 0;

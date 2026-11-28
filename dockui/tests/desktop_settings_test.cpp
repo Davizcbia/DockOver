@@ -28,6 +28,9 @@ int wmain(int argc, wchar_t** argv) {
        SearchCategories(L"windows taskbar")!=std::vector<int>{6} ||
        SearchCategories(L"density")!=std::vector<int>{4} ||
        SearchCategories(L"menu bar size")!=std::vector<int>{3} ||
+       SearchCategories(L"network speed")!=std::vector<int>{3} || SearchCategories(L"temperature")!=std::vector<int>{3} ||
+       SearchCategories(L"温度")!=std::vector<int>{3} || SearchCategories(L"gradient length")!=std::vector<int>{3} ||
+       SearchCategories(L"lock dragging")!=std::vector<int>{2} ||
        SearchCategories(L"legacy backup")!=std::vector<int>{8} || SearchCategories(L"about")!=std::vector<int>{9} ||
        SearchCategories(L"upd")!=std::vector<int>{9} || SearchCategories(L"check for updates")!=std::vector<int>{9} ||
        SearchCategories(L"no-such-setting").size()!=0)return 20;
@@ -106,7 +109,16 @@ int wmain(int argc, wchar_t** argv) {
         WriteMenuBarInt(file, "gradientLength", 65) == SaveStatus::Saved &&
         WriteMenuBarInt(file, "gradientLength", 39) == SaveStatus::Invalid &&
         Load(file).value.menuBar.gradientOpacity == 55 && Load(file).value.menuBar.gradientLength == 65;
+    // Above 100 % the fade continues below the bar (up to 300 %).
+    ok = ok && WriteMenuBarInt(file, "gradientLength", 300) == SaveStatus::Saved && Load(file).value.menuBar.gradientLength == 300 &&
+        WriteMenuBarInt(file, "gradientLength", 301) == SaveStatus::Invalid && WriteMenuBarInt(file, "gradientLength", 65) == SaveStatus::Saved;
     if (!ok) { std::puts("FAIL menu bar gradient preference"); return 1; }
+    // Menu bar sensors and the Dock icon lock are opt-in.
+    ok = ok && !Load(file).value.menuBar.showNetSpeed && !Load(file).value.menuBar.showTemperature && !Load(file).value.dock.lockIcons;
+    ok = ok && WriteBool(file, "menuBar", "showNetSpeed", true) == SaveStatus::Saved && WriteBool(file, "menuBar", "showTemperature", true) == SaveStatus::Saved &&
+        WriteBool(file, "dock", "lockIcons", true) == SaveStatus::Saved;
+    ok = ok && Load(file).value.menuBar.showNetSpeed && Load(file).value.menuBar.showTemperature && Load(file).value.dock.lockIcons;
+    if (!ok) { std::puts("FAIL menu bar sensors / Dock icon lock preference"); return 1; }
     // Output preferences round-trip by endpoint ID in display order, preserving unrelated settings.
     ok = ok && Load(file).value.controlCenter.audioOutputs.empty();
     ok = ok && WriteAudioOutputs(file, {

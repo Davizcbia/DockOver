@@ -33,7 +33,7 @@
 
 <p align="center"><sub>截图使用 Windows 默认壁纸、系统应用和示例数据。 Screenshots use Windows wallpaper, built-in apps, and sample data.</sub></p>
 
-[1.3.0 更新说明](docs/releases/1.3.0.md) · [DockDrop 独立版](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player 独立版](https://github.com/Davizcbia/DockOver-Music-Player)
+[1.4.1 更新说明](docs/releases/1.4.1.md) · [DockDrop 独立版](https://github.com/Davizcbia/DockDrop) · [DockOver Music Player 独立版](https://github.com/Davizcbia/DockOver-Music-Player)
 
 ---
 
@@ -51,8 +51,11 @@
 | ![Minimized window](docs/screenshots/dock-minimized.jpg) | **最小化到 Dock**：Genie 动画，最小化的窗口以实时缩略图留在 Dock 右侧；Dock 重启后也不会丢。 |
 
 - 放大效果 0–150% 可调，0% 即不放大；弹簧动画跟随指针，不掉帧。
-- 运行指示、拖动排序、分隔符、自动隐藏、下载堆栈（扇形或网格）、回收站。
-- macOS 风格图标遮罩、自定义图标和图标编辑器。
+- 运行指示、拖动排序（可锁定）、分隔符、自动隐藏、底部偏移、下载堆栈（扇形或网格）、回收站。
+- 右键即可添加应用和系统快捷方式（此电脑、控制面板、下载等），显示或隐藏 Windows 任务栏。
+- macOS 风格图标遮罩（按图标颜色生成渐变底板）、自定义图标和图标编辑器。
+- Windows 状态块：在程序坞里显示时间、日期、电池、Wi-Fi、音量和蓝牙。
+- 台前调度：从控制中心或右键菜单开启，在左侧切换窗口组。
 
 ## Launchpad
 
@@ -64,7 +67,7 @@
 
 ## 菜单栏与控制中心
 
-顶部菜单栏显示当前应用、托盘图标、设备电量、Wi-Fi、蓝牙、声音和时间。控制中心集中了 Wi-Fi、蓝牙、勿扰、亮度、音量和正在播放。所有弹窗点击别处或失去焦点即关闭。
+顶部菜单栏显示当前应用、托盘图标、设备电量、Wi-Fi、蓝牙、声音和时间，还可以开启网速和 CPU／GPU 温度。在隐藏图标列表里右键程序可以把它放到菜单栏，在菜单栏上右键可以移除；顶部渐变的长度可调。控制中心集中了 Wi-Fi、蓝牙、勿扰、亮度、音量和正在播放。所有弹窗点击别处或失去焦点即关闭。
 
 | | |
 | :-: | :-: |
@@ -95,7 +98,9 @@
 
 ## DockDrop
 
-从 Dock 右键菜单打开 DockDrop。手机用浏览器扫描配对光泡或备用二维码，即可双向传输文件和文字。首次配对后可记住手机，下次直接连接。DockOver Desktop 的暂存小组件支持拖入文件和粘贴文字。 [DockDrop 独立版](https://github.com/Davizcbia/DockDrop)
+电脑和手机之间互传文件和文字，手机端只需要浏览器。从程序坞右键菜单打开 DockDrop，手机扫描水球或备用二维码完成首次配对；之后在 DockDrop 窗口里点已配对的手机，手机打开扫码页就会自动连上。电脑接收前会先询问。附近的电脑之间也可以互传。DockOver Desktop 的暂存小组件支持拖入文件和粘贴文字。 [DockDrop 独立版](https://github.com/Davizcbia/DockDrop)
+
+![DockDrop 配对与传输流程](docs/screenshots/dockdrop-flow-zh.jpg)
 
 ## 设置
 

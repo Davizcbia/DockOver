@@ -123,6 +123,7 @@ Result Load(const std::wstring& path) {
         if(const auto* v=section->Find("showDownloads"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showDownloads=v->boolean;
         if(const auto* v=section->Find("showTrash"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showTrash=v->boolean;
         if(const auto* v=section->Find("showDivider"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.showDivider=v->boolean;
+        if(const auto* v=section->Find("lockIcons"))if(v->type==dock::json::Value::Type::Bool)r.value.dock.lockIcons=v->boolean;
         if(const auto* v=section->Find("tailOrder"))if(v->type==dock::json::Value::Type::Array)
             for(const auto& k:v->array){if(k.type!=dock::json::Value::Type::String)continue;const std::wstring key=dock::json::FromUtf8(k.string);auto& order=r.value.dock.tailOrder;
                 if(ValidTailKey(key)&&order.size()<8&&std::find(order.begin(),order.end(),key)==order.end())order.push_back(key);}
@@ -132,10 +133,13 @@ Result Load(const std::wstring& path) {
         if (const auto* gradient = section->Find("themeGradient"); gradient && gradient->type == dock::json::Value::Type::Bool)
             r.value.menuBar.themeGradient = gradient->boolean;
     if(const auto* section=root.Find("menuBar")) if(const auto* on=section->Find("captureNotifications")){if(on->type==dock::json::Value::Type::Bool)r.value.menuBar.captureNotifications=on->boolean;}
+    if(const auto* section=root.Find("menuBar")){
+        if(const auto* v=section->Find("showNetSpeed"))if(v->type==dock::json::Value::Type::Bool)r.value.menuBar.showNetSpeed=v->boolean;
+        if(const auto* v=section->Find("showTemperature"))if(v->type==dock::json::Value::Type::Bool)r.value.menuBar.showTemperature=v->boolean;}
     if(const auto* section=root.Find("menuBar")){  // a value out of range is ignored (default), never invalidates the file
         auto integer=[&](const char* key,int lo,int hi,int& out){if(const auto* v=section->Find(key);v&&v->type==dock::json::Value::Type::Number&&std::isfinite(v->number)&&v->number>=lo&&v->number<=hi)out=static_cast<int>(v->number);};
         integer("gradientOpacity",0,100,r.value.menuBar.gradientOpacity);
-        integer("gradientLength",40,100,r.value.menuBar.gradientLength);
+        integer("gradientLength",40,300,r.value.menuBar.gradientLength);
         integer("notificationBlur",0,100,r.value.menuBar.notificationBlur);integer("notificationBlurFade",40,400,r.value.menuBar.notificationBlurFade);integer("notificationShade",0,100,r.value.menuBar.notificationShade);
     }
     if(const auto* section=root.Find("menuBar")) if(const auto* on=section->Find("hideSystemNotifications")){if(on->type==dock::json::Value::Type::Bool)r.value.menuBar.hideSystemNotifications=on->boolean;}
@@ -406,7 +410,7 @@ SaveStatus WriteMenuBarScale(const std::wstring& path,int percent){
  return percent>=80&&percent<=160?WriteScalar(path,"menuBar","scalePercent",std::to_string(percent),false):SaveStatus::Invalid;
 }
 SaveStatus WriteMenuBarInt(const std::wstring& path,const std::string& key,int value){
- const bool valid=(key=="gradientOpacity"&&value>=0&&value<=100)||(key=="gradientLength"&&value>=40&&value<=100)||(key=="notificationBlur"&&value>=0&&value<=100)||(key=="notificationBlurFade"&&value>=40&&value<=400)||(key=="notificationShade"&&value>=0&&value<=100);
+ const bool valid=(key=="gradientOpacity"&&value>=0&&value<=100)||(key=="gradientLength"&&value>=40&&value<=300)||(key=="notificationBlur"&&value>=0&&value<=100)||(key=="notificationBlurFade"&&value>=40&&value<=400)||(key=="notificationShade"&&value>=0&&value<=100);
  return valid?WriteScalar(path,"menuBar",key,std::to_string(value),false):SaveStatus::Invalid;
 }
 SaveStatus WriteAudioOutputs(const std::wstring& path, const std::vector<AudioOutputPreference>& outputs) {

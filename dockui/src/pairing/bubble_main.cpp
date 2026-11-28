@@ -666,6 +666,16 @@ void ReplyPhone(const std::wstring& reply) {
     docky::pairing::ReplyToPhoneHost(g_phoneHost, reply.c_str());
 }
 
+// A paired phone picked in the PC picker: the phone page then listens for that phone only (as when a file is sent to it
+// from Explorer), so it connects as soon as DockDrop is opened on the phone. Files and text are chosen on that page.
+void OpenPairedPhoneFromPreview(const std::wstring& id) {
+    if (!g_unified || !EnterPhonePage(true)) { OpenPhonePairingFromPreview(); return; }
+    if (g_transferring || (g_connectedAt > 0 && g_activePhone == id)) return;
+    if (g_connectedAt > 0) ResetPairing();
+    g_targetPhone = id;
+    ReplyPhone(L"trust-refresh");
+}
+
 // The phone page is what the user sees (not hidden in the background, not the PC picker): only then does the phone host
 // keep a room open for the QR code. Remembered phones are listened for either way.
 bool PhonePageShown() { return g_wnd && IsWindowVisible(g_wnd) && !IsIconic(g_wnd) && g_opt.pairPhone; }
@@ -1510,7 +1520,8 @@ public:
         BOOL animation = TRUE;
         SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &animation, 0);
         g_reduceMotion = g_opt.pcReduced || !animation;
-        pickerReady_ = g_devicePreview.Init(dev_.Get(), count, g_reduceMotion, OpenPhonePairingFromPreview);
+        pickerReady_ = g_devicePreview.Init(dev_.Get(), count, g_reduceMotion, OpenPhonePairingFromPreview,
+                                            OpenPairedPhoneFromPreview);
         return pickerReady_;
     }
     // Page change inside the one window: the next frame of the current page is also copied into a snapshot layer,

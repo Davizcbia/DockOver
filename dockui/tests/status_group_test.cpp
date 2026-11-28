@@ -15,13 +15,14 @@ static bool Near(float a, float b) { return std::fabs(a - b) < 0.01f; }
 using Cells = std::vector<std::wstring>;
 
 // --render <out.png> <size> [wifi icon]: the combined cell alone on a grey plate (visual comparison with the reference).
-static int Render(const wchar_t* out, int size, const wchar_t* icon, const State* given = nullptr) {
+// pad > 0 adds that many pixels around the cell, showing what is drawn past its edge.
+static int Render(const wchar_t* out, int size, const wchar_t* icon, const State* given = nullptr, int pad = 0) {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ComPtr<IWICImagingFactory> wic; ComPtr<ID2D1Factory1> d2d; ComPtr<IDWriteFactory> dw;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic)))) return 10;
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf()))) return 11;
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), reinterpret_cast<IUnknown**>(dw.GetAddressOf()));
-    ComPtr<IWICBitmap> bmp; wic->CreateBitmap(size, size, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp);
+    ComPtr<IWICBitmap> bmp; wic->CreateBitmap(size + 2 * pad, size + 2 * pad, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp);
     ComPtr<ID2D1RenderTarget> rt;
     if (FAILED(d2d->CreateWicBitmapRenderTarget(bmp.Get(), D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)), &rt))) return 12;
     ComPtr<ID2D1DeviceContext> dc; if (FAILED(rt.As(&dc))) return 13;
@@ -30,7 +31,8 @@ static int Render(const wchar_t* out, int size, const wchar_t* icon, const State
     if (icon) { std::vector<uint32_t> px; UINT w = 0, h = 0; std::wstring err;
         if (dock::LoadCustomIconPixels(icon, px, w, h, err)) { st.wifiIcon = std::make_shared<const std::vector<uint32_t>>(std::move(px)); st.wifiW = w; st.wifiH = h; } }
     dc->BeginDraw(); dc->Clear(st.dark ? D2D1::ColorF(0.30f, 0.32f, 0.36f, 1.f) : D2D1::ColorF(0.93f, 0.93f, 0.94f, 1.f));
-    Draw(dc.Get(), dw.Get(), D2D1::RectF(0, 0, static_cast<float>(size), static_cast<float>(size)), {L"combo"}, st, -1, 1.f);
+    const float p0 = static_cast<float>(pad);
+    Draw(dc.Get(), dw.Get(), D2D1::RectF(p0, p0, p0 + size, p0 + size), {L"combo"}, st, -1, 1.f);
     if (FAILED(dc->EndDraw())) return 14;
     ComPtr<IWICStream> stream; ComPtr<IWICBitmapEncoder> enc; ComPtr<IWICBitmapFrameEncode> frame;
     wic->CreateStream(&stream); if (FAILED(stream->InitializeFromFilename(out, GENERIC_WRITE))) return 15;
@@ -83,14 +85,18 @@ int wmain(int argc, wchar_t** argv) {
         }
         return 0;
     }
-    if (argc >= 3 && std::wstring(argv[1]) == L"--render-states") {  // <dir> [wifi icon]: battery states of the combined cell
-        const std::wstring dir = argv[2]; const wchar_t* icon = argc >= 4 ? argv[3] : nullptr;
+    // --render-states <dir> [wifi icon]: battery states of the combined cell. --render-states-padded <dir>: the same with
+    // 40 px around the cell, to see whether anything is drawn past the Dock item's edge.
+    if (argc >= 3 && (std::wstring(argv[1]) == L"--render-states" || std::wstring(argv[1]) == L"--render-states-padded")) {
+        const std::wstring dir = argv[2];
+        const bool padded = std::wstring(argv[1]) == L"--render-states-padded";
+        const wchar_t* icon = !padded && argc >= 4 ? argv[3] : nullptr;
         struct Case { const wchar_t* name; int battery; bool charging, plugged, percent; } cases[] = {
             {L"battery-72", 72, false, false, false}, {L"low-16-percent", 16, false, false, true}, {L"charging", 64, true, true, false},
             {L"charging-percent", 64, true, true, true}, {L"plugged-full-percent", 100, false, true, true},
             {L"saver-48", 48, false, false, true}, {L"light-charging-percent", 64, true, true, true}, {L"light-72", 72, false, false, false}};
         for (const auto& c : cases) { State st; st.saver = std::wstring(c.name).rfind(L"saver", 0) == 0; st.dark = std::wstring(c.name).rfind(L"light", 0) != 0; st.batteryPresent = true; st.battery = c.battery; st.charging = c.charging; st.plugged = c.plugged; st.showPercent = c.percent;
-            st.wifi = 2; st.audio = true; st.volume = 40; if (const int r = Render((dir + L"\\" + c.name + L".png").c_str(), 294, icon, &st)) return r; }
+            st.wifi = 2; st.audio = true; st.volume = 40; if (const int r = Render((dir + L"\\" + c.name + L".png").c_str(), 294, icon, &st, padded ? 40 : 0)) return r; }
         return 0;
     }
     // Ordinary cells: two per column, a column is half an icon wide.

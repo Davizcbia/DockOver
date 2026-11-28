@@ -11,19 +11,24 @@
 #include "pc_pairing_motion.h"
 #include "phone_language.h"
 #include "lan_picker.h"
+#include "trusted_phones.h"
 
 namespace docky::pairing {
 
 // The device picker simulates selection and sending. Add phone opens the existing pairing UI.
+// Live, it lists the nearby PCs and then the paired phones; a phone opens the phone page waiting for that phone.
 class DevicePreview {
 public:
     static constexpr int kDrawnBubbles = 7;
 
-    bool Init(ID3D11Device* device, int count, bool reducedMotion, void (*openPhone)()) {
+    bool Init(ID3D11Device* device, int count, bool reducedMotion, void (*openPhone)(),
+              void (*openPairedPhone)(const std::wstring& id) = nullptr) {
         live_ = count < 0;
         count_ = live_ ? 0 : std::clamp(count, 1, static_cast<int>(devices_.size()));
         reducedMotion_ = reducedMotion;
         openPhone_ = openPhone;
+        openPairedPhone_ = openPairedPhone;
+        if (live_) RefreshPhones();
         using Microsoft::WRL::ComPtr;
         ComPtr<IDWriteFactory> write;
         if (!glass_.Init(device) ||
@@ -39,7 +44,7 @@ public:
 
     void Frame(UINT width, UINT height, float dpi, double now) {
         if (live_ && pressed_ == kNone && !dragging_ && lan_.Poll(now)) {
-            count_ = static_cast<int>(lan_.peers.size());
+            RefreshPhones();  // also picks up a phone paired or removed meanwhile
             if (keyboard_ >= count_) keyboard_ = kPrimary;
         }
         scale_ = std::min({dpi, width / 610.0f, height / 680.0f});
@@ -306,6 +311,16 @@ private:
     D2D1_POINT_2F Dip(POINT p) const { return {p.x / scale_, p.y / scale_}; }
     PcBubble Pixels(PcBubble b) const { return {b.x * scale_, b.y * scale_, b.radius * scale_, b.opacity}; }
     float ContentWidth() const { return (count_ - 1) * kStep + kCardWidth; }
+    int PcCount() const { return live_ ? static_cast<int>(lan_.peers.size()) : count_; }
+    // Live entries: the PCs found on the network, then the paired phones (index - PcCount()).
+    void RefreshPhones() {
+        phones_ = openPairedPhone_ ? ReadTrustedPhones() : std::vector<TrustedPhone>{};
+        count_ = PcCount() + static_cast<int>(phones_.size());
+    }
+    const TrustedPhone* PhoneAt(int i) const {
+        const int k = i - PcCount();
+        return live_ && k >= 0 && k < static_cast<int>(phones_.size()) ? &phones_[k] : nullptr;
+    }
     float MaxScroll() const { return std::max(0.0f, ContentWidth() - (viewport_.right - viewport_.left)); }
     void ScrollTo(float value) { scrollTarget_ = std::clamp(value, 0.0f, MaxScroll()); }
 
@@ -380,7 +395,12 @@ private:
         keyboard_ = action == kLeft || action == kRight ? kNone : action;
         if (action >= 0 && action < count_ && Browsing()) {
             if (live_) {
-                if (!lan_.Send(lan_.peers[action].id)) MessageBoxW(GetActiveWindow(), T(L"无法启动电脑传输组件", L"Could not start PC transfer"), L"DockDrop", MB_ICONERROR);
+                if (const auto* phone = PhoneAt(action)) {
+                    const std::wstring id = phone->id;  // the call may refresh phones_
+                    openPairedPhone_(id);
+                } else if (!lan_.Send(lan_.peers[action].id)) {
+                    MessageBoxW(GetActiveWindow(), T(L"无法启动电脑传输组件", L"Could not start PC transfer"), L"DockDrop", MB_ICONERROR);
+                }
                 return;
             }
             selectedFrom_ = DeviceBall(action, Card(action));
@@ -416,6 +436,7 @@ private:
         case Phase::Browse:
             if (live_ && lan_.Failed()) return T(L"电脑发现组件不可用", L"PC discovery unavailable");
             if (live_ && !count_) return T(L"正在寻找附近的电脑…", L"Looking for nearby PCs…");
+            if (live_ && !PcCount()) return T(L"选择已配对的手机，或继续寻找电脑…", L"Pick a paired phone, or wait for PCs…");
             return T(L"选择接收设备", L"Choose a device");
         case Phase::Waiting: return std::wstring(T(L"等待确认 · ", L"Waiting for ")) + devices_[selected_].name;
         case Phase::Sending: return std::wstring(T(L"正在发送给 ", L"Sending to ")) + devices_[selected_].name;
@@ -481,10 +502,12 @@ private:
         for (int i = 0; i < count_; ++i) {
             const auto rect = Card(i);
             if (!Visible(rect)) continue;
-            const Device item = live_ ? Device{lan_.peers[i].name.c_str(), false} : devices_[i];
+            const auto* paired = PhoneAt(i);
+            const Device item = paired ? Device{paired->name.c_str(), true}
+                : live_ ? Device{lan_.peers[i].name.c_str(), false} : devices_[i];
             Text(item.name, {rect.left + 3, rect.top + 65, rect.right - 3, rect.top + 87}, label_.Get());
             DeviceIcon(item.phone, rect.left + 22, rect.top + 96);
-            Text(item.phone ? T(L"手机", L"Phone") : T(L"电脑", L"PC"),
+            Text(paired ? T(L"已配对", L"Paired") : item.phone ? T(L"手机", L"Phone") : T(L"电脑", L"PC"),
                 {rect.left + 31, rect.top + 84, rect.right - 8, rect.top + 107}, detail_.Get(), true);
             if (keyboard_ == i) Outline({rect.left + 2, rect.top + 2, rect.right - 2, rect.bottom - 2}, 16);
         }
@@ -501,6 +524,8 @@ private:
     }
 
     LanPicker lan_;
+    std::vector<TrustedPhone> phones_;
+    void (*openPairedPhone_)(const std::wstring&) = nullptr;
     bool live_ = false;
     Phase phase_ = Phase::Browse;
     int count_ = 0, selected_ = -1, keyboard_ = kNone, pressed_ = kNone, returningDevice_ = -1;

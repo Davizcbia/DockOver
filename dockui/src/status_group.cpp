@@ -143,12 +143,29 @@ void Combo(Painter& p, D2D1_POINT_2F c, float s, const State& st) {
     const std::wstring digits = number ? std::to_wstring(std::clamp(st.battery, 0, 100)) : std::wstring();
     float boltH = 0.17f * s, textSize = 0.19f * s;  // a 0.19 s font draws 0.136 s tall digits
     if (st.showPercent && st.plugged) { boltH = 0.19f * s; textSize = 0.21f * s; }  // both at once: larger, so both stay legible
-    float textW = 0.f;
-    if (number) if (auto* f = p.Font(textSize, true)) {
+    // capRatio: the digits' ink height per unit of font size; baseRatio: their baseline below the text's centre line.
+    // Measured for the bolt alone too, so it takes the place the digits would have.
+    float textW = 0.f, capRatio = 0.f, baseRatio = 0.f;
+    const std::wstring measured = number ? digits : std::wstring(L"0");
+    if (number || bolt) if (auto* f = p.Font(textSize, true)) {
         ComPtr<IDWriteTextLayout> layout;
-        if (p.dwrite && SUCCEEDED(p.dwrite->CreateTextLayout(digits.c_str(), static_cast<UINT32>(digits.size()), f, 4 * s, s, &layout))) {
-            DWRITE_TEXT_METRICS m{}; layout->GetMetrics(&m); textW = m.width; }
+        if (p.dwrite && SUCCEEDED(p.dwrite->CreateTextLayout(measured.c_str(), static_cast<UINT32>(measured.size()), f, 4 * s, 2 * textSize, &layout))) {
+            DWRITE_TEXT_METRICS m{}; layout->GetMetrics(&m); if (number) textW = m.width;
+            DWRITE_LINE_METRICS line{}; UINT32 lines = 0;
+            ComPtr<IDWriteFontCollection> fonts; ComPtr<IDWriteFontFamily> family; ComPtr<IDWriteFont> font; UINT32 index = 0; BOOL exists = FALSE;
+            if (SUCCEEDED(layout->GetLineMetrics(&line, 1, &lines)) && lines == 1 &&
+                SUCCEEDED(f->GetFontCollection(&fonts)) && SUCCEEDED(fonts->FindFamilyName(L"Segoe UI Variable Text", &index, &exists)) && exists &&
+                SUCCEEDED(fonts->GetFontFamily(index, &family)) &&
+                SUCCEEDED(family->GetFirstMatchingFont(DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, &font))) {
+                DWRITE_FONT_METRICS fm{}; font->GetMetrics(&fm);
+                if (fm.designUnitsPerEm) { capRatio = static_cast<float>(fm.capHeight) / fm.designUnitsPerEm; baseRatio = (line.baseline - line.height / 2) / textSize; }
+            }
+        }
     }
+    // The bolt is exactly as tall as the digits (its outline stroke adds 6%) and shares their top and bottom; alone, as
+    // tall as the digits would be. A taller bolt rose past the top of the Dock item and lost its tip there when magnified.
+    const bool matchDigits = bolt && capRatio > 0.f;
+    if (matchDigits) boltH = capRatio * textSize / 1.06f;
     float boltW = bolt ? boltH * 0.70f : 0.f, spacing = number && bolt ? 0.01f * s : 0.f;
     float content = textW + boltW + spacing;
     // The gap opens at most about 48 degrees each way ("100" with a bolt is shrunk to fit), so the ring stays a ring.
@@ -174,7 +191,8 @@ void Combo(Painter& p, D2D1_POINT_2F c, float s, const State& st) {
     // The gap's content, centred on the ring line at the top.
     const D2D1_POINT_2F mid = D2D1::Point2F(rc.x, rc.y - r);
     float x = mid.x - content / 2;
-    if (bolt) { p.White(1.f); Bolt(p, D2D1::Point2F(x + boltW / 2, mid.y), boltH); x += boltW + spacing; }
+    const float boltY = matchDigits ? mid.y + baseRatio * textSize - capRatio * textSize / 2 : mid.y;  // the digits' ink centre
+    if (bolt) { p.White(1.f); Bolt(p, D2D1::Point2F(x + boltW / 2, boltY), boltH); x += boltW + spacing; }
     if (number) { p.White(1.f); p.Text(digits, D2D1::RectF(x, mid.y - textSize, x + textW, mid.y + textSize), textSize, true); }
     WifiGlyph(p, c, s, st);
     const int lit = !st.audio || st.muted ? 0 : (std::clamp(st.volume, 0, 100) + 24) / 25;
